@@ -24,8 +24,10 @@ for p in (REPO_PARENT, REPO_ROOT):
 import torch
 from tqdm.auto import tqdm
 
-from models.kimi import load_model
+from models.kimi import load_model as load_model_patched
+from models.kimi import load_model_plain
 from observations.common import resolve_model_name_or_path
+from src.modality_router import attach_modality_aware_router, load_affinity
 from tasks.gqa import (
     gqa_doc_to_answer,
     gqa_doc_to_text,
@@ -49,6 +51,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="If set, randomly sample num_samples rows from [start_idx, end) instead of sequential slice.")
     p.add_argument("--max_new_tokens", type=int, default=32)
     p.add_argument("--batch_size", type=int, default=1)
+    p.add_argument(
+        "--affinity_path",
+        type=str,
+        default=None,
+        help="Path to affinity.pt saved by collect_scores.py --modality_aware. "
+             "If provided, enables modality-aware routing at inference time.",
+    )
+    p.add_argument(
+        "--affinity_threshold",
+        type=float,
+        default=0.9,
+        help="Affinity magnitude cutoff for modality-aware routing. Default: 0.9.",
+    )
     return p
 
 
@@ -63,14 +78,33 @@ def main():
     print(f"[Eval] Resolving model: {args.model_name_or_path}")
     model_path = resolve_model_name_or_path(args.model_name_or_path)
     print(f"[Eval] Loading model from: {model_path}")
-    model, processor = load_model(
-        model_path,
-        device_map="auto",
-        attn_implementation="flash_attention_2",
-    )
+
+    if args.affinity_path is not None:
+        # load_model_patched binds gate_forward and model_forward which propagate
+        # moe_text_index / moe_media_index to every gate — required for affinity routing.
+        print("[Eval] Affinity path provided: loading model with full MoDES patches.")
+        model, processor = load_model_patched(
+            model_path,
+            device_map="auto",
+            attn_implementation="flash_attention_2",
+        )
+    else:
+        model, processor = load_model_plain(
+            model_path,
+            device_map="auto",
+            attn_implementation="flash_attention_2",
+        )
+
     model.eval()
     device = next(model.parameters()).device
     print(f"[Eval] Model loaded. Primary device: {device}")
+
+    if args.affinity_path is not None:
+        print(f"[Eval] Loading affinity from: {args.affinity_path}")
+        affinity = load_affinity(args.affinity_path)
+        attach_modality_aware_router(model, affinity, threshold=args.affinity_threshold)
+    else:
+        print("[Eval] No affinity path provided; using standard routing.")
 
     print("[Eval] Loading GQA testdev_balanced...")
     rows = load_gqa_instruction_rows()
@@ -152,6 +186,8 @@ def main():
         "num_samples": total,
         "accuracy": round(accuracy, 6),
         "correct": correct,
+        "affinity_path": args.affinity_path,
+        "affinity_threshold": args.affinity_threshold if args.affinity_path else None,
     }
     summary_path = os.path.join(args.output_dir, "summary.json")
     with open(summary_path, "w") as f:

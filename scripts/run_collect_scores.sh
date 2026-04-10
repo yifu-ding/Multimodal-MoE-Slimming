@@ -9,23 +9,33 @@ set -euo pipefail
 # Activation scoring on 128 GQA samples:
 #   CUDA_VISIBLE_DEVICES=0 bash scripts/run_collect_scores.sh
 #
+# Activation + contribution scores (layerwise_loss, expert_out_contrib):
+#   COLLECT_CONTRIB=1 CUDA_VISIBLE_DEVICES=0 bash scripts/run_collect_scores.sh
+#
 # Full run:
 #   CUDA_VISIBLE_DEVICES=0 NUM_SAMPLES=512 bash scripts/run_collect_scores.sh
+#
+# Modality-aware scoring (auto-computes affinity via preliminary routing-survey pass):
+#   MODALITY_AWARE=1 CUDA_VISIBLE_DEVICES=0 bash scripts/run_collect_scores.sh
 
 PREFIX="${PREFIX:-$(pwd)}"
 export PYTHONPATH="${PREFIX}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 DATASET="${DATASET:-gqa}"
 NUM_SAMPLES="${NUM_SAMPLES:-128}"
-BATCH_SIZE="${BATCH_SIZE:-1}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
 START_IDX="${START_IDX:-0}"
 SUBSET_SEED="${SUBSET_SEED:-42}"
 SCORE_TYPE="${SCORE_TYPE:-activation}"
 EMA="${EMA:-0.9}"
+COLLECT_CONTRIB="${COLLECT_CONTRIB:-1}"   # set to 1 to enable gradient-based block contrib
 OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/kimi_gqa}"
+MODALITY_AWARE="${MODALITY_AWARE:-1}"
+AFFINITY_MODE="${AFFINITY_MODE:-scalar}"   # threshold | scalar
+AFFINITY_THRESHOLD="${AFFINITY_THRESHOLD:-0.95}"
 
 EXTRA_ARGS=("$@")
 
@@ -42,6 +52,14 @@ CMD=(
     --ema                "${EMA}"
 )
 
+if [ "${COLLECT_CONTRIB}" = "1" ]; then
+    CMD+=(--collect_contrib)
+fi
+
+if [ "${MODALITY_AWARE}" = "1" ]; then
+    CMD+=(--modality_aware --affinity_mode "${AFFINITY_MODE}" --affinity_threshold "${AFFINITY_THRESHOLD}")
+fi
+
 CMD+=("${EXTRA_ARGS[@]}")
 
 echo "Model      : ${MODEL_PATH}"
@@ -49,5 +67,9 @@ echo "Dataset    : ${DATASET} (${NUM_SAMPLES} samples)"
 echo "Score type : ${SCORE_TYPE}"
 echo "Output     : ${OUTPUT_DIR}"
 echo "GPU        : ${CUDA_VISIBLE_DEVICES}"
+echo "Modality aware    : ${MODALITY_AWARE}"
+echo "Affinity mode     : ${AFFINITY_MODE}"
+echo "Affinity threshold: ${AFFINITY_THRESHOLD}"
+
 echo ""
 "${CMD[@]}"

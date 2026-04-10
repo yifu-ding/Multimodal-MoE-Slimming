@@ -10,7 +10,6 @@ __pycache__
 llms-eval/
 storage/
 outputs/
-transformers/
 *.png
 *.json
 *.pt

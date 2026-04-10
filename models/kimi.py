@@ -20,6 +20,7 @@ from MoDES.models.utils import (
 import torch.nn.functional as F
 import os
 import pickle
+import shutil
 
 HS_DICT = None
 FREQ_DICT = None
@@ -258,7 +259,11 @@ def model_forward(
         use_legacy_cache = not isinstance(past_key_values, Cache)
         if use_legacy_cache:
             past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-        past_key_values_length = past_key_values.get_usable_length(seq_length)
+        # get_usable_length was removed in newer transformers; fall back to get_seq_length()
+        if hasattr(past_key_values, "get_usable_length"):
+            past_key_values_length = past_key_values.get_usable_length(seq_length)
+        else:
+            past_key_values_length = past_key_values.get_seq_length()
 
     if position_ids is None:
         device = input_ids.device if input_ids is not None else inputs_embeds.device
@@ -539,6 +544,10 @@ def vl_forward(
         hasattr(self.language_model.model.layers[1].mlp, "gate_dict")
         or hasattr(self.language_model.model.layers[1].mlp, "freq_save_dir")
         or hasattr(self.language_model.model.layers[1].mlp.gate, "topk_save_dir")
+        or (
+            hasattr(self.language_model.model.layers[1].mlp.gate, "affinity_mask")
+            and self.language_model.model.layers[1].mlp.gate.affinity_mask is not None
+        )
         or moe_layer_skip != -1
         or record_mask
         or enable_tau_skip
@@ -597,6 +606,10 @@ def vl_forward(
             or (
                 hasattr(layer.mlp.gate, "topk_save_dir")
                 and layer.mlp.gate.topk_save_dir is not None
+            )
+            or (
+                hasattr(layer.mlp.gate, "affinity_mask")
+                and layer.mlp.gate.affinity_mask is not None
             )
             or moe_layer_skip != -1
             or enable_tau_skip
@@ -887,7 +900,8 @@ def gate_forward(self, hidden_states, **kwargs):
         raise NotImplementedError(
             f"insupportable scoring function for MoE gating: {self.scoring_func}"
         )
-
+    
+    import ipdb; ipdb.set_trace()
     # select top-k experts
     if self.topk_method == "noaux_tc":
         assert not self.training
@@ -910,7 +924,7 @@ def gate_forward(self, hidden_states, **kwargs):
             .reshape(bsz * seq_len, -1)
         )  # [n, e]
         tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
-        # import ipdb; ipdb.set_trace()
+
         if (
             hasattr(self, "gate_dict")
             and self.gate_dict is not None
@@ -920,11 +934,37 @@ def gate_forward(self, hidden_states, **kwargs):
             tmp_scores[self.moe_text_index, self.text_low_freq_index] = 0.0
             tmp_scores[self.moe_media_index, self.visual_low_freq_index] = 0.0
 
+        # Modality-aware routing: block mismatched-modality tokens from
+        # activating strongly-specialised experts.  gate.affinity_mask is set
+        # by src/modality_router.attach_modality_aware_router().
+        if hasattr(self, "affinity_mask") and self.affinity_mask is not None:
+            txt_idx = self.moe_text_index.view(-1)    # [T_text]
+            vis_idx = self.moe_media_index.view(-1)   # [T_visual]
+            vis_only = self.affinity_mask.get("visual_only")
+            txt_only = self.affinity_mask.get("text_only")
+            if vis_only is not None and txt_idx.numel() > 0:
+                # Text tokens cannot activate visual-preferring experts
+                vis_only = vis_only.to(tmp_scores.device)
+                tmp_scores[txt_idx.unsqueeze(1), vis_only.unsqueeze(0)] = 0.0
+            if txt_only is not None and vis_idx.numel() > 0:
+                # Visual tokens cannot activate text-preferring experts
+                txt_only = txt_only.to(tmp_scores.device)
+                tmp_scores[vis_idx.unsqueeze(1), txt_only.unsqueeze(0)] = 0.0
+
         _, topk_idx = torch.topk(
             tmp_scores, k=self.top_k, dim=-1, sorted=True
         )  # important!!!
         topk_weight = scores.gather(1, topk_idx)
     elif self.topk_method == "greedy":
+        if hasattr(self, "affinity_mask") and self.affinity_mask is not None:
+            txt_idx = self.moe_text_index.view(-1)
+            vis_idx = self.moe_media_index.view(-1)
+            vis_only = self.affinity_mask.get("visual_only")
+            txt_only = self.affinity_mask.get("text_only")
+            if vis_only is not None and txt_idx.numel() > 0:
+                scores[txt_idx.unsqueeze(1), vis_only.to(scores.device).unsqueeze(0)] = 0.0
+            if txt_only is not None and vis_idx.numel() > 0:
+                scores[vis_idx.unsqueeze(1), txt_only.to(scores.device).unsqueeze(0)] = 0.0
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
     else:
         raise NotImplementedError(
@@ -1219,7 +1259,7 @@ def prepare_inputs_for_generation(
 
     # If we're in cached decoding stage, pixel values should be None because input ids do not contain special image token anymore
     # Otherwise we need pixel values to be passed to model
-    if cache_position[0] == 0:
+    if cache_position is not None and cache_position[0] == 0:
         model_inputs["pixel_values"] = pixel_values
         model_inputs["image_grid_hws"] = image_grid_hws
 
@@ -1243,7 +1283,10 @@ def prepare_inputs_for_generation_language(
     if past_key_values is not None:
         if isinstance(past_key_values, Cache):
             cache_length = past_key_values.get_seq_length()
-            past_length = past_key_values.seen_tokens
+            # seen_tokens was removed in newer transformers; fall back to get_seq_length()
+            past_length = getattr(past_key_values, "seen_tokens", None)
+            if past_length is None:
+                past_length = past_key_values.get_seq_length()
             max_cache_length = past_key_values.get_seq_length()
         else:
             cache_length = past_length = past_key_values[0][0].shape[2]
@@ -1274,8 +1317,10 @@ def prepare_inputs_for_generation_language(
         # create position_ids on the fly for batch generation
         position_ids = attention_mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 1)
-        if past_key_values:
-            position_ids = position_ids[:, -input_ids.shape[1] :]
+    # Always trim position_ids to the current step's tokens (handles both on-the-fly
+    # and externally-provided position_ids from _update_model_kwargs_for_generation)
+    if past_key_values and position_ids is not None:
+        position_ids = position_ids[:, -input_ids.shape[1] :]
 
     # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
     if inputs_embeds is not None and past_key_values is None:
@@ -1301,6 +1346,35 @@ def prepare_inputs_for_generation_language(
     return model_inputs
 
 
+def _sync_remote_code_cache(model_path: str) -> None:
+    """Copy local modeling_kimi_vl.py to the HF modules cache.
+
+    When trust_remote_code=True, transformers loads from a cached copy under
+    HF_HOME/modules/transformers_modules/<model-name>/.  If that cache is
+    stale (e.g. missing 'sdpa' in ATTENTION_CLASSES), loading fails with a
+    confusing KeyError.  This function overwrites the cached file with the
+    local version so our patches are always active.
+    """
+    local_code = os.path.join(model_path, "modeling_kimi_vl.py")
+    if not os.path.exists(local_code):
+        return  # nothing to sync (HF hub model without local code)
+    # Priority: HF_HOME > HUGGINGFACE_HUB_CACHE > default ~/.cache/huggingface
+    default_hf_home = os.path.join(
+        os.environ.get("HOME", "/root"), ".cache", "huggingface"
+    )
+    hf_home = os.environ.get(
+        "HF_HOME",
+        os.environ.get("HUGGINGFACE_HUB_CACHE", default_hf_home),
+    )
+    model_name = os.path.basename(os.path.abspath(model_path))
+    cache_dir = os.path.join(hf_home, "modules", "transformers_modules", model_name)
+    if not os.path.isdir(cache_dir):
+        return  # cache not yet populated; first load will create it from local
+    cached_file = os.path.join(cache_dir, "modeling_kimi_vl.py")
+    shutil.copy2(local_code, cached_file)
+    logger.info(f"[kimi] Synced modeling_kimi_vl.py → {cached_file}")
+
+
 def load_model(
     model_path: str,
     attn_implementation: str = "flash_attention_2",
@@ -1324,8 +1398,16 @@ def load_model(
     """
     if layer_gate_dict is not None:
         logger.info(f"layer_gate_dict: {layer_gate_dict}")
+    _sync_remote_code_cache(model_path)
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
     config = _normalize_kimi_config_for_remote_code(config)
+    # Propagate attn_implementation to all sub-configs (e.g. text_config) so that
+    # nested models like DeepseekV3ForCausalLM don't default to "sdpa" and then fail
+    # with a KeyError when ATTENTION_CLASSES doesn't contain "sdpa".
+    # KimiVLConfig has sub_configs={} so the property setter doesn't recurse; do it manually.
+    config._attn_implementation = attn_implementation
+    if hasattr(config, "text_config") and config.text_config is not None:
+        config.text_config._attn_implementation = attn_implementation
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         config=config,
@@ -1378,6 +1460,37 @@ def load_model(
                 layer.mlp.gate.gate_dict = layer.mlp.gate_dict
         layer.mlp.layer_idx = idx
         idx += 1
+    return model, processor
+
+
+def load_model_plain(
+    model_path: str,
+    attn_implementation: str = "flash_attention_2",
+    trust_remote_code: bool = True,
+    torch_dtype: torch.dtype = torch.bfloat16,
+    device_map: str = "auto",
+):
+    """Load Kimi-VL without any MoDES monkey-patches.
+
+    Use this for baseline evaluation (no expert skipping, no token routing changes).
+    Returns (model, processor).
+    """
+    _sync_remote_code_cache(model_path)
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+    config = _normalize_kimi_config_for_remote_code(config)
+    config._attn_implementation = attn_implementation
+    if hasattr(config, "text_config") and config.text_config is not None:
+        config.text_config._attn_implementation = attn_implementation
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        torch_dtype=torch_dtype,
+        device_map=device_map,
+        trust_remote_code=trust_remote_code,
+        attn_implementation=attn_implementation,
+    )
+    model.eval()
+    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
     return model, processor
 
 

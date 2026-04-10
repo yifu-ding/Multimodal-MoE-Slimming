@@ -9,18 +9,23 @@ set -euo pipefail
 # Full eval (~12k samples):
 #   bash scripts/eval_baseline_kimi_gqa.sh
 
-PREFIX="/home/data/dyf/moe-prune"
-export PYTHONPATH=".:${PYTHONPATH:-}"
+PREFIX="${PREFIX:-$(pwd)}"
+export PYTHONPATH="${PREFIX}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
-NUM_SAMPLES="${NUM_SAMPLES:-0}"          # 0 = full testdev_balanced
+# MODEL_PATH="/home/dyf/code/distill/MoDES/storage/prune/pruned_models/kimi_gqa_p30_uniform_layerwise"
+# MODEL_PATH="/home/dyf/code/distill/MoDES/storage/prune/pruned_models/kimi_gqa_p30_coverage_coverage"
+NUM_SAMPLES="${NUM_SAMPLES:-500}"          # 0 = full testdev_balanced
 START_IDX="${START_IDX:-0}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"
 SUBSET_SEED="${SUBSET_SEED:-}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/results/baseline_kimi_gqa}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/results/affinity_threshold_0.9_kimi_gqa}"
+
+AFFINITY_PATH="${AFFINITY_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa/affinity.pt}"
+AFFINITY_THRESHOLD="${AFFINITY_THRESHOLD:-0.9}"
 
 EXTRA_ARGS=("$@")
 
@@ -32,6 +37,8 @@ CMD=(
     --start_idx         "${START_IDX}"
     --batch_size        "${BATCH_SIZE}"
     --max_new_tokens    "${MAX_NEW_TOKENS}"
+    --affinity_path     "${AFFINITY_PATH}"
+    --affinity_threshold "${AFFINITY_THRESHOLD}"
 )
 
 if [[ -n "${SUBSET_SEED}" ]]; then
