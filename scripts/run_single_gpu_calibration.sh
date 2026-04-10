@@ -5,8 +5,8 @@ set -euo pipefail
 # Override defaults via env vars, for example:
 #   CUDA_VISIBLE_DEVICES=2 MODEL_PATH=storage/models/Kimi-VL-A3B-Instruct bash scripts/run_single_gpu_calibration.sh
 
-PREFIX="${PREFIX:-$(pwd)}"
-PYTHONPATH="${PREFIX}:${PYTHONPATH:-}"
+PREFIX="/home/data/dyf/moe-prune"
+PYTHONPATH=".:${PYTHONPATH:-}"
 export PYTHONPATH
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"

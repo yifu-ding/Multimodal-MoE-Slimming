@@ -14,3 +14,4 @@ transformers/
 *.png
 *.json
 *.pt
+results/
