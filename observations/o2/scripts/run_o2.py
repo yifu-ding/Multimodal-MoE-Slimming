@@ -19,8 +19,8 @@ from observations.common import (
     compute_routing_freq,
     dump_json,
     ensure_dir,
-    pick_plot_layer,
-    plot_expert_channel_bars,
+    pick_top_experts_global,
+    plot_expert_channel_lines_per_expert,
     plot_heatmap,
     print_saved_artifact_message,
     save_tensor_dict,
@@ -30,8 +30,12 @@ from observations.common import (
 
 def main():
     parser = build_base_arg_parser("O2: Expert channel modality response analysis.")
-    parser.add_argument("--top_experts", type=int, default=4)
-    parser.add_argument("--plot_layer", type=int, default=-1)
+    parser.add_argument("--top_experts", type=int, default=10)
+    parser.add_argument("--min_count", type=int, default=5,
+                        help="过滤掉任一模态 token 数 < min_count 的 expert，避免低样本噪声。")
+    parser.add_argument("--sort_by", type=str, default="ema_abs",
+                        choices=["modal_bias", "ema_abs"],
+                        help="expert 选取排序依据：ema_abs 按模态偏好强度，modal_bias 按通道差异强度。")
     parser.add_argument("--high_bias_threshold", type=float, default=0.5)
     args = parser.parse_args()
 
@@ -51,38 +55,37 @@ def main():
     channel_response = compute_channel_response(raw_stats)
     modal_bias = compute_modal_bias(channel_response)
     layers = raw_stats["layers"]
+
     modal_bias_matrix = stack_layer_tensors(
         {layer: modal_bias[layer].mean(dim=-1) for layer in layers}, layers
     )
-
     plot_heatmap(
         modal_bias_matrix,
         "O2 Mean ModalBias per Expert",
         os.path.join(args.output_dir, "modal_bias_heatmap.png"),
         cmap="viridis",
     )
-    print("[O2说明] ModalBias 热力图：横轴是 expert id，纵轴是 layer id。")
-    print("[O2说明] 每个格子的值是该 expert 内所有通道的平均模态偏置强度。")
-    print("[O2说明] 数值越大，表示这个 expert 内部的通道对 text / visual 的响应差异越明显；越接近 0，表示通道响应更均衡。")
 
-    plot_layer = args.plot_layer if args.plot_layer >= 0 else pick_plot_layer(raw_stats)
-    layer_total = raw_stats["channel_count"][plot_layer]["text"] + raw_stats["channel_count"][plot_layer]["visual"]
-    top_experts = torch.topk(
-        layer_total,
-        k=min(args.top_experts, int(layer_total.numel())),
-    ).indices.tolist()
-    plot_expert_channel_bars(
-        channel_response[plot_layer]["text"],
-        channel_response[plot_layer]["visual"],
-        plot_layer,
-        top_experts,
-        os.path.join(args.output_dir, f"channel_response_layer_{plot_layer}.png"),
+    # 全模型选 top-K 模态偏置最强的 expert，每个单独出一张折线图
+    top_candidates = pick_top_experts_global(
+        modal_bias, raw_stats, top_k=args.top_experts, min_count=args.min_count,
+        ema=ema, sort_by=args.sort_by,
     )
-    print(
-        f"[O2说明] 通道响应折线图选择了 layer={plot_layer} 的 experts={top_experts}。"
-        " 每条曲线展示该 expert 内各通道的平均 |activation|。"
+    print(f"[O2] 全模型 Top-{args.top_experts} expert (sort_by={args.sort_by}):")
+    for layer_idx, expert_idx, bias_val in top_candidates:
+        n_text = int(raw_stats["channel_count"][layer_idx]["text"][expert_idx].item())
+        n_visual = int(raw_stats["channel_count"][layer_idx]["visual"][expert_idx].item())
+        print(
+            f"  Layer {layer_idx:3d}  Expert {expert_idx:3d}"
+            f"  mean_ModalBias={bias_val:.4f}"
+            f"  (n_text={n_text}, n_visual={n_visual})"
+        )
+
+    saved_paths = plot_expert_channel_lines_per_expert(
+        channel_response, top_candidates, args.output_dir, ema=ema
     )
-    print("[O2说明] 如果同一 expert 中 text 曲线和 visual 曲线明显分离，说明通道存在模态专属性。")
+    for p in saved_paths:
+        print_saved_artifact_message(p, "通道响应折线图")
 
     opposite_modality_counts = []
     for layer in layers:
@@ -100,15 +103,17 @@ def main():
         "high_bias_threshold": args.high_bias_threshold,
         "mean_modal_bias": float(modal_bias_matrix.mean().item()),
         "max_modal_bias": float(modal_bias_matrix.max().item()),
-        "selected_plot_layer": int(plot_layer),
-        "selected_plot_experts": top_experts,
+        "top_experts": [
+            {
+                "layer": layer_idx,
+                "expert": expert_idx,
+                "mean_modal_bias": round(bias_val, 6),
+                "n_text": int(raw_stats["channel_count"][layer_idx]["text"][expert_idx].item()),
+                "n_visual": int(raw_stats["channel_count"][layer_idx]["visual"][expert_idx].item()),
+            }
+            for layer_idx, expert_idx, bias_val in top_candidates
+        ],
         "opposite_modality_high_bias_cells": int(sum(opposite_modality_counts)),
-        "heatmap_readme": {
-            "what_is_row": "layer id",
-            "what_is_column": "expert id",
-            "larger_value_means": "stronger channel-level modality asymmetry inside the expert",
-            "smaller_value_means": "more balanced channel responses between text and visual tokens",
-        },
     }
 
     metrics_path = os.path.join(args.output_dir, "o2_metrics.pt")
@@ -120,11 +125,6 @@ def main():
             "modal_bias": modal_bias,
             "mean_modal_bias_per_expert": modal_bias_matrix,
         },
-    )
-    print_saved_artifact_message(os.path.join(args.output_dir, "modal_bias_heatmap.png"), "ModalBias 热力图")
-    print_saved_artifact_message(
-        os.path.join(args.output_dir, f"channel_response_layer_{plot_layer}.png"),
-        "通道响应对比图",
     )
     print_saved_artifact_message(metrics_path, "O2 指标张量")
     summary_path = os.path.join(args.output_dir, "summary.json")

@@ -918,24 +918,92 @@ def plot_expert_channel_bars(
     expert_indices: List[int],
     output_path: str,
 ):
-    import numpy as np
-
     rows = len(expert_indices)
-    fig, axes = plt.subplots(rows, 1, figsize=(18, 3 * rows), squeeze=False)
+    fig, axes = plt.subplots(rows, 1, figsize=(14, 3 * rows), squeeze=False)
     for axis, expert_idx in zip(axes[:, 0], expert_indices):
-        t = text_resp[expert_idx].cpu().numpy()
-        v = visual_resp[expert_idx].cpu().numpy()
-        x = np.arange(len(t))
-        axis.bar(x, t, color="steelblue", alpha=0.7, label="text", linewidth=0)
-        axis.bar(x, v, color="darkorange", alpha=0.7, label="visual", linewidth=0)
+        axis.plot(text_resp[expert_idx].cpu().numpy(), label="text", alpha=0.9)
+        axis.plot(visual_resp[expert_idx].cpu().numpy(), label="visual", alpha=0.9)
         axis.set_title(f"Layer {layer_idx} Expert {expert_idx}")
         axis.set_xlabel("Channel Index")
         axis.set_ylabel("Mean |activation|")
         axis.legend()
     plt.tight_layout()
     plt.savefig(output_path, dpi=200)
-    print(f"[结果输出] 已保存第 {layer_idx} 层通道响应柱状图: {output_path}", flush=True)
+    print(f"[结果输出] 已保存第 {layer_idx} 层通道响应折线图: {output_path}", flush=True)
     plt.close()
+
+
+def pick_top_experts_global(
+    modal_bias: Dict[int, torch.Tensor],
+    raw_stats: Dict[str, Any],
+    top_k: int,
+    min_count: int = 5,
+    ema: Optional[Dict[int, torch.Tensor]] = None,
+    sort_by: str = "modal_bias",
+) -> List[Tuple[int, int, float]]:
+    """全模型遍历，返回 top_k 个 (layer, expert, sort_score) 列表。
+
+    sort_by:
+      "modal_bias" — 按通道级平均 ModalBias 降序（通道差异最大）
+      "ema_abs"    — 按 |EMA| 降序（模态偏好最强，需传入 ema）
+    min_count 过滤掉任一模态 token 数 < min_count 的 expert。
+    """
+    candidates = []
+    for layer, bias in modal_bias.items():
+        text_counts = raw_stats["channel_count"][layer]["text"]
+        visual_counts = raw_stats["channel_count"][layer]["visual"]
+        for expert_idx in range(bias.shape[0]):
+            if (
+                text_counts[expert_idx].item() < min_count
+                or visual_counts[expert_idx].item() < min_count
+            ):
+                continue
+            if sort_by == "ema_abs" and ema is not None and layer in ema:
+                score = float(ema[layer][expert_idx].abs().item())
+            else:
+                score = float(bias[expert_idx].mean().item())
+            candidates.append((layer, expert_idx, score))
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    return candidates[:top_k]
+
+
+def plot_expert_channel_lines_per_expert(
+    channel_response: Dict[int, Dict[str, torch.Tensor]],
+    candidates: List[Tuple[int, int, float]],
+    output_dir: str,
+    ema: Optional[Dict[int, torch.Tensor]] = None,
+) -> List[str]:
+    """每个 (layer, expert) 单独出一张折线图，返回已保存的路径列表。
+
+    title 优先显示 EMA（expert modality affinity，+1 纯视觉 / -1 纯文本 / 0 中性）；
+    若未传入 ema 则回退到显示 mean ModalBias。
+    """
+    saved = []
+    for layer_idx, expert_idx, bias_val in candidates:
+        t = channel_response[layer_idx]["text"][expert_idx].cpu().numpy()
+        v = channel_response[layer_idx]["visual"][expert_idx].cpu().numpy()
+        fig, axis = plt.subplots(1, 1, figsize=(14, 3))
+        axis.plot(t, label="text", alpha=0.9, color="steelblue")
+        axis.plot(v, label="visual", alpha=0.9, color="darkorange")
+        if ema is not None and layer_idx in ema:
+            ema_val = float(ema[layer_idx][expert_idx].item())
+            title_suffix = f"EMA = {ema_val:+.3f}  (+1 visual / -1 text)"
+        else:
+            title_suffix = f"mean ModalBias = {bias_val:.3f}"
+        axis.set_title(f"Layer {layer_idx} Expert {expert_idx}  ({title_suffix})")
+        axis.set_xlabel("Channel Index")
+        axis.set_ylabel("Mean |activation|")
+        axis.legend()
+        plt.tight_layout()
+        fname = os.path.join(output_dir, f"channel_resp_L{layer_idx}_E{expert_idx}.png")
+        plt.savefig(fname, dpi=200)
+        plt.close()
+        print(
+            f"[结果输出] 已保存 Layer {layer_idx} Expert {expert_idx} 通道响应折线图: {fname}",
+            flush=True,
+        )
+        saved.append(fname)
+    return saved
 
 
 def build_base_arg_parser(description: str) -> argparse.ArgumentParser:
