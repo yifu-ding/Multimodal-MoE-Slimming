@@ -48,6 +48,27 @@ def _normalize_kimi_config_for_remote_code(config):
     return config
 
 
+def _ensure_writable_hf_modules_cache(model_path: str) -> None:
+    """Point transformers dynamic-module cache to a writable location when needed."""
+    local_code = os.path.join(model_path, "modeling_kimi_vl.py")
+    if not os.path.exists(local_code):
+        return
+
+    try:
+        import transformers.dynamic_module_utils as _dynamic_module_utils
+        import transformers.utils.hub as _hub_utils
+    except Exception:
+        return
+
+    fallback = os.path.join("/tmp", "hf_modules")
+    os.makedirs(fallback, exist_ok=True)
+    os.environ["HF_MODULES_CACHE"] = fallback
+    os.environ["TRANSFORMERS_DYNAMIC_MODULE_NAME"] = "transformers_modules"
+    _dynamic_module_utils.HF_MODULES_CACHE = fallback
+    if hasattr(_hub_utils, "HF_MODULES_CACHE"):
+        _hub_utils.HF_MODULES_CACHE = fallback
+
+
 def save_states(
     self,
     hidden_states,
@@ -783,6 +804,7 @@ def vl_forward(
 
 
 def load_model_save(layer_to_save: list, save_dir: str, model_path: str):
+    _ensure_writable_hf_modules_cache(model_path)
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16,
@@ -1324,6 +1346,7 @@ def load_model(
     """
     if layer_gate_dict is not None:
         logger.info(f"layer_gate_dict: {layer_gate_dict}")
+    _ensure_writable_hf_modules_cache(model_path)
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
     config = _normalize_kimi_config_for_remote_code(config)
     model = AutoModelForCausalLM.from_pretrained(
@@ -1383,6 +1406,7 @@ def load_model(
 
 def load_model_freq(freq_save_dir: str, model_path: str):
     # We consider both system and user prompt as the text input here
+    _ensure_writable_hf_modules_cache(model_path)
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16,
@@ -1422,6 +1446,7 @@ def load_model_freq(freq_save_dir: str, model_path: str):
 
 def load_model_topk(topk_save_dir: str, model_path: str, topk: int = 6):
     # We consider both system and user prompt as the text input here
+    _ensure_writable_hf_modules_cache(model_path)
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16,

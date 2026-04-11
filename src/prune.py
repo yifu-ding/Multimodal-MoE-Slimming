@@ -24,8 +24,10 @@ Pruning scope
 """
 
 import argparse
+import glob
 import math
 import os
+import shutil
 import sys
 from typing import Dict
 
@@ -39,9 +41,165 @@ for _p in (REPO_PARENT, REPO_ROOT):
 import torch
 import torch.nn as nn
 from tqdm.auto import tqdm
-from transformers import AutoModelForCausalLM, AutoProcessor
+from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
 
+from models.kimi import _normalize_kimi_config_for_remote_code
 from observations.common import resolve_model_name_or_path
+
+
+_ROUTED_EXPERT_LOAD_PATCH = """
+
+# ---------------------------------------------------------------------------
+# MoDES patch: restore routed experts from checkpoint tensor shapes
+# ---------------------------------------------------------------------------
+
+import re as _modes_re
+from transformers import modeling_utils as _modes_modeling_utils
+
+
+_MODES_ROUTED_WEIGHT_RE = _modes_re.compile(
+    r"^(.*)\\.experts\\.(\\d+)\\.(gate_proj|up_proj|down_proj)\\.weight$"
+)
+
+
+def _modes_resolve_experts_container(model, moe_path):
+    try:
+        module = model.get_submodule(moe_path)
+    except AttributeError:
+        module, _ = _modes_modeling_utils.get_module_from_name(model, moe_path)
+    if hasattr(module, "experts"):
+        return module.experts
+    if hasattr(module, "mlp") and hasattr(module.mlp, "experts"):
+        return module.mlp.experts
+    raise AttributeError(
+        f"Could not resolve experts container from '{moe_path}' "
+        f"(got {type(module).__name__})."
+    )
+
+
+def _modes_maybe_resize_routed_expert(model, param_name, tensor):
+    match = _MODES_ROUTED_WEIGHT_RE.match(param_name)
+    if match is None:
+        return
+
+    moe_path, expert_idx_str, proj_name = match.groups()
+    expert_idx = int(expert_idx_str)
+    experts = _modes_resolve_experts_container(model, moe_path)
+    expert = experts[expert_idx]
+    base_config = getattr(model.config, "text_config", model.config)
+
+    if proj_name in ("gate_proj", "up_proj"):
+        target_intermediate = int(tensor.shape[0])
+        target_hidden = int(tensor.shape[1])
+    else:
+        target_hidden = int(tensor.shape[0])
+        target_intermediate = int(tensor.shape[1])
+
+    if expert is not None:
+        current_hidden = int(expert.gate_proj.in_features)
+        current_intermediate = int(expert.gate_proj.out_features)
+        if (
+            current_hidden == target_hidden
+            and current_intermediate == target_intermediate
+        ):
+            return
+        expert_device = expert.gate_proj.weight.device
+        expert_dtype = expert.gate_proj.weight.dtype
+    else:
+        expert_device = tensor.device
+        expert_dtype = tensor.dtype
+
+    new_expert = DeepseekV3MLP(
+        expert.config if expert is not None else base_config,
+        hidden_size=target_hidden,
+        intermediate_size=target_intermediate,
+    )
+    new_expert = new_expert.to(device=expert_device, dtype=expert_dtype)
+    experts[expert_idx] = new_expert
+
+
+try:
+    from accelerate.utils import modeling as _modes_accel_modeling
+
+    _modes_orig_set_module_tensor_to_device = (
+        _modes_accel_modeling.set_module_tensor_to_device
+    )
+
+    def _modes_patched_set_module_tensor_to_device(
+        module,
+        tensor_name,
+        device,
+        value=None,
+        dtype=None,
+        fp16_statistics=None,
+        tied_params_map=None,
+        non_blocking=False,
+        clear_cache=True,
+    ):
+        if value is not None:
+            _modes_maybe_resize_routed_expert(module, tensor_name, value)
+        return _modes_orig_set_module_tensor_to_device(
+            module,
+            tensor_name,
+            device,
+            value=value,
+            dtype=dtype,
+            fp16_statistics=fp16_statistics,
+            tied_params_map=tied_params_map,
+            non_blocking=non_blocking,
+            clear_cache=clear_cache,
+        )
+
+    _modes_accel_modeling.set_module_tensor_to_device = (
+        _modes_patched_set_module_tensor_to_device
+    )
+    if hasattr(_modes_modeling_utils, "set_module_tensor_to_device"):
+        _modes_modeling_utils.set_module_tensor_to_device = (
+            _modes_patched_set_module_tensor_to_device
+        )
+except (ImportError, AttributeError):
+    pass
+
+try:
+    from transformers import core_model_loading as _modes_core_loading
+
+    _modes_orig_set_param = _modes_core_loading.set_param_for_module
+
+    def _modes_patched_set_param(
+        model,
+        target_name,
+        param_value,
+        loading_info,
+        distributed_operation,
+        hf_quantizer,
+    ):
+        _modes_maybe_resize_routed_expert(model, target_name, param_value)
+        return _modes_orig_set_param(
+            model,
+            target_name,
+            param_value,
+            loading_info,
+            distributed_operation,
+            hf_quantizer,
+        )
+
+    _modes_core_loading.set_param_for_module = _modes_patched_set_param
+except (ImportError, AttributeError):
+    pass
+
+if hasattr(_modes_modeling_utils, "_load_parameter_into_model"):
+    _modes_orig_load_parameter_into_model = (
+        _modes_modeling_utils._load_parameter_into_model
+    )
+
+    def _modes_load_parameter_into_model(model, param_name, tensor):
+        _modes_maybe_resize_routed_expert(model, param_name, tensor)
+        return _modes_orig_load_parameter_into_model(model, param_name, tensor)
+
+    _modes_modeling_utils._load_parameter_into_model = (
+        _modes_load_parameter_into_model
+    )
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -187,17 +345,54 @@ def apply_structural_pruning(
 # ---------------------------------------------------------------------------
 
 def update_config(model: nn.Module, masks: Dict[int, torch.Tensor]) -> int:
-    """Update moe_intermediate_size in the text config to reflect the new I'.
-
-    Assumes uniform pruning (all experts have the same I' across all layers).
-    Returns I'.
-    """
+    """Keep config moe_intermediate_size unchanged and return routed expert I'."""
     # Sample I' from the first MoE layer's first expert
     first_layer = sorted(masks.keys())[0]
     I_prime = int(masks[first_layer][0].sum().item())
-    model.config.text_config.moe_intermediate_size = I_prime
-    print(f"[prune] Updated config: moe_intermediate_size = {I_prime}")
+    print(
+        "[prune] Leaving text_config.moe_intermediate_size unchanged so shared "
+        f"experts keep their original shape (routed experts saved with I'={I_prime})."
+    )
     return I_prime
+
+
+def patch_saved_remote_code(output_dir: str) -> bool:
+    """Patch copied modeling_kimi_vl.py to restore routed experts from ckpt shapes."""
+    fp = os.path.join(output_dir, "modeling_kimi_vl.py")
+    if not os.path.exists(fp):
+        print(f"[prune] WARNING: {fp} not found; skipping modeling patch")
+        return False
+
+    with open(fp, "r", encoding="utf-8") as f:
+        code = f.read()
+
+    marker = "MoDES patch: restore routed experts from checkpoint tensor shapes"
+    new_patch = _ROUTED_EXPERT_LOAD_PATCH.lstrip("\n")
+
+    if new_patch in code:
+        print("[prune] modeling_kimi_vl.py already patched.")
+        return False
+
+    if marker in code:
+        marker_idx = code.index(marker)
+        section_start = code.rfind(
+            "# ---------------------------------------------------------------------------",
+            0,
+            marker_idx,
+        )
+        if section_start == -1:
+            section_start = marker_idx
+        updated = code[:section_start].rstrip() + "\n\n" + new_patch
+        action = "Updated"
+    else:
+        updated = code.rstrip() + "\n\n" + new_patch
+        action = "Patched"
+
+    with open(fp, "w", encoding="utf-8") as f:
+        f.write(updated)
+
+    print(f"[prune] {action} modeling_kimi_vl.py for variable routed-expert reload.")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -256,8 +451,11 @@ def main() -> None:
     # ---- Load clean model (no monkey-patches) ----
     model_path = resolve_model_name_or_path(args.model_path)
     print(f"[prune] Loading model from {model_path} ...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    config = _normalize_kimi_config_for_remote_code(config)
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
+        config=config,
         torch_dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True,
@@ -276,6 +474,11 @@ def main() -> None:
     print(f"[prune] Saving pruned model to {args.output_dir} ...")
     model.save_pretrained(args.output_dir)
     processor.save_pretrained(args.output_dir)
+    for py_file in glob.glob(os.path.join(model_path, "*.py")):
+        dst = os.path.join(args.output_dir, os.path.basename(py_file))
+        shutil.copy2(py_file, dst)
+        print(f"[prune] Copied {os.path.basename(py_file)}")
+    patch_saved_remote_code(args.output_dir)
     print(f"[prune] Done.  Pruned model saved to {args.output_dir}")
 
 

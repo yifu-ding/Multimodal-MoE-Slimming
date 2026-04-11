@@ -15,7 +15,7 @@ export PYTHONPATH=".:${PYTHONPATH:-}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
-NUM_SAMPLES="${NUM_SAMPLES:-0}"          # 0 = full testdev_balanced
+NUM_SAMPLES="${NUM_SAMPLES:-500}"          # 0 = full testdev_balanced
 START_IDX="${START_IDX:-0}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"

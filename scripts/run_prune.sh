@@ -14,11 +14,11 @@ set -euo pipefail
 PREFIX="${PREFIX:-$(pwd)}"
 export PYTHONPATH="${PREFIX}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa/channel_scores.pt}"
-PRUNE_RATIO="${PRUNE_RATIO:-0.30}"
+PRUNE_RATIO="${PRUNE_RATIO:-0.50}"
 
 # Build a descriptive output dir from the ratio, e.g. "p30" for 0.30
 RATIO_TAG="p$(python3 -c "print(str(int(float('${PRUNE_RATIO}')*100)))")"
