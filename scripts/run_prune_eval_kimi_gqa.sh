@@ -21,7 +21,7 @@ set -euo pipefail
 PREFIX="${PREFIX:-$(pwd)}"
 export PYTHONPATH="${PREFIX}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa/scores.pt}"
@@ -37,7 +37,7 @@ LAYERWISE_WEIGHT_SOURCE="${LAYERWISE_WEIGHT_SOURCE:-block_loss}"
 #   expert_out_contrib : use expertwise_weights.attr_coverage from scores payload
 #   expert_usage       : use expertwise_weights.usage_coverage from scores payload
 #   empty              : uniform anchor across experts
-EXPERTWISE_WEIGHT_SOURCE="${EXPERTWISE_WEIGHT_SOURCE:-expert_out_contrib}"
+EXPERTWISE_WEIGHT_SOURCE="${EXPERTWISE_WEIGHT_SOURCE:-expert_usage}"
 EVICT_MIN_CHANNELS="${EVICT_MIN_CHANNELS:-0}"
 
 NUM_SAMPLES="${NUM_SAMPLES:-500}"
