@@ -29,8 +29,8 @@ from observations.common import (
     prepare_inputs,
     resolve_model_name_or_path,
 )
+from src.channel_scoring.collector.utils import channel_rms, safe_add_with_ema, weight_rms
 from src.channel_scoring.forward import block_forward
-from src.score_utils import channel_rms, safe_add_with_ema, weight_rms
 
 
 CHANNEL_METRICS = (
@@ -250,6 +250,21 @@ class RichScoreAccumulator:
         return payload
 
     def build_scores_payload(self, args) -> dict:
+        expert_scores = {
+            metric: (
+                _to_nested_expert_dict(self.expert_scores[metric], scalar=False)
+                if metric in CHANNEL_METRICS
+                else _to_nested_expert_dict(self.expert_scores[metric], scalar=True)
+            )
+            for metric in tuple(CHANNEL_METRICS) + tuple(EXPERT_METRICS)
+        }
+        # Compatibility aliases for downstream modality-aware loaders.
+        expert_scores["activation_text"] = _to_nested_expert_dict(
+            self.expert_scores["text_act"], scalar=False
+        )
+        expert_scores["activation_visual"] = _to_nested_expert_dict(
+            self.expert_scores["visual_act"], scalar=False
+        )
         payload = {
             "model_name_or_path": args.model_name_or_path,
             "resolved_model_name_or_path": resolve_model_name_or_path(args.model_name_or_path),
@@ -266,14 +281,7 @@ class RichScoreAccumulator:
             "layer_to_num_channels": self.layer_to_num_channels,
             "available_channel_metrics": list(CHANNEL_METRICS),
             "available_expert_metrics": list(EXPERT_METRICS),
-            "expert_scores": {
-                metric: (
-                    _to_nested_expert_dict(self.expert_scores[metric], scalar=False)
-                    if metric in CHANNEL_METRICS
-                    else _to_nested_expert_dict(self.expert_scores[metric], scalar=True)
-                )
-                for metric in tuple(CHANNEL_METRICS) + tuple(EXPERT_METRICS)
-            },
+            "expert_scores": expert_scores,
             "gate_scores": {
                 "usage": _to_nested_expert_dict(self.gate_scores["usage"], scalar=True),
             },

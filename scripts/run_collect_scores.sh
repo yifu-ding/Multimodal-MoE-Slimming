@@ -36,7 +36,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/kimi_gqa-modal2}"
 EXTRA_ARGS=("$@")
 
 CMD=(
-    python src/collect_scores.py
+    python -m src.channel_scoring.main
     --model_name_or_path "${MODEL_PATH}"
     --output_dir         "${OUTPUT_DIR}"
     --dataset            "${DATASET}"

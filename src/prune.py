@@ -216,50 +216,6 @@ def _is_moe_layer(layer_idx: int, config) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Mask generation
-# ---------------------------------------------------------------------------
-
-def generate_masks(
-    scores: Dict[int, Dict[int, torch.Tensor]],
-    prune_ratio: float,
-    layer_to_num_experts: Dict[int, int],
-    layer_to_num_channels: Dict[int, int],
-) -> Dict[int, torch.Tensor]:
-    """Generate per-expert top-k keep-masks.
-
-    For each (layer, expert) independently, keep the top-k channels by score
-    where k = max(1, round(I * (1 - prune_ratio))).
-
-    Returns
-    -------
-    masks : Dict[int, Tensor[E, I]] bool
-        True  = keep this channel
-        False = prune this channel
-    """
-    masks: Dict[int, torch.Tensor] = {}
-    for layer_idx in sorted(scores.keys()):
-        E = layer_to_num_experts[layer_idx]
-        I = layer_to_num_channels[layer_idx]
-        k = max(1, round(I * (1.0 - prune_ratio)))
-        layer_mask = torch.zeros(E, I, dtype=torch.bool)
-        for eid in range(E):
-            s = scores[layer_idx].get(eid, None)
-            if s is None or s.numel() == 0:
-                # No score available — keep first k channels (no-op for this expert)
-                layer_mask[eid, :k] = True
-            else:
-                s = s.float().cpu()
-                if s.numel() != I:
-                    raise ValueError(
-                        f"Layer {layer_idx} expert {eid}: score length {s.numel()} != I={I}"
-                    )
-                topk_idx = torch.topk(s, k, largest=True).indices
-                layer_mask[eid][topk_idx] = True
-        masks[layer_idx] = layer_mask
-    return masks
-
-
-# ---------------------------------------------------------------------------
 # Structural pruning
 # ---------------------------------------------------------------------------
 
