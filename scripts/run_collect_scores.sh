@@ -26,10 +26,12 @@ NUM_SAMPLES="${NUM_SAMPLES:-128}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 START_IDX="${START_IDX:-0}"
 SUBSET_SEED="${SUBSET_SEED:-42}"
+
 SCORE_TYPE="${SCORE_TYPE:-activation}"
 EMA="${EMA:-0.9}"
-MODALITY_AWARE="${MODALITY_AWARE:-0}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/kimi_gqa}"
+
+MODALITY_AWARE="${MODALITY_AWARE:-1}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/kimi_gqa-modal2}"
 
 EXTRA_ARGS=("$@")
 

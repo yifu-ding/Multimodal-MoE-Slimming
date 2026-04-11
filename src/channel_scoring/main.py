@@ -35,6 +35,7 @@ from src.score_utils import channel_rms, safe_add_with_ema, weight_rms
 
 CHANNEL_METRICS = (
     "activation",
+    "gateup_act",
     "saliency",
     "wa",
     "grad",
@@ -77,6 +78,22 @@ def _normalize_per_layer_counts(counts_map: Dict[int, torch.Tensor]) -> Dict[int
         denom = counts.sum().clamp_min(1.0)
         output[layer_idx] = counts / denom
     return output
+
+
+def _to_nested_expert_dict(layer_map: Dict[int, torch.Tensor], scalar: bool = False):
+    nested = {}
+    for layer_idx, tensor in layer_map.items():
+        if scalar:
+            nested[layer_idx] = {
+                eid: float(tensor[eid].item())
+                for eid in range(tensor.shape[0])
+            }
+        else:
+            nested[layer_idx] = {
+                eid: tensor[eid].detach().cpu().float()
+                for eid in range(tensor.shape[0])
+            }
+    return nested
 
 
 class ModalityActivationAccumulator:
@@ -230,6 +247,55 @@ class RichScoreAccumulator:
             }
         return payload
 
+    def build_scores_payload(self, args) -> dict:
+        payload = {
+            "model_name_or_path": args.model_name_or_path,
+            "resolved_model_name_or_path": resolve_model_name_or_path(args.model_name_or_path),
+            "dataset": args.dataset,
+            "num_samples": args.num_samples,
+            "batch_size": args.batch_size,
+            "start_idx": args.start_idx,
+            "subset_seed": args.subset_seed,
+            "score_type": args.score_type,
+            "ema": args.ema,
+            "modality_aware": self.modality_aware,
+            "layers": self.layers,
+            "layer_to_num_experts": self.layer_to_num_experts,
+            "layer_to_num_channels": self.layer_to_num_channels,
+            "available_channel_metrics": list(CHANNEL_METRICS),
+            "available_expert_metrics": list(EXPERT_METRICS),
+            "expert_scores": {
+                metric: (
+                    _to_nested_expert_dict(self.expert_scores[metric], scalar=False)
+                    if metric in CHANNEL_METRICS
+                    else _to_nested_expert_dict(self.expert_scores[metric], scalar=True)
+                )
+                for metric in tuple(CHANNEL_METRICS) + tuple(EXPERT_METRICS)
+            },
+            "gate_scores": {
+                "usage": _to_nested_expert_dict(self.gate_scores["usage"], scalar=True),
+            },
+            "layerwise_loss": dict(self.layerwise_loss),
+            # Backward-compatible aliases
+            "scores": _tensor_map_to_nested_dict(self.expert_scores["activation"]),
+            "expert_out_token_contrib": _scalar_map_to_nested_dict(
+                self.expert_scores["expert_out_token_contrib"]
+            ),
+            "expert_usage": _scalar_map_to_nested_dict(self.gate_scores["usage"]),
+        }
+        if self.modality_scores is not None:
+            payload["modality_channel_scores"] = {
+                "text": _tensor_map_to_nested_dict(self.modality_scores.activation_text),
+                "visual": _tensor_map_to_nested_dict(self.modality_scores.activation_visual),
+            }
+            payload["gate_scores"]["usage_text"] = _scalar_map_to_nested_dict(
+                self.modality_scores.usage_text
+            )
+            payload["gate_scores"]["usage_visual"] = _scalar_map_to_nested_dict(
+                self.modality_scores.usage_visual
+            )
+        return payload
+
 
 def attach_kimi_modality_hooks(model, config, accumulator: ModalityActivationAccumulator, ema: float):
     states = []
@@ -337,49 +403,9 @@ def collect_weight_scores(model, config, accumulator: RichScoreAccumulator) -> N
 
 def save_score_artifacts(output_dir: str, accumulator: RichScoreAccumulator, args) -> None:
     accumulator.finalize()
-    expert_scores_path = os.path.join(output_dir, "expert_scores.pth")
-    gate_scores_path = os.path.join(output_dir, "gate_scores.pth")
-    metadata_path = os.path.join(output_dir, "metadata.json")
-    legacy_path = os.path.join(output_dir, "channel_scores.pt")
-    layerwise_loss_path = os.path.join(output_dir, "layerwise_loss.pth")
-
-    torch.save(accumulator.expert_scores, expert_scores_path)
-    torch.save(accumulator.gate_scores, gate_scores_path)
-    torch.save(
-        torch.tensor(
-            [accumulator.layerwise_loss[layer_idx] for layer_idx in accumulator.layers],
-            dtype=torch.float32,
-        ),
-        layerwise_loss_path,
-    )
-
-    metadata = {
-        "model_name_or_path": args.model_name_or_path,
-        "resolved_model_name_or_path": resolve_model_name_or_path(args.model_name_or_path),
-        "dataset": args.dataset,
-        "num_samples": args.num_samples,
-        "batch_size": args.batch_size,
-        "start_idx": args.start_idx,
-        "subset_seed": args.subset_seed,
-        "score_type": args.score_type,
-        "ema": args.ema,
-        "modality_aware": args.modality_aware,
-        "layers": accumulator.layers,
-        "layer_to_num_experts": accumulator.layer_to_num_experts,
-        "layer_to_num_channels": accumulator.layer_to_num_channels,
-        "available_channel_metrics": list(CHANNEL_METRICS),
-        "available_expert_metrics": list(EXPERT_METRICS),
-    }
-    with open(metadata_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-
-    torch.save(accumulator.build_legacy_payload(args), legacy_path)
-    print(f"[channel_scoring] Saved expert scores: {expert_scores_path}")
-    print(f"[channel_scoring] Saved gate scores: {gate_scores_path}")
-    print(f"[channel_scoring] Saved layerwise loss: {layerwise_loss_path}")
-    print(f"[channel_scoring] Saved metadata: {metadata_path}")
-    print(f"[channel_scoring] Saved legacy payload: {legacy_path}")
+    scores_path = os.path.join(output_dir, "scores.pt")
+    torch.save(accumulator.build_scores_payload(args), scores_path)
+    print(f"[channel_scoring] Saved scores: {scores_path}")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -402,7 +428,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def run_collection(args) -> None:
     ensure_dir(args.output_dir)
-    out_path = os.path.join(args.output_dir, "expert_scores.pth")
+    out_path = os.path.join(args.output_dir, "scores.pt")
     if os.path.exists(out_path) and not args.force_recompute:
         print(
             f"[channel_scoring] Found existing scores at {out_path}. "

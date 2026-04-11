@@ -18,7 +18,7 @@ export PYTHONPATH="${PREFIX}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
-SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa-modal}"
+SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa-modal/channel_scores.pt}"
 PRUNE_RATIO="${PRUNE_RATIO:-0.50}"
 INTER_METHOD="${INTER_METHOD:-uniform}"
 INTRA_METHOD="${INTRA_METHOD:-uniform}"

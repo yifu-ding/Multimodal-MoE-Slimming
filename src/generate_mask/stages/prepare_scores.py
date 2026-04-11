@@ -54,16 +54,45 @@ def _load_legacy_payload(path: str, device: str):
     return expert_scores, gate_scores, metadata, payload
 
 
-def _load_modern_scores(scores_dir: str, device: str):
-    expert_scores = torch.load(os.path.join(scores_dir, "expert_scores.pth"), map_location=device)
-    gate_scores_path = os.path.join(scores_dir, "gate_scores.pth")
-    gate_scores = torch.load(gate_scores_path, map_location=device) if os.path.exists(gate_scores_path) else {}
-    metadata_path = os.path.join(scores_dir, "metadata.json")
-    metadata = {}
-    if os.path.exists(metadata_path):
-        with open(metadata_path, "r", encoding="utf-8") as f:
-            metadata = json.load(f)
-    return expert_scores, gate_scores, metadata, None
+def _nested_scores_to_layer_tensors(nested):
+    output = {}
+    for lid in sorted(nested.keys()):
+        expert_ids = sorted(nested[lid].keys())
+        first_val = nested[lid][expert_ids[0]] if expert_ids else None
+        if first_val is None:
+            output[lid] = torch.empty(0)
+            continue
+        if isinstance(first_val, torch.Tensor):
+            output[lid] = torch.stack(
+                [nested[lid][eid].detach().cpu().float() for eid in expert_ids],
+                dim=0,
+            )
+        else:
+            output[lid] = torch.tensor(
+                [float(nested[lid][eid]) for eid in expert_ids],
+                dtype=torch.float32,
+            )
+    return output
+
+
+def _load_scores_payload(path: str, device: str):
+    payload = torch.load(path, map_location=device, weights_only=False)
+    if "expert_scores" not in payload:
+        return _load_legacy_payload(path, device)
+    expert_scores = {
+        metric: _nested_scores_to_layer_tensors(nested)
+        for metric, nested in payload["expert_scores"].items()
+    }
+    gate_scores = {
+        metric: _nested_scores_to_layer_tensors(nested)
+        for metric, nested in payload.get("gate_scores", {}).items()
+    }
+    metadata = {
+        "modality_aware": bool(payload.get("modality_aware", False)),
+        "layers": payload.get("layers", sorted(next(iter(payload["expert_scores"].values())).keys())),
+        "layerwise_loss": payload.get("layerwise_loss", {}),
+    }
+    return expert_scores, gate_scores, metadata, payload
 
 
 def load_channel_scores(
@@ -74,22 +103,24 @@ def load_channel_scores(
 ) -> Tuple[Dict[str, Dict[int, torch.Tensor]], Optional[Dict[str, Dict[int, torch.Tensor]]], Dict[str, Any], Optional[dict]]:
     if os.path.isfile(scores_dir):
         if verbose:
-            _print(f"[Score Loading] Loading legacy payload from {scores_dir}")
-        expert_scores, gate_scores, metadata, payload = _load_legacy_payload(scores_dir, device)
+            _print(f"[Score Loading] Loading scores payload from {scores_dir}")
+        expert_scores, gate_scores, metadata, payload = _load_scores_payload(scores_dir, device)
         return expert_scores, None, {"gate_scores": gate_scores, "metadata": metadata}, payload
 
-    modern_fp = os.path.join(scores_dir, "expert_scores.pth")
+    modern_fp = os.path.join(scores_dir, "scores.pt")
     legacy_fp = os.path.join(scores_dir, "channel_scores.pt")
-    if not os.path.exists(modern_fp) and os.path.exists(legacy_fp):
+    if os.path.exists(modern_fp):
+        if verbose:
+            _print(f"[Score Loading] Loading unified scores payload from {modern_fp}")
+        expert_scores, gate_scores, metadata, payload = _load_scores_payload(modern_fp, device)
+        return expert_scores, None, {"gate_scores": gate_scores, "metadata": metadata}, payload
+    if os.path.exists(legacy_fp):
         if verbose:
             _print(f"[Score Loading] Falling back to legacy payload at {legacy_fp}")
         expert_scores, gate_scores, metadata, payload = _load_legacy_payload(legacy_fp, device)
         return expert_scores, None, {"gate_scores": gate_scores, "metadata": metadata}, payload
 
-    if verbose:
-        _print(f"[Score Loading] Loading score directory from {scores_dir}")
-    expert_scores, gate_scores, metadata, payload = _load_modern_scores(scores_dir, device)
-    return expert_scores, None, {"gate_scores": gate_scores, "metadata": metadata}, payload
+    raise FileNotFoundError(f"No scores.pt found under {scores_dir}")
 
 
 def load_layerwise_loss(
@@ -103,16 +134,20 @@ def load_layerwise_loss(
     if "loss" not in inter_layer_method:
         return m
 
-    if os.path.isfile(scores_dir):
-        maybe_dir = os.path.dirname(scores_dir)
-    else:
-        maybe_dir = scores_dir
-    fp = os.path.join(maybe_dir, "layerwise_loss.pth")
-    if not os.path.exists(fp):
-        raise FileNotFoundError(f"layerwise_loss.pth not found under {maybe_dir}")
-    layerwise_loss = torch.load(fp, map_location=device)
+    scores_fp = scores_dir if os.path.isfile(scores_dir) else os.path.join(scores_dir, "scores.pt")
+    if not os.path.exists(scores_fp):
+        raise FileNotFoundError(f"scores.pt not found under {scores_dir}")
+    payload = torch.load(scores_fp, map_location=device, weights_only=False)
+    layerwise_loss_dict = payload.get("layerwise_loss", None)
+    if layerwise_loss_dict is None:
+        raise FileNotFoundError(f"layerwise_loss not found in {scores_fp}")
+    layerwise_loss = torch.tensor(
+        [layerwise_loss_dict[layer] for layer in sorted(layerwise_loss_dict.keys())],
+        dtype=torch.float32,
+        device=device,
+    )
     if verbose:
-        _print(f"[Score Loading] Loading layerwise_loss from {fp}")
+        _print(f"[Score Loading] Loading layerwise_loss from {scores_fp}")
     m["layerwise_loss"] = layerwise_loss
     if inter_layer_method.startswith("loss_smooth_"):
         m["smooth_times"] = int(inter_layer_method.split("_")[-1])
@@ -142,14 +177,8 @@ def load_modality_channel_scores(scores_dir: str, device: str = "cpu"):
     visual_scores = expert_scores.get("activation_visual")
     if text_scores is None or visual_scores is None:
         if payload is not None and payload.get("modality_channel_scores") is not None:
-            text_scores = {
-                lid: dict_to_tensor(payload["modality_channel_scores"]["text"])[idx]
-                for idx, lid in enumerate(sorted(payload["modality_channel_scores"]["text"].keys()))
-            }
-            visual_scores = {
-                lid: dict_to_tensor(payload["modality_channel_scores"]["visual"])[idx]
-                for idx, lid in enumerate(sorted(payload["modality_channel_scores"]["visual"].keys()))
-            }
+            text_scores = _nested_scores_to_layer_tensors(payload["modality_channel_scores"]["text"])
+            visual_scores = _nested_scores_to_layer_tensors(payload["modality_channel_scores"]["visual"])
         else:
             return None
     return {

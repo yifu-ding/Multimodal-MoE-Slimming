@@ -75,6 +75,22 @@ def _unwrap_output(output):
     return output[0] if isinstance(output, (tuple, list)) else output
 
 
+def _resolve_activation_fn(expert: nn.Module):
+    for attr in ("act_fn", "activation_fn"):
+        fn = getattr(expert, attr, None)
+        if fn is not None:
+            return fn
+    return torch.nn.functional.silu
+
+
+def _compute_gateup_act(expert: nn.Module, gate_output: torch.Tensor, up_output: torch.Tensor):
+    if gate_output is None or up_output is None:
+        return None
+    activation = _resolve_activation_fn(expert)(gate_output.detach()) * up_output.detach()
+    dims = tuple(range(activation.dim() - 1))
+    return activation.abs().to(torch.float32).mean(dim=dims)
+
+
 def _compute_block_loss(
     pred: torch.Tensor,
     teacher_target: torch.Tensor,
@@ -355,6 +371,9 @@ def collect_scores_attn_mlp(cnt_block,
                 if down_input is not None:
                     wg_mean = compute_wg_I(W_down, W_up, W_gate, W_down.grad, W_up.grad, W_gate.grad)
                     safe_add_with_ema(expert, ema, wg_mean, "wg")
+
+                    gateup_act = _compute_gateup_act(expert, gate_output, up_output)
+                    safe_add_with_ema(expert, ema, gateup_act, "gateup_act")
                 
                     token_contrib_I = compute_token_contrib_I(down_input, down_grad, up_output, up_out_grad, gate_output, gate_grad)
                     safe_add_with_ema(expert, ema, token_contrib_I, "token_contrib")

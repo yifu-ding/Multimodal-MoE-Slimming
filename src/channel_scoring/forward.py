@@ -35,6 +35,20 @@ def _move_to_device_dtype(obj: Any, device: torch.device, dtype: torch.dtype):
     return obj
 
 
+def _enable_input_grads(obj: Any):
+    if isinstance(obj, torch.Tensor):
+        if obj.is_floating_point():
+            return obj.detach().requires_grad_(True)
+        return obj.detach()
+    if isinstance(obj, tuple):
+        return tuple(_enable_input_grads(x) for x in obj)
+    if isinstance(obj, list):
+        return [_enable_input_grads(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _enable_input_grads(v) for k, v in obj.items()}
+    return obj
+
+
 def _unwrap_output(output):
     return output[0] if isinstance(output, (tuple, list)) else output
 
@@ -158,7 +172,7 @@ def block_forward(
     teacher_block = list(_kimi_teacher_block(model))[layer_idx]
     block_device = next(teacher_block.parameters()).device
     cnt_block = cnt_block.to(device=block_device, dtype=dtype)
-    cnt_block.train()
+    cnt_block.eval()
 
     teacher_state: Dict[str, Any] = {}
     teacher_handle = _register_teacher_block_hook(teacher_block, teacher_state)
@@ -183,8 +197,12 @@ def block_forward(
             if not teacher_state:
                 raise RuntimeError(f"Teacher block hook did not capture layer {layer_idx} inputs.")
 
-            in_args = _move_to_device_dtype(teacher_state["in_args"], block_device, dtype)
-            in_kwargs = _move_to_device_dtype(teacher_state["in_kwargs"], block_device, dtype)
+            in_args = _enable_input_grads(
+                _move_to_device_dtype(teacher_state["in_args"], block_device, dtype)
+            )
+            in_kwargs = _enable_input_grads(
+                _move_to_device_dtype(teacher_state["in_kwargs"], block_device, dtype)
+            )
             teacher_target = _unwrap_output(teacher_state["output"])
             teacher_target = _move_to_device_dtype(teacher_target, block_device, dtype)
 
