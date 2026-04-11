@@ -22,6 +22,7 @@ for p in (REPO_PARENT, REPO_ROOT):
         sys.path.insert(0, p)
 
 import torch
+import transformers
 from tqdm.auto import tqdm
 
 from models.kimi import load_model as load_model_patched
@@ -76,10 +77,14 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     print(f"[Eval] Resolving model: {args.model_name_or_path}")
+    print(f"[Eval] transformers: {transformers.__version__} @ {transformers.__file__}")
     model_path = resolve_model_name_or_path(args.model_name_or_path)
     print(f"[Eval] Loading model from: {model_path}")
+    threshold_noop = (
+        args.affinity_path is not None and args.affinity_threshold >= 1.0
+    )
 
-    if args.affinity_path is not None:
+    if args.affinity_path is not None and not threshold_noop:
         # load_model_patched binds gate_forward and model_forward which propagate
         # moe_text_index / moe_media_index to every gate — required for affinity routing.
         print("[Eval] Affinity path provided: loading model with full MoDES patches.")
@@ -99,10 +104,16 @@ def main():
     device = next(model.parameters()).device
     print(f"[Eval] Model loaded. Primary device: {device}")
 
-    if args.affinity_path is not None:
+    if args.affinity_path is not None and not threshold_noop:
         print(f"[Eval] Loading affinity from: {args.affinity_path}")
         affinity = load_affinity(args.affinity_path)
         attach_modality_aware_router(model, affinity, threshold=args.affinity_threshold)
+    elif threshold_noop:
+        print(
+            "[Eval] affinity_threshold>=1.0 makes thresholded affinity routing a "
+            "strict no-op; skipping affinity attachment so results match the "
+            "no-affinity path."
+        )
     else:
         print("[Eval] No affinity path provided; using standard routing.")
 

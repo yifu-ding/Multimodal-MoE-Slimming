@@ -333,6 +333,7 @@ def _build_masks_coverage(
     layer_keep_ratios: List[float],
     layer_to_num_experts: Dict[int, int],
     layer_to_num_channels: Dict[int, int],
+    expertwise_weights: Optional[torch.Tensor] = None,
     max_iter: int = 64,
 ) -> Dict[int, torch.Tensor]:
     """
@@ -340,8 +341,9 @@ def _build_masks_coverage(
 
     For each layer l with total budget k_layer = round(E * I * keep_ratio_l):
 
-      1. Weight each expert e by its score mass: w_e = sum(scores_e) / sum_layer
-         (more activated experts get a larger share of the coverage budget).
+      1. Use an external per-expert anchor weight w_e within the layer.
+         This determines the relative target coverage ratio across experts
+         before binary-searching the shared scale factor.
 
       2. Binary-search for a scale factor t such that
              sum_e( k_e(w_e * t) ) ≈ k_layer
@@ -352,6 +354,8 @@ def _build_masks_coverage(
     Effect: an expert whose channels are highly concentrated (one channel
     dominates) needs fewer kept channels to maintain its saliency than an
     expert with a flat score distribution — more principled than top-k.
+
+    If expertwise_weights is None, falls back to a uniform anchor across experts.
 
     Ported from:
       LLM-Distillation/src/prune/generate/planners/intra_layer/algo/coverage.py
@@ -365,29 +369,28 @@ def _build_masks_coverage(
 
         # Per-expert sorted scores and prefix sums
         expert_s_info: List[Dict[str, Any]] = []
-        total_mass_layer = 0.0
         for eid in range(E):
             sv = _get_expert_scores(scores, layer_idx, eid, I).clamp_min(0.0)
             sv_sorted, _ = torch.sort(sv, descending=True)
             prefix = torch.cumsum(sv_sorted, dim=0)
             total_e = float(prefix[-1].item()) if sv.numel() > 0 else 0.0
-            mass = float(sv.sum().item())
-            total_mass_layer += mass
             expert_s_info.append({
                 "sorted": sv_sorted,
                 "prefix": prefix,
                 "total": total_e,
-                "mass": mass,
             })
 
-        # Coverage weights proportional to score mass
-        cov_weights = torch.tensor(
-            [info["mass"] / (total_mass_layer + 1e-12) for info in expert_s_info],
-            dtype=torch.float32,
-        )
-        # If all masses zero, fall back to uniform
-        if total_mass_layer < 1e-12:
+        if expertwise_weights is None:
             cov_weights = torch.ones(E, dtype=torch.float32) / E
+        else:
+            cov_weights = expertwise_weights[li].float().cpu().clone()
+            cov_weights = cov_weights.clamp_min(0.0)
+            cov_weights = torch.sqrt(cov_weights)
+            total_cov = float(cov_weights.sum().item())
+            if total_cov < 1e-12:
+                cov_weights = torch.ones(E, dtype=torch.float32) / E
+            else:
+                cov_weights /= total_cov
 
         # Binary search for scale t such that sum(k_e(w_e * t)) ≈ k_layer
         def _total_kept(t: float) -> Tuple[int, List[int]]:
@@ -681,6 +684,8 @@ def generate_masks(
     intra_method: str = "expertwise",
     # coverage inter-layer kwargs
     layerwise_weights: Optional[torch.Tensor] = None,
+    # coverage intra-layer kwargs
+    expertwise_weights: Optional[torch.Tensor] = None,
     # eviction adjuster kwargs
     evict_min_channels: int = 0,
 ) -> Dict[int, torch.Tensor]:
@@ -700,6 +705,9 @@ def generate_masks(
         Per-layer importance weights for the "coverage" inter-layer method.
         Typical source: per-layer ablation loss increase.
         If None, uses plain (unweighted) coverage binary search.
+    expertwise_weights : Tensor[L, E], optional
+        Per-expert anchor weights for the "coverage" intra-layer planner.
+        If None, uses a uniform anchor within each layer.
     evict_min_channels : int, optional
         If > 0, run a post-planning eviction pass: any expert left with fewer
         than this many channels is fully evicted (set to 0), and the freed
@@ -749,6 +757,7 @@ def generate_masks(
         masks = _build_masks_coverage(
             scores, sorted_layers, layer_keep_ratios,
             layer_to_num_experts, layer_to_num_channels,
+            expertwise_weights=expertwise_weights,
         )
 
     # --- optional eviction pass ---

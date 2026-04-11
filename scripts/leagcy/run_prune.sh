@@ -32,7 +32,7 @@ SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa/scores.pt}"
 PRUNE_RATIO="${PRUNE_RATIO:-0.50}"
 
 # Pruning - building mask
-INTER_METHOD="${INTER_METHOD:-uniform}"    # uniform | coverage | global 
+INTER_METHOD="${INTER_METHOD:-uniform}"     # uniform | coverage | global 
 INTRA_METHOD="${INTRA_METHOD:-layerwise}"    # expertwise | layerwise |  coverage
 # Layerwise weights source for coverage inter-layer (leave empty for unweighted)
 #   uniform : 随便填一个值，fallback 到 uniform 

@@ -901,7 +901,6 @@ def gate_forward(self, hidden_states, **kwargs):
             f"insupportable scoring function for MoE gating: {self.scoring_func}"
         )
     
-    import ipdb; ipdb.set_trace()
     # select top-k experts
     if self.topk_method == "noaux_tc":
         assert not self.training
@@ -945,16 +944,21 @@ def gate_forward(self, hidden_states, **kwargs):
             if vis_only is not None and txt_idx.numel() > 0:
                 # Text tokens cannot activate visual-preferring experts
                 vis_only = vis_only.to(tmp_scores.device)
-                tmp_scores[txt_idx.unsqueeze(1), vis_only.unsqueeze(0)] = 0.0
+                tmp_scores[txt_idx.unsqueeze(1), vis_only.unsqueeze(0)] = -float('inf')
             if txt_only is not None and vis_idx.numel() > 0:
                 # Visual tokens cannot activate text-preferring experts
                 txt_only = txt_only.to(tmp_scores.device)
-                tmp_scores[vis_idx.unsqueeze(1), txt_only.unsqueeze(0)] = 0.0
+                tmp_scores[vis_idx.unsqueeze(1), txt_only.unsqueeze(0)] = -float('inf')
 
-        _, topk_idx = torch.topk(
+        topk_weight, topk_idx = torch.topk(
             tmp_scores, k=self.top_k, dim=-1, sorted=True
         )  # important!!!
-        topk_weight = scores.gather(1, topk_idx)
+        # Preserve affinity masking in the final routing result. If topk needs to
+        # fill from the -inf tail, treat those entries as dropped experts.
+        invalid_topk = ~torch.isfinite(topk_weight)
+        if invalid_topk.any():
+            topk_weight = topk_weight.masked_fill(invalid_topk, 0.0)
+            topk_idx = topk_idx.masked_fill(invalid_topk, len(self.experts))
     elif self.topk_method == "greedy":
         if hasattr(self, "affinity_mask") and self.affinity_mask is not None:
             txt_idx = self.moe_text_index.view(-1)
@@ -962,9 +966,9 @@ def gate_forward(self, hidden_states, **kwargs):
             vis_only = self.affinity_mask.get("visual_only")
             txt_only = self.affinity_mask.get("text_only")
             if vis_only is not None and txt_idx.numel() > 0:
-                scores[txt_idx.unsqueeze(1), vis_only.to(scores.device).unsqueeze(0)] = 0.0
+                scores[txt_idx.unsqueeze(1), vis_only.to(scores.device).unsqueeze(0)] = -float('inf')
             if txt_only is not None and vis_idx.numel() > 0:
-                scores[vis_idx.unsqueeze(1), txt_only.to(scores.device).unsqueeze(0)] = 0.0
+                scores[vis_idx.unsqueeze(1), txt_only.to(scores.device).unsqueeze(0)] = -float('inf')
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
     else:
         raise NotImplementedError(
@@ -1257,9 +1261,17 @@ def prepare_inputs_for_generation(
         **kwargs,
     )
 
-    # If we're in cached decoding stage, pixel values should be None because input ids do not contain special image token anymore
-    # Otherwise we need pixel values to be passed to model
-    if cache_position is not None and cache_position[0] == 0:
+    # Pass pixel_values only during prefill (first forward).
+    # cache_position may be None in newer transformers; use past_key_values to detect prefill.
+    _is_prefill = (
+        past_key_values is None
+        or (
+            hasattr(past_key_values, "get_seq_length")
+            and past_key_values.get_seq_length() == 0
+        )
+        or (cache_position is not None and cache_position[0] == 0)
+    )
+    if _is_prefill:
         model_inputs["pixel_values"] = pixel_values
         model_inputs["image_grid_hws"] = image_grid_hws
 
@@ -1367,12 +1379,23 @@ def _sync_remote_code_cache(model_path: str) -> None:
         os.environ.get("HUGGINGFACE_HUB_CACHE", default_hf_home),
     )
     model_name = os.path.basename(os.path.abspath(model_path))
-    cache_dir = os.path.join(hf_home, "modules", "transformers_modules", model_name)
-    if not os.path.isdir(cache_dir):
-        return  # cache not yet populated; first load will create it from local
-    cached_file = os.path.join(cache_dir, "modeling_kimi_vl.py")
-    shutil.copy2(local_code, cached_file)
-    logger.info(f"[kimi] Synced modeling_kimi_vl.py → {cached_file}")
+    modules_root = os.path.join(hf_home, "modules", "transformers_modules")
+    # HF may store hub models under "_<hash>" (underscore-prefixed) instead of just "<hash>"
+    candidates = [model_name, f"_{model_name}"]
+    for candidate in candidates:
+        cache_dir = os.path.join(modules_root, candidate)
+        if os.path.isdir(cache_dir):
+            cached_file = os.path.join(cache_dir, "modeling_kimi_vl.py")
+            try:
+                shutil.copy2(local_code, cached_file)
+            except PermissionError:
+                logger.warning(
+                    f"[kimi] Skip syncing modeling_kimi_vl.py (permission denied): {cached_file}"
+                )
+                return
+            logger.info(f"[kimi] Synced modeling_kimi_vl.py → {cached_file}")
+            return
+    # cache not yet populated; first load will create it from local
 
 
 def load_model(
@@ -1491,6 +1514,13 @@ def load_model_plain(
     )
     model.eval()
     processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+    # Keep baseline routing/forward behavior, but override generation input
+    # preparation so Kimi-VL remains compatible with newer transformers where
+    # `cache_position` may be omitted for remote-code models.
+    model.prepare_inputs_for_generation = prepare_inputs_for_generation.__get__(model)
+    model.language_model.prepare_inputs_for_generation = (
+        prepare_inputs_for_generation_language.__get__(model.language_model)
+    )
     return model, processor
 
 

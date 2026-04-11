@@ -12,20 +12,17 @@ set -euo pipefail
 PREFIX="${PREFIX:-$(pwd)}"
 export PYTHONPATH="${PREFIX}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
-# MODEL_PATH="/home/dyf/code/distill/MoDES/storage/prune/pruned_models/kimi_gqa_p30_uniform_layerwise"
-# MODEL_PATH="/home/dyf/code/distill/MoDES/storage/prune/pruned_models/kimi_gqa_p30_coverage_coverage"
-NUM_SAMPLES="${NUM_SAMPLES:-500}"          # 0 = full testdev_balanced
+NUM_SAMPLES="${NUM_SAMPLES:-100}"          # 0 = full testdev_balanced
 START_IDX="${START_IDX:-0}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"
 SUBSET_SEED="${SUBSET_SEED:-}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/results/affinity_threshold_0.9_kimi_gqa}"
-
+OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/results/baseline_kimi_gqa}"
 AFFINITY_PATH="${AFFINITY_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa/affinity.pt}"
-AFFINITY_THRESHOLD="${AFFINITY_THRESHOLD:-0.9}"
+AFFINITY_THRESHOLD="${AFFINITY_THRESHOLD:-1.0}"
 
 EXTRA_ARGS=("$@")
 

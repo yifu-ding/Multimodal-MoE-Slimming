@@ -39,6 +39,7 @@ import argparse
 import os
 import sys
 import types
+import warnings
 from typing import Dict, List, Optional
 
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -130,7 +131,7 @@ class ContribAccumulator:
 
     Gradient-based (only when --collect_contrib, via block-forward pass):
       layerwise_loss[l]          : MLP-level reconstruction loss vs teacher
-      expert_out_contrib[l][e]   : |down_out * down_out_grad|.sum() * usage
+      expert_out_contrib[l][e]   : token_contrib(down_out_grad, down_output).sum() * usage
 
     All scalars are float (None until first update).
     """
@@ -151,6 +152,9 @@ class ContribAccumulator:
         self.expert_out_contrib: Dict[int, Dict[int, Optional[float]]] = {
             l: {e: None for e in range(E[l])} for l in self.layers
         }
+        self._layerwise_loss_counts: Dict[int, int] = {
+            l: 0 for l in self.layers
+        }
 
     def _ema_scalar(self, old: Optional[float], new: float, ema: float) -> float:
         return new if old is None else old * ema + new * (1.0 - ema)
@@ -164,7 +168,10 @@ class ContribAccumulator:
         )
 
     def update_layer_loss(self, l: int, loss: float, ema: float) -> None:
-        self.layerwise_loss[l] = self._ema_scalar(self.layerwise_loss[l], loss, ema)
+        old = self.layerwise_loss[l]
+        count = self._layerwise_loss_counts[l]
+        self.layerwise_loss[l] = loss if old is None else ((old * count) + loss) / (count + 1)
+        self._layerwise_loss_counts[l] = count + 1
 
     def update_expert_contrib(self, l: int, e: int, contrib: float, ema: float) -> None:
         self.expert_out_contrib[l][e] = self._ema_scalar(
@@ -230,7 +237,7 @@ def compute_modality_affinity(
         original_moe_infer = layer.mlp.moe_infer
         orig_infers[layer_idx] = original_moe_infer
 
-        def _survey_moe_infer(
+        def _compute_moe_infer(
             self,
             x,
             topk_ids,
@@ -276,7 +283,7 @@ def compute_modality_affinity(
                 self.freq_save_dir = saved
             return out
 
-        layer.mlp.moe_infer = types.MethodType(_survey_moe_infer, layer.mlp)
+        layer.mlp.moe_infer = types.MethodType(_compute_moe_infer, layer.mlp)
 
     model.eval()
     with torch.no_grad():
@@ -285,8 +292,12 @@ def compute_modality_affinity(
             inputs = move_inputs_to_model_device(model, inputs)
             try:
                 model(**inputs, use_cache=False, return_dict=True)
-            except Exception:
-                pass
+            except Exception as exc:
+                warnings.warn(
+                    "[collect_scores] Forward failed during affinity computation "
+                    f"({type(exc).__name__}: {exc}).",
+                    stacklevel=2,
+                )
 
     # Restore original moe_infer
     for layer_idx, layer in enumerate(model.language_model.model.layers):
@@ -327,6 +338,7 @@ def attach_scoring_hooks(
     affinity: Optional[Dict[int, Dict[int, float]]] = None,
     affinity_mode: str = "threshold", # threshold | scalar
     affinity_threshold: float = 0.9,
+    track_usage: bool = True,
 ) -> None:
     """Monkey-patch moe_infer on every MoE layer.
 
@@ -402,6 +414,7 @@ def attach_scoring_hooks(
             ).permute(2, 1, 0)  # [E, topk, T]
 
             expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+            
             for et in expert_hit:
                 eid = int(et[0].item())
                 _, token_idx = torch.where(expert_mask[eid])
@@ -418,15 +431,16 @@ def attach_scoring_hooks(
                         if vis_flat is not None:
                             vis_flat = vis_flat.to(x.device).view(-1)
                             keep = vis_flat[token_idx]
-                            if keep.any():
-                                score_token_idx = token_idx[keep]
+                            score_token_idx = token_idx[keep]
                     elif aff < -__threshold:
                         txt_flat = getattr(self, "moe_text_mask", None)
                         if txt_flat is not None:
                             txt_flat = txt_flat.to(x.device).view(-1)
                             keep = txt_flat[token_idx]
-                            if keep.any():
-                                score_token_idx = token_idx[keep]
+                            score_token_idx = token_idx[keep]
+
+                    if score_token_idx.numel() == 0:
+                        continue
 
                     with torch.no_grad():
                         act = compute_generic_expert_activation(
@@ -462,10 +476,10 @@ def attach_scoring_hooks(
                         act = compute_generic_expert_activation(
                             self.experts[eid], x[token_idx]
                         )  # [T', I]
-
-                    vis_weight = max(aff, 0.0)    # ∈ [0, 1]
-                    txt_weight = max(-aff, 0.0)   # ∈ [0, 1]
-
+                   
+                    vis_weight = (aff + 1.0) / 2.0
+                    txt_weight = (1.0 - aff) / 2.0
+ 
                     if vis_sel.any() and vis_weight > 0.0:
                         vis_score = channel_rms(act[vis_sel]) * vis_weight
                     else:
@@ -496,8 +510,9 @@ def attach_scoring_hooks(
                 __acc.update(__layer_idx, eid, score, __ema)
 
                 # Gradient-free contribution proxy: routing fraction
-                usage = float(token_idx.numel()) / float(total_tokens)
-                __cacc.update_usage(__layer_idx, eid, usage, __ema)
+                if track_usage:
+                    usage = float(token_idx.numel()) / float(total_tokens)
+                    __cacc.update_usage(__layer_idx, eid, usage, __ema)
 
             # Run original moe_infer (which has its own no_grad context).
             saved = getattr(self, "freq_save_dir", None)
@@ -533,7 +548,12 @@ def collect_weight_scores(
         for eid, expert in enumerate(layer.mlp.experts):
             g = expert.gate_proj.weight  # [I, H]
             u = expert.up_proj.weight    # [I, H]
-            score = (weight_rms(g) + weight_rms(u)) / 2.0  # [I]
+            d = expert.down_proj.weight  # [H, I]
+            score = (
+                weight_rms(g, channel_dim=0)
+                + weight_rms(u, channel_dim=0)
+                + weight_rms(d, channel_dim=1)
+            ) / 3.0  # [I]
             accumulator.update(layer_idx, eid, score, ema=1.0)
 
 
@@ -639,6 +659,66 @@ def _rel_l2_loss(
     return rel.mean()
 
 
+def _reference_token_contrib(
+    grad: torch.Tensor,
+    activation: torch.Tensor,
+    trim_head: float = 0.01,
+) -> torch.Tensor:
+    """Reference token-contribution estimator from channel_scoring.
+
+    Computes a clipped mean of g * z per channel, then returns [C].
+    """
+    if grad.shape != activation.shape:
+        raise ValueError(
+            f"grad and activation must have the same shape, got "
+            f"{tuple(grad.shape)} vs {tuple(activation.shape)}"
+        )
+    channels = activation.size(-1)
+    gz = (grad * activation).reshape(-1, channels).to(torch.float32)
+    if gz.numel() == 0:
+        return torch.zeros(channels, dtype=torch.float32, device=activation.device)
+    if gz.size(0) <= 2 or trim_head <= 0.0:
+        return gz.mean(dim=0)
+
+    trim_head = float(max(0.0, min(trim_head, 0.49)))
+    abs_gz = gz.abs()
+    q_high = torch.quantile(abs_gz, 1.0 - trim_head, dim=0, keepdim=True)
+    q_high = torch.clamp(q_high, min=1e-25)
+    clipped = torch.clamp(gz, min=-q_high, max=q_high)
+    return clipped.mean(dim=0)
+
+
+def _build_reference_expertwise_weights(
+    source: Dict[int, Dict[int, Optional[float]]],
+    layers: List[int],
+    layer_to_num_experts: Dict[int, int],
+    negate: bool = False,
+) -> Dict[int, Dict[int, float]]:
+    """Convert raw per-expert scores to reference coverage weights.
+
+    Matches the reference coverage preprocessing:
+      1. optional negate (used by attr_coverage)
+      2. clamp negatives to 0
+      3. sqrt compression
+      4. per-layer normalize to sum 1 when the row is non-zero
+    """
+    result: Dict[int, Dict[int, float]] = {}
+    for layer_idx in layers:
+        vals = []
+        for eid in range(layer_to_num_experts[layer_idx]):
+            value = source[layer_idx].get(eid, None)
+            value = 0.0 if value is None else float(value)
+            vals.append(-value if negate else value)
+        row = torch.tensor(vals, dtype=torch.float32)
+        row = torch.clamp(row, min=0.0)
+        row = torch.sqrt(row)
+        row_sum = float(row.sum().item())
+        if row_sum > 0.0:
+            row = row / row_sum
+        result[layer_idx] = {eid: float(row[eid].item()) for eid in range(row.numel())}
+    return result
+
+
 def collect_block_contrib_scores(
     model,
     config,
@@ -700,8 +780,15 @@ def collect_block_contrib_scores(
         with torch.no_grad():
             try:
                 model(**inputs, use_cache=False, return_dict=True)
-            except Exception:
-                pass
+            except Exception as exc:
+                warnings.warn(
+                    "[collect_scores] Teacher forward failed during block contribution "
+                    f"collection ({type(exc).__name__}: {exc}).",
+                    stacklevel=2,
+                )
+                for h in hooks:
+                    h.remove()
+                continue
 
         for h in hooks:
             h.remove()
@@ -765,17 +852,24 @@ def collect_block_contrib_scores(
                 contrib_acc.update_layer_loss(layer_idx, float(loss.item()), ema)
 
                 # Collect per-expert output contribution
-                # T_total = total tokens in the batch (for usage fraction)
-                T_total = int(h_in.shape[-2]) if h_in.ndim >= 2 else int(h_in.shape[0])
+                # T_total = total valid tokens in the batch (for usage fraction)
+                if attn_mask is not None:
+                    T_total = int(attn_mask.sum().item())
+                elif h_in.ndim >= 3:
+                    T_total = int(h_in.shape[0] * h_in.shape[1])
+                else:
+                    T_total = int(h_in.shape[0])
                 for eid, saves in expert_out_saves.items():
                     if saves["out"] is not None and saves["grad"] is not None:
-                        saliency = float(
-                            (saves["out"].float() * saves["grad"].float())
-                            .abs().sum().item()
-                        )
                         usage = saves["n_tokens"] / max(T_total, 1)
+                        token_contrib = _reference_token_contrib(
+                            saves["grad"].float(),
+                            saves["out"].float(),
+                        )
+                        contrib = float(token_contrib.sum().item() * usage)
+                        contrib_acc.update_usage(layer_idx, eid, usage, ema)
                         contrib_acc.update_expert_contrib(
-                            layer_idx, eid, saliency * usage, ema
+                            layer_idx, eid, contrib, ema
                         )
 
             except Exception as exc:
@@ -886,6 +980,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_arg_parser().parse_args()
     ensure_dir(args.output_dir)
+    threshold_noop = (
+        args.modality_aware
+        and args.affinity_mode == "threshold"
+        and args.affinity_threshold >= 1.0
+    )
     if not args.modality_aware:
         out_filename = "scores.pt"
     elif args.affinity_mode == "threshold":
@@ -943,7 +1042,7 @@ def main() -> None:
             return prepare_inputs(bundle, batch, args.dataset)
 
         # ── Optional: preliminary routing-computation pass to compute modality affinity ──
-        if args.modality_aware:
+        if args.modality_aware and not threshold_noop:
             print("[collect_scores] modality_aware=True: running routing-computation pass "
                   "to compute expert modality affinity.")
             affinity = compute_modality_affinity(
@@ -952,14 +1051,21 @@ def main() -> None:
             aff_path = os.path.join(args.output_dir, "affinity.pt")
             torch.save({"affinity": affinity, "threshold": args.affinity_threshold}, aff_path)
             print(f"[collect_scores] Affinity saved to {aff_path}.")
+        elif threshold_noop:
+            print(
+                "[collect_scores] affinity_mode=threshold with affinity_threshold>=1.0 "
+                "is a strict no-op; skipping affinity computation and scoring will "
+                "match the non-modality-aware path."
+            )
 
         print(f"[collect_scores] score_type=activation: attaching hooks, "
               f"dataset={args.dataset}.")
         attach_scoring_hooks(
             model, config, accumulator, contrib_acc, args.ema,
-            affinity=affinity,
+            affinity=None if threshold_noop else affinity,
             affinity_mode=args.affinity_mode,
             affinity_threshold=args.affinity_threshold,
+            track_usage=not args.collect_contrib,
         )
 
         model.eval()
@@ -967,7 +1073,14 @@ def main() -> None:
             for batch in tqdm(loader, desc="Collecting scores", unit="batch"):
                 inputs = _prepare_fn(batch)
                 inputs = move_inputs_to_model_device(model, inputs)
-                model(**inputs, use_cache=False, return_dict=True)
+                try:
+                    model(**inputs, use_cache=False, return_dict=True)
+                except Exception as exc:
+                    warnings.warn(
+                        "[collect_scores] Forward failed during score collection "
+                        f"({type(exc).__name__}: {exc}).",
+                        stacklevel=2,
+                    )
 
         # ── Optional: gradient-based block contribution pass ──
         if args.collect_contrib:
@@ -1012,9 +1125,44 @@ def main() -> None:
         )
         print(f"[collect_scores] Layers with block loss: {loss_seen}/{len(contrib_acc.layers)}")
 
+    # Match channel_scoring/main.py semantics: normalize per-layer channel scores
+    # by the layer-wide mean across all experts/channels.
+    for layer_idx in accumulator.layers:
+        E = layer_to_num_experts[layer_idx]
+        I = layer_to_num_channels[layer_idx]
+        layer_scores = []
+        for eid in range(E):
+            s = accumulator.scores[layer_idx][eid]
+            if s is None:
+                layer_scores.append(torch.zeros(I, dtype=torch.float32))
+            else:
+                layer_scores.append(s.float())
+        stacked = torch.stack(layer_scores, dim=0)
+        denom = stacked.mean()
+        if torch.isfinite(denom) and float(denom.item()) > 0.0:
+            for eid in range(E):
+                s = accumulator.scores[layer_idx][eid]
+                if s is not None:
+                    accumulator.scores[layer_idx][eid] = s / denom
+
     # Merge and save
     payload = accumulator.to_payload()
     payload.update(contrib_acc.to_payload())
+    payload["expert_out_token_contrib"] = payload["expert_out_contrib"]
+    payload["expertwise_weights"] = {
+        "attr_coverage": _build_reference_expertwise_weights(
+            payload["expert_out_token_contrib"],
+            accumulator.layers,
+            layer_to_num_experts,
+            negate=True,
+        ),
+        "usage_coverage": _build_reference_expertwise_weights(
+            payload["expert_usage"],
+            accumulator.layers,
+            layer_to_num_experts,
+            negate=False,
+        ),
+    }
     payload["score_type"]          = args.score_type
     payload["collect_contrib"]     = args.collect_contrib
     payload["model_name_or_path"]  = args.model_name_or_path
@@ -1025,7 +1173,7 @@ def main() -> None:
     payload["affinity_threshold"]  = args.affinity_threshold
 
     torch.save(payload, out_path)
-    print(f"[collect_scores] Set SCORES_PATH={out_path} bash scripts/run_prune.sh to use the score in pruning. ")
+    print(f"[collect_scores] Set SCORES_PATH={out_path} bash scripts/run_prune_eval_kimi_gqa.sh to use the score in pruning. ")
 
 
 if __name__ == "__main__":

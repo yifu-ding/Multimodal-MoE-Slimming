@@ -73,8 +73,8 @@ def attach_modality_aware_router(
             continue
         aff_layer = affinity[layer_idx]
 
-        vis_only = sorted(e for e, a in aff_layer.items() if a > threshold)
-        txt_only = sorted(e for e, a in aff_layer.items() if a < -threshold)
+        vis_only = [e for e, a in aff_layer.items() if a > threshold]
+        txt_only = [e for e, a in aff_layer.items() if a < -threshold]
 
         if not vis_only and not txt_only:
             continue

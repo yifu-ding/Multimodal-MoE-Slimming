@@ -73,7 +73,7 @@ import torch.nn as nn
 from tqdm.auto import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
 
-from models.kimi import _normalize_kimi_config_for_remote_code
+from models.kimi import _normalize_kimi_config_for_remote_code, _sync_remote_code_cache
 from observations.common import resolve_model_name_or_path
 from src.planners import (
     INTER_LAYER_METHODS,
@@ -153,6 +153,53 @@ def _modes_maybe_resize_routed_expert(model, param_name, tensor):
     new_expert = new_expert.to(device=expert_device, dtype=expert_dtype)
     experts[expert_idx] = new_expert
 
+
+# ---------------------------------------------------------------------------
+# Patch 1: transformers 4.48.x / accelerate.set_module_tensor_to_device
+# This is the loading path hit by transformers 4.48.x when loading into a
+# meta-initialized model.
+# ---------------------------------------------------------------------------
+try:
+    from accelerate.utils import modeling as _modes_accel_modeling
+
+    _modes_orig_set_module_tensor_to_device = (
+        _modes_accel_modeling.set_module_tensor_to_device
+    )
+
+    def _modes_patched_set_module_tensor_to_device(
+        module,
+        tensor_name,
+        device,
+        value=None,
+        dtype=None,
+        fp16_statistics=None,
+        tied_params_map=None,
+        non_blocking=False,
+        clear_cache=True,
+    ):
+        if value is not None:
+            _modes_maybe_resize_routed_expert(module, tensor_name, value)
+        return _modes_orig_set_module_tensor_to_device(
+            module,
+            tensor_name,
+            device,
+            value=value,
+            dtype=dtype,
+            fp16_statistics=fp16_statistics,
+            tied_params_map=tied_params_map,
+            non_blocking=non_blocking,
+            clear_cache=clear_cache,
+        )
+
+    _modes_accel_modeling.set_module_tensor_to_device = (
+        _modes_patched_set_module_tensor_to_device
+    )
+    if hasattr(_modes_modeling_utils, "set_module_tensor_to_device"):
+        _modes_modeling_utils.set_module_tensor_to_device = (
+            _modes_patched_set_module_tensor_to_device
+        )
+except (ImportError, AttributeError):
+    pass
 
 # ---------------------------------------------------------------------------
 # Patch 1: new-style HF transformers (core_model_loading.set_param_for_module)
@@ -347,6 +394,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--expertwise_weight_source",
+        type=str,
+        default=None,
+        choices=["expert_out_contrib", "expert_usage", None],
+        help=(
+            "Source for expertwise_weights passed to coverage intra-layer planner. "
+            "expert_out_contrib: use per-expert output attribution from scores file "
+            "(closest to attr_coverage semantics). "
+            "expert_usage: use per-expert routing/output usage from scores file. "
+            "None (default): uniform anchor across experts."
+        ),
+    )
+    p.add_argument(
         "--evict_min_channels",
         type=int,
         default=0,
@@ -403,6 +463,57 @@ def main() -> None:
                 print("[prune] WARNING: layerwise_loss not available "
                       "(was --collect_contrib used?); falling back to unweighted coverage.")
 
+    # ---- Build expertwise_weights (optional, for coverage intra-layer) ----
+    expertwise_weights = None
+    if args.intra_method == "coverage" and args.expertwise_weight_source is not None:
+        sorted_layers = sorted(scores.keys())
+        payload_key = {
+            "expert_out_contrib": "attr_coverage",
+            "expert_usage": "usage_coverage",
+        }[args.expertwise_weight_source]
+
+        precomputed = score_payload.get("expertwise_weights", {})
+        src = precomputed.get(payload_key, None)
+        if src is not None:
+            print(f"[prune] Loading precomputed expertwise_weights[{payload_key}] from scores payload.")
+        else:
+            if args.expertwise_weight_source == "expert_out_contrib":
+                src = score_payload.get(
+                    "expert_out_token_contrib",
+                    score_payload.get("expert_out_contrib", {}),
+                )
+            else:  # expert_usage
+                src = score_payload.get("expert_usage", {})
+            print(
+                f"[prune] WARNING: expertwise_weights[{payload_key}] not found in payload; "
+                "falling back to raw per-expert scores."
+            )
+
+        expertwise_weights = []
+        missing = False
+        for layer_idx in sorted_layers:
+            E = layer_to_num_experts[layer_idx]
+            layer_vals = []
+            layer_src = src.get(layer_idx, {})
+            for eid in range(E):
+                value = layer_src.get(eid, None)
+                if value is None:
+                    missing = True
+                    value = 0.0
+                layer_vals.append(float(value))
+            expertwise_weights.append(layer_vals)
+
+        expertwise_weights = torch.tensor(expertwise_weights, dtype=torch.float32)
+        if missing:
+            print(
+                f"[prune] WARNING: {args.expertwise_weight_source} not fully available; "
+                "missing experts were filled with 0."
+            )
+        print(
+            f"[prune] Using expertwise_weights from {args.expertwise_weight_source}: "
+            f"shape={tuple(expertwise_weights.shape)}"
+        )
+
     # ---- Generate masks ----
     print(
         f"[prune] Generating masks: "
@@ -421,6 +532,7 @@ def main() -> None:
         inter_method=args.inter_method,
         intra_method=args.intra_method,
         layerwise_weights=layerwise_weights,
+        expertwise_weights=expertwise_weights,
         evict_min_channels=args.evict_min_channels,
     )
 
@@ -437,14 +549,19 @@ def main() -> None:
     # ---- Load clean model ----
     model_path = resolve_model_name_or_path(args.model_path)
     print(f"[prune] Loading model from {model_path} ...")
+    _sync_remote_code_cache(model_path)
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     config = _normalize_kimi_config_for_remote_code(config)
+    config._attn_implementation = "flash_attention_2"
+    if hasattr(config, "text_config") and config.text_config is not None:
+        config.text_config._attn_implementation = "flash_attention_2"
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         config=config,
         torch_dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True,
+        attn_implementation="flash_attention_2",
     )
     processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
     model.eval()
@@ -461,6 +578,66 @@ def main() -> None:
     print(f"[prune] Saving pruned model to {args.output_dir} ...")
     model.save_pretrained(args.output_dir)
     processor.save_pretrained(args.output_dir)
+
+    # Restore processor/tokenizer config files from the source model. The pruned
+    # checkpoint keeps the same processor as the base model, and newer
+    # save_pretrained() formats can emit processor configs that are not backward
+    # compatible with the transformers version used for Kimi eval.
+    for rel_path in [
+        "preprocessor_config.json",
+        "special_tokens_map.json",
+        "chat_template.jinja",
+        "chat_template.json",
+    ]:
+        src_fp = os.path.join(model_path, rel_path)
+        dst_fp = os.path.join(args.output_dir, rel_path)
+        if os.path.exists(src_fp):
+            shutil.copy2(src_fp, dst_fp)
+            print(f"[prune] Restored {rel_path} from source model")
+
+    processor_cfg = os.path.join(args.output_dir, "processor_config.json")
+    if os.path.exists(processor_cfg):
+        os.remove(processor_cfg)
+        print("[prune] Removed processor_config.json to keep AutoProcessor compatible.")
+
+    # Repair tokenizer_config.json using the source tokenizer config. This keeps
+    # special-token metadata intact and avoids incompatible save formats.
+    src_tok_cfg = os.path.join(model_path, "tokenizer_config.json")
+    dst_tok_cfg = os.path.join(args.output_dir, "tokenizer_config.json")
+    if os.path.exists(src_tok_cfg):
+        import json as _json
+        with open(src_tok_cfg) as _f:
+            src_tok = _json.load(_f)
+        dst_tok = dict(src_tok)
+        if os.path.exists(dst_tok_cfg):
+            with open(dst_tok_cfg) as _f:
+                saved_tok = _json.load(_f)
+        else:
+            saved_tok = {}
+        src_at = src_tok.get("added_tokens_decoder", {})
+        dst_at = saved_tok.get("added_tokens_decoder", {})
+        missing = {k: v for k, v in src_at.items() if k not in dst_at}
+        dst_extra = saved_tok.get("extra_special_tokens", src_tok.get("extra_special_tokens"))
+        src_extra = src_tok.get("extra_special_tokens", {})
+        extra_fixed = False
+        if not isinstance(dst_extra, dict):
+            dst_tok["extra_special_tokens"] = (
+                src_extra if isinstance(src_extra, dict) else {}
+            )
+            extra_fixed = True
+        else:
+            dst_tok["extra_special_tokens"] = dst_extra
+        if missing:
+            dst_at.update(missing)
+            dst_tok["added_tokens_decoder"] = dst_at
+        with open(dst_tok_cfg, "w") as _f:
+            _json.dump(dst_tok, _f, indent=2, ensure_ascii=False)
+            _f.write("\n")
+        if extra_fixed:
+            print("[prune] Normalized tokenizer_config.json extra_special_tokens to dict.")
+        if missing:
+            print(f"[prune] Restored {len(missing)} missing special token(s) in tokenizer_config.json: "
+                  + ", ".join(f"{k}={v['content']!r}" for k, v in missing.items()))
 
     # Copy custom modeling Python files from original snapshot
     for py_file in glob.glob(os.path.join(model_path, "*.py")):
