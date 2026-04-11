@@ -1,4 +1,5 @@
 import copy
+import types
 from typing import Any, Dict, Iterable, List, Tuple
 
 import torch
@@ -55,6 +56,8 @@ def _unwrap_output(output):
 
 def _clear_block_saved_tensors(block: nn.Module) -> None:
     for expert in _iter_experts(block.mlp):
+        for attr in ("saved_text_mask", "saved_visual_mask"):
+            setattr(expert, attr, None)
         for proj_name in ("down_proj", "up_proj", "gate_proj"):
             proj = getattr(expert, proj_name, None)
             if proj is None:
@@ -65,6 +68,10 @@ def _clear_block_saved_tensors(block: nn.Module) -> None:
 
 def _register_tensor_hooks(module: nn.Module) -> List[Any]:
     handles = []
+    module.saved_input = None
+    module.saved_output = None
+    module.saved_grad_in = None
+    module.saved_grad_out = None
 
     def _pre_hook(mod, args):
         if getattr(mod, "save_tensors", True) is False:
@@ -155,6 +162,99 @@ def _kimi_teacher_block(model) -> Iterable[nn.Module]:
     return model.language_model.model.layers
 
 
+def _patch_grad_enabled_kimi_moe_infer(block: nn.Module):
+    mlp = getattr(block, "mlp", None)
+    if mlp is None or not hasattr(mlp, "moe_infer"):
+        return None
+
+    original = mlp.moe_infer
+
+    def _grad_enabled_moe_infer(self, x, topk_ids, topk_weight, **kwargs):
+        skip_expert_idx = kwargs.get("skip_expert_idx", None)
+        skip_modality = kwargs.get("skip_modality", None)
+        batch_idx = kwargs.get("batch_idx", None)
+
+        text_mask = getattr(self, "moe_text_mask", None)
+        visual_mask = getattr(self, "moe_media_mask", None)
+        if text_mask is None:
+            text_mask = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
+        else:
+            text_mask = text_mask.to(x.device).view(-1)
+        if visual_mask is None:
+            visual_mask = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
+        else:
+            visual_mask = visual_mask.to(x.device).view(-1)
+
+        for expert in self.experts:
+            expert.saved_text_mask = None
+            expert.saved_visual_mask = None
+
+        if skip_expert_idx is not None:
+            if batch_idx is not None:
+                skip_mask = (
+                    self.moe_text_mask_list[batch_idx]
+                    if skip_modality == "text"
+                    else self.moe_media_mask_list[batch_idx]
+                )
+            else:
+                skip_mask = (
+                    self.moe_text_mask if skip_modality == "text" else self.moe_media_mask
+                )
+            target_mask = (topk_ids == skip_expert_idx) & skip_mask.to(topk_ids.device)
+            topk_weight = topk_weight.clone()
+            topk_ids = topk_ids.clone()
+            topk_weight.mul_(~target_mask)
+            topk_ids[target_mask] = len(self.experts)
+
+        if hasattr(self, "gate_dict") and self.gate_dict is not None:
+            valid_mask = self.valid_expert_mask.to(topk_weight.device)
+            topk_weight = topk_weight * valid_mask
+            topk_ids = topk_ids.clone()
+            topk_ids[~valid_mask] = len(self.experts)
+
+        idxs = topk_ids.view(-1).argsort()
+        flat_token_idx = idxs // topk_ids.shape[1]
+        sorted_tokens = x[flat_token_idx]
+        sorted_text_mask = text_mask[flat_token_idx]
+        sorted_visual_mask = visual_mask[flat_token_idx]
+        cnts = topk_ids.new_zeros((topk_ids.shape[0], len(self.experts) + 1))
+        src = torch.ones_like(topk_ids, dtype=cnts.dtype, device=cnts.device)
+        cnts.scatter_add_(1, topk_ids, src)
+        tokens_per_expert = cnts.sum(dim=0).tolist()
+
+        outputs = []
+        start_idx = 0
+        for i, num_tokens in enumerate(tokens_per_expert):
+            end_idx = start_idx + int(num_tokens)
+            if num_tokens == 0:
+                continue
+            tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
+            if i == len(self.experts):
+                outputs.append(tokens_for_this_expert)
+                break
+            expert = self.experts[i + self.ep_rank * self.experts_per_rank]
+            expert.saved_text_mask = sorted_text_mask[start_idx:end_idx]
+            expert.saved_visual_mask = sorted_visual_mask[start_idx:end_idx]
+            outputs.append(expert(tokens_for_this_expert))
+            start_idx = end_idx
+
+        outs = torch.cat(outputs, dim=0) if outputs else sorted_tokens.new_empty((0, x.shape[-1]))
+        new_x = torch.empty_like(outs)
+        if idxs.numel() > 0:
+            new_x[idxs] = outs
+        final_out = (
+            new_x.view(*topk_ids.shape, -1)
+            .type(topk_weight.dtype)
+            .mul(topk_weight.unsqueeze(dim=-1))
+            .sum(dim=1)
+            .type(new_x.dtype)
+        )
+        return final_out
+
+    mlp.moe_infer = types.MethodType(_grad_enabled_moe_infer, mlp)
+    return mlp, original
+
+
 def block_forward(
     bundle,
     cnt_block: nn.Module,
@@ -177,6 +277,7 @@ def block_forward(
     teacher_state: Dict[str, Any] = {}
     teacher_handle = _register_teacher_block_hook(teacher_block, teacher_state)
     copied_handles = _register_copied_block_hooks(cnt_block)
+    moe_infer_state = _patch_grad_enabled_kimi_moe_infer(cnt_block)
 
     total_loss = 0.0
     total_batches = 0
@@ -222,7 +323,7 @@ def block_forward(
             collect_scores_attn_mlp(
                 cnt_block,
                 ema=saliency_ema,
-                compute_H_scores_kwargs={
+                _kwargs={
                     "use_mlp_scores": True,
                     "use_attn_scores": False,
                     "attn_mask": attn_mask,
@@ -243,6 +344,9 @@ def block_forward(
         teacher_handle.remove()
         for handle in copied_handles:
             handle.remove()
+        if moe_infer_state is not None:
+            mlp, original_moe_infer = moe_infer_state
+            mlp.moe_infer = original_moe_infer
         _clear_block_saved_tensors(cnt_block)
 
     return total_loss / max(total_batches, 1)

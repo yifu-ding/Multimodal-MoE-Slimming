@@ -30,7 +30,7 @@ SUBSET_SEED="${SUBSET_SEED:-42}"
 SCORE_TYPE="${SCORE_TYPE:-activation}"
 EMA="${EMA:-0.9}"
 
-MODALITY_AWARE="${MODALITY_AWARE:-1}"
+MODALITY_AWARE="${MODALITY_AWARE:-0}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/kimi_gqa-modal2}"
 
 EXTRA_ARGS=("$@")

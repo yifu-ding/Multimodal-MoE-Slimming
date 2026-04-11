@@ -83,10 +83,20 @@ def _resolve_activation_fn(expert: nn.Module):
     return torch.nn.functional.silu
 
 
-def _compute_gateup_act(expert: nn.Module, gate_output: torch.Tensor, up_output: torch.Tensor):
+def _compute_gateup_act(
+    expert: nn.Module,
+    gate_output: torch.Tensor,
+    up_output: torch.Tensor,
+    token_mask: torch.Tensor | None = None,
+):
     if gate_output is None or up_output is None:
         return None
     activation = _resolve_activation_fn(expert)(gate_output.detach()) * up_output.detach()
+    if token_mask is not None:
+        token_mask = token_mask.to(device=activation.device).view(-1).bool()
+        if token_mask.numel() != activation.shape[0] or not bool(token_mask.any()):
+            return None
+        activation = activation[token_mask]
     dims = tuple(range(activation.dim() - 1))
     return activation.abs().to(torch.float32).mean(dim=dims)
 
@@ -163,28 +173,28 @@ def _restore_patched_expert(state: dict) -> None:
     state["expert"].forward = state["forward"]
 
 
-def _get_block_eval_context(compute_H_scores_kwargs: dict):
-    if compute_H_scores_kwargs is None:
+def _get_block_eval_context(_kwargs: dict):
+    if _kwargs is None:
         return None
 
-    in_args = compute_H_scores_kwargs.get("block_in_args", None)
-    in_kwargs = compute_H_scores_kwargs.get("block_in_kwargs", None)
-    teacher_target = compute_H_scores_kwargs.get("teacher_target", None)
-    attn_mask = compute_H_scores_kwargs.get("attn_mask", None)
+    in_args = _kwargs.get("block_in_args", None)
+    in_kwargs = _kwargs.get("block_in_kwargs", None)
+    teacher_target = _kwargs.get("teacher_target", None)
+    attn_mask = _kwargs.get("attn_mask", None)
     if in_args is None or in_kwargs is None or teacher_target is None or attn_mask is None:
         return None
 
-    autocast_dtype = compute_H_scores_kwargs.get("autocast_dtype", None)
+    autocast_dtype = _kwargs.get("autocast_dtype", None)
     return {
         "in_args": in_args,
         "in_kwargs": in_kwargs,
         "teacher_target": teacher_target,
         "attn_mask": attn_mask,
-        "loss_fn": compute_H_scores_kwargs.get("loss_fn", "rel_l2"),
-        "loss_eps": compute_H_scores_kwargs.get("loss_eps", 1e-6),
+        "loss_fn": _kwargs.get("loss_fn", "rel_l2"),
+        "loss_eps": _kwargs.get("loss_eps", 1e-6),
         "autocast_dtype": autocast_dtype,
         "autocast_enabled": autocast_dtype in (torch.float16, torch.bfloat16),
-        "autocast_device_type": compute_H_scores_kwargs.get(
+        "autocast_device_type": _kwargs.get(
             "autocast_device_type",
             teacher_target.device.type if isinstance(teacher_target, torch.Tensor) else "cuda",
         ),
@@ -196,12 +206,12 @@ def _compute_second_approx_attr(
     down_out_grad: torch.Tensor,
     expert_out_token_contrib: torch.Tensor,
     usage: float,
-    compute_H_scores_kwargs: dict,
+    _kwargs: dict,
 ):
-    if down_output is None or down_out_grad is None or compute_H_scores_kwargs is None:
+    if down_output is None or down_out_grad is None or _kwargs is None:
         return None
 
-    attn_mask = compute_H_scores_kwargs.get("attn_mask", None)
+    attn_mask = _kwargs.get("attn_mask", None)
     if attn_mask is None:
         return None
 
@@ -209,7 +219,7 @@ def _compute_second_approx_attr(
     g = down_out_grad.detach().float()
     total_tokens = max(float(attn_mask.sum().item()), 1.0)
     hidden_size = float(z.size(-1))
-    loss_reduction = compute_H_scores_kwargs.get("loss_reduction", "sum")
+    loss_reduction = _kwargs.get("loss_reduction", "sum")
 
     # 按 hidden-MSE 的闭式二阶展开来构造 approx-second:
     # Delta L_e ≈ [ -(2/NH) sum_i <r_i, z_i> + (1/NH) sum_i ||z_i||^2 ]_+
@@ -231,9 +241,9 @@ def _compute_second_approx_attr(
 def _compute_second_exact_attr(
     cnt_block: nn.Module,
     expert: nn.Module,
-    compute_H_scores_kwargs: dict,
+    _kwargs: dict,
 ):
-    context = _get_block_eval_context(compute_H_scores_kwargs)
+    context = _get_block_eval_context(_kwargs)
     if context is None:
         return None
 
@@ -278,13 +288,13 @@ def _compute_second_exact_attr(
 def _compute_true_ablate_attr(
     cnt_block: nn.Module,
     expert: nn.Module,
-    compute_H_scores_kwargs: dict,
+    _kwargs: dict,
 ):
-    context = _get_block_eval_context(compute_H_scores_kwargs)
+    context = _get_block_eval_context(_kwargs)
     if context is None:
         return None
 
-    base_loss = compute_H_scores_kwargs.get("_true_ablate_base_loss", None)
+    base_loss = _kwargs.get("_true_ablate_base_loss", None)
     if base_loss is None:
         with _suspend_tensor_saving(cnt_block):
             with torch.no_grad():
@@ -301,7 +311,7 @@ def _compute_true_ablate_attr(
                         loss_fn=context["loss_fn"],
                         eps=context["loss_eps"],
                     )
-        compute_H_scores_kwargs["_true_ablate_base_loss"] = base_loss.detach()
+        _kwargs["_true_ablate_base_loss"] = base_loss.detach()
 
     state = _patch_full_expert_mask(expert)
     try:
@@ -327,39 +337,43 @@ def _compute_true_ablate_attr(
         
 def collect_scores_attn_mlp(cnt_block, 
                             ema: float = 0.9, 
-                            compute_H_scores_kwargs: dict = None) -> None:
+                            _kwargs: dict = None) -> None:
     experts = getattr(cnt_block.mlp, "experts", None)
     if _is_fused_expert_container(experts):
         _collect_scores_fused_experts(experts, ema=ema)
     else:
         for expert in cnt_block.mlp.experts:
             # 取出并清空 hook 保存的张量
-            down_input    = expert.down_proj.saved_input
-            down_output   = expert.down_proj.saved_output
-            down_grad     = expert.down_proj.saved_grad_in  
-            down_out_grad = expert.down_proj.saved_grad_out
+            down_input    = getattr(expert.down_proj, "saved_input", None)
+            down_output   = getattr(expert.down_proj, "saved_output", None)
+            down_grad     = getattr(expert.down_proj, "saved_grad_in", None)
+            down_out_grad = getattr(expert.down_proj, "saved_grad_out", None)
             expert.down_proj.saved_input    = None
             expert.down_proj.saved_output   = None
             expert.down_proj.saved_grad_in  = None
             expert.down_proj.saved_grad_out = None
 
-            up_input    = expert.up_proj.saved_input
-            up_output   = expert.up_proj.saved_output
-            up_in_grad  = expert.up_proj.saved_grad_in
-            up_out_grad = expert.up_proj.saved_grad_out
+            up_input    = getattr(expert.up_proj, "saved_input", None)
+            up_output   = getattr(expert.up_proj, "saved_output", None)
+            up_in_grad  = getattr(expert.up_proj, "saved_grad_in", None)
+            up_out_grad = getattr(expert.up_proj, "saved_grad_out", None)
             expert.up_proj.saved_input    = None
             expert.up_proj.saved_output   = None
             expert.up_proj.saved_grad_in  = None
             expert.up_proj.saved_grad_out = None
 
-            gate_input      = expert.gate_proj.saved_input
-            gate_output     = expert.gate_proj.saved_output
-            gate_in_grad    = expert.gate_proj.saved_grad_in
-            gate_grad       = expert.gate_proj.saved_grad_out
+            gate_input      = getattr(expert.gate_proj, "saved_input", None)
+            gate_output     = getattr(expert.gate_proj, "saved_output", None)
+            gate_in_grad    = getattr(expert.gate_proj, "saved_grad_in", None)
+            gate_grad       = getattr(expert.gate_proj, "saved_grad_out", None)
             expert.gate_proj.saved_input    = None
             expert.gate_proj.saved_output   = None
             expert.gate_proj.saved_grad_in  = None
             expert.gate_proj.saved_grad_out = None
+            text_mask = getattr(expert, "saved_text_mask", None)
+            visual_mask = getattr(expert, "saved_visual_mask", None)
+            expert.saved_text_mask = None
+            expert.saved_visual_mask = None
             
             W_down, W_up, W_gate = expert.down_proj.weight, expert.up_proj.weight, expert.gate_proj.weight
             
@@ -374,10 +388,16 @@ def collect_scores_attn_mlp(cnt_block,
 
                     gateup_act = _compute_gateup_act(expert, gate_output, up_output)
                     safe_add_with_ema(expert, ema, gateup_act, "gateup_act")
-                
+
+                    text_act = _compute_gateup_act(expert, gate_output, up_output, token_mask=text_mask)
+                    safe_add_with_ema(expert, ema, text_act, "text_act")
+
+                    visual_act = _compute_gateup_act(expert, gate_output, up_output, token_mask=visual_mask)
+                    safe_add_with_ema(expert, ema, visual_act, "visual_act")
+
                     token_contrib_I = compute_token_contrib_I(down_input, down_grad, up_output, up_out_grad, gate_output, gate_grad)
                     safe_add_with_ema(expert, ema, token_contrib_I, "token_contrib")
-                        
+                            
                     grad_I, down_grad, up_out_grad, gate_grad = compute_grad_I(down_grad, up_out_grad, gate_grad)
                     safe_add_with_ema(expert, ema, grad_I, "grad")
                         
@@ -391,7 +411,7 @@ def collect_scores_attn_mlp(cnt_block,
                     safe_add_with_ema(expert, ema, wa_mean, "wa")
                     
                     # expert output 
-                    attn_mask = compute_H_scores_kwargs.get("attn_mask", None)
+                    attn_mask = _kwargs.get("attn_mask", None)
                     total_tokens = float(attn_mask.sum().item())
                     usage = float(down_output.shape[0]) / max(total_tokens, 1.0)
                     expert_out_token_contrib = token_contrib(down_out_grad, down_output).sum() * usage
@@ -401,7 +421,7 @@ def collect_scores_attn_mlp(cnt_block,
                     second_exact_attr = _compute_second_exact_attr(
                         cnt_block=cnt_block,
                         expert=expert,
-                        compute_H_scores_kwargs=compute_H_scores_kwargs,
+                        _kwargs=_kwargs,
                     )
                     if second_exact_attr is not None:
                         safe_add_with_ema(expert, ema, second_exact_attr, "second_exact_attr")
@@ -409,7 +429,7 @@ def collect_scores_attn_mlp(cnt_block,
                     true_ablate = _compute_true_ablate_attr(
                         cnt_block=cnt_block,
                         expert=expert,
-                        compute_H_scores_kwargs=compute_H_scores_kwargs,
+                        _kwargs=_kwargs,
                     )
                     if true_ablate is not None:
                         safe_add_with_ema(expert, ema, true_ablate, "true_ablate")

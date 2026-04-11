@@ -36,6 +36,8 @@ from src.score_utils import channel_rms, safe_add_with_ema, weight_rms
 CHANNEL_METRICS = (
     "activation",
     "gateup_act",
+    "text_act",
+    "visual_act",
     "saliency",
     "wa",
     "grad",
