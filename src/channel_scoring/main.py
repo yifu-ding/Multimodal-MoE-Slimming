@@ -1,324 +1,496 @@
-import os
-import torch
 import argparse
-from copy import deepcopy
-from tqdm import tqdm
+import copy
+import json
+import os
+import random
+import sys
+from typing import Dict, Optional
 
-from src.base.models import get_model
-from src.base.datasets import load_datasets
-from src.base.shared_utils import format_name, _layer_norm, _print
-from src.base.shared_utils.safe_isinstance import (
-    _get_num_experts, 
-    _get_moe_intermediate_size,
-    _get_num_hidden_layers,
-    _get_model_layer,
-    _get_text_cfg,
-    _is_moe_block,
-    _get_num_hidden_size)
+SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+REPO_PARENT = os.path.dirname(REPO_ROOT)
+for _p in (REPO_PARENT, REPO_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
-from src.prune.apply.masking.expert.forward_utils import _patch_block_alpha_if_needed
-from src.calibration.channel_scoring.forward import block_forward
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+from tqdm.auto import tqdm
 
-
-def _is_fused_expert_container(experts):
-    return (
-        experts is not None
-        and getattr(experts, "__class__", type(None)).__name__ == "Qwen3VLMoeTextExperts"
-        and hasattr(experts, "gate_up_proj")
-        and hasattr(experts, "down_proj")
-    )
-
-
-def _get_fused_expert_score(experts, attr_name, default_shape, device):
-    value = getattr(experts, attr_name, None)
-    if value is None:
-        return torch.zeros(default_shape, dtype=torch.float32, device=device)
-    return value.clone().detach().to(device=device, dtype=torch.float32)
-
-
-def _get_optional_tensor(obj, attr_name, default_shape, device):
-    value = getattr(obj, attr_name, None)
-    if value is None:
-        return torch.zeros(default_shape, dtype=torch.float32, device=device)
-    return value.clone().detach().to(device=device, dtype=torch.float32)
+from observations.common import (
+    build_dataset,
+    compute_generic_expert_activation,
+    custom_collate_fn,
+    discover_layer_structure,
+    ensure_dir,
+    load_model_bundle,
+    move_inputs_to_model_device,
+    prepare_inputs,
+    resolve_model_name_or_path,
+)
+from src.channel_scoring.forward import block_forward
+from src.score_utils import channel_rms, safe_add_with_ema, weight_rms
 
 
-def main(args, model, tokenizer, output_dir, calib_dataset, collect_H_data = False, verbose=False):
-    
-    model.eval()
-    torch.set_float32_matmul_precision("high")
+CHANNEL_METRICS = (
+    "activation",
+    "saliency",
+    "wa",
+    "grad",
+    "token_contrib",
+    "wg",
+    "weight",
+)
+EXPERT_METRICS = (
+    "expert_out_token_contrib",
+    "usage",
+    "second_exact_attr",
+    "true_ablate",
+)
 
-    E = _get_num_experts(model)
-    I = _get_moe_intermediate_size(model)
-    L = _get_num_hidden_layers(model)
-    H = _get_num_hidden_size(model)
-    model_cfg = _get_text_cfg(model)
-    
-    _print(f"num_experts: {E}, num_intermediate_size: {I}, num_hidden_layers: {L}")
-    
-    # calib_dataset = prepare_dataset(args, tokenizer)
-    calib_dataset = load_datasets(
-        calib_dataset,
-        tokenizer,
-        max_samples=args.calib_batches * args.batch_size,
-        max_length=args.max_seq_length,
-    )
 
-    gate_scores = {"saliency": {}, "out": {}, "grad": {}, "usage": {}}
-    expert_scores = {
-        "activation": {},
-        "saliency": {},
-        "wa": {},
-        "grad": {},
-        "token_contrib": {},
-        "expert_out_token_contrib": {},
-        "second_attr": {},
-        "wg": {},
-        "weight": {},
+def _tensor_map_to_nested_dict(layer_map: Dict[int, torch.Tensor]) -> Dict[int, Dict[int, torch.Tensor]]:
+    return {
+        layer_idx: {
+            eid: tensor[eid].detach().cpu().float()
+            for eid in range(tensor.shape[0])
+        }
+        for layer_idx, tensor in layer_map.items()
     }
-    
-    if collect_H_data:
-        H_scores = {
-            "H_grad": {}, 
-            "H_saliency": {}, 
-            "H_activation": {}, 
-            "H_wa": {}, 
+
+
+def _scalar_map_to_nested_dict(layer_map: Dict[int, torch.Tensor]) -> Dict[int, Dict[int, float]]:
+    return {
+        layer_idx: {
+            eid: float(tensor[eid].item())
+            for eid in range(tensor.shape[0])
         }
-        attn_head_scores = {
-            "wo_group_scores_mean": {},
-            "wo_group_scores_max": {},
-            "wo_group_scores_sum": {},
-            "similarity_matrix": {},
+        for layer_idx, tensor in layer_map.items()
+    }
+
+
+def _normalize_per_layer_counts(counts_map: Dict[int, torch.Tensor]) -> Dict[int, torch.Tensor]:
+    output = {}
+    for layer_idx, counts in counts_map.items():
+        counts = counts.detach().cpu().float()
+        denom = counts.sum().clamp_min(1.0)
+        output[layer_idx] = counts / denom
+    return output
+
+
+class ModalityActivationAccumulator:
+    def __init__(self, layer_to_num_experts: Dict[int, int], layer_to_num_channels: Dict[int, int]) -> None:
+        self.layers = sorted(layer_to_num_experts.keys())
+        self.activation_text = {
+            layer_idx: torch.zeros(layer_to_num_experts[layer_idx], layer_to_num_channels[layer_idx], dtype=torch.float32)
+            for layer_idx in self.layers
+        }
+        self.activation_visual = {
+            layer_idx: torch.zeros(layer_to_num_experts[layer_idx], layer_to_num_channels[layer_idx], dtype=torch.float32)
+            for layer_idx in self.layers
+        }
+        self.usage_text = {
+            layer_idx: torch.zeros(layer_to_num_experts[layer_idx], dtype=torch.float32)
+            for layer_idx in self.layers
+        }
+        self.usage_visual = {
+            layer_idx: torch.zeros(layer_to_num_experts[layer_idx], dtype=torch.float32)
+            for layer_idx in self.layers
         }
 
-    layerwise_loss = []
-    
-    for layer_idx in tqdm(range(L), desc="Processing"):
-        teacher_block = _get_model_layer(model, layer_idx)
-        copied_block = deepcopy(teacher_block).to(device=args.device, dtype=args.dtype)
-        copied_mlp = copied_block.mlp
-        if not _is_moe_block(copied_mlp):
-            continue # skip non-moe blocks
-
-        # 设置 alpha 参数（如果 args 中没有）
-        if not hasattr(args, 'alpha'):
-            args.alpha = 0.9
-        _patch_block_alpha_if_needed(copied_block, E=E, args=args)
-
-        total_loss = block_forward(model, 
-                      copied_block, 
-                      layer_idx,
-                      calib_dataset, 
-                      tokenizer, 
-                      max_seq_length=args.max_seq_length,
-                      saliency_ema=0.9,
-                      batch_size=args.batch_size, 
-                      calib_batches=args.calib_batches,  
-                      second_order_mode=args.second_order_mode,
-                      device=args.device,
-                      dtype=args.dtype,
-                      verbose=verbose)
-        
-        layerwise_loss.append(total_loss)
-        gate_saliency = getattr(copied_mlp.gate, 'saliency', None)
-        gate_saliency = _layer_norm(gate_saliency) 
-        gate_scores["saliency"][layer_idx] = gate_saliency[:, None] if gate_saliency is not None else None
-        gate_output = getattr(copied_mlp.gate, 'gate_output', None)
-        gate_output = torch.softmax(gate_output, dim=0)[:, None]  if gate_output is not None else None
-        gate_scores["out"][layer_idx] = gate_output
-        gate_grad = getattr(copied_mlp.gate, 'gate_grad', None)
-        gate_grad = _layer_norm(gate_grad)
-        gate_scores["grad"][layer_idx] = gate_grad[:, None] if gate_grad is not None else None
-        
-        copied_mlp.gate.saliency = None
-        copied_mlp.gate.gate_output = None
-        copied_mlp.gate.gate_input = None
-        copied_mlp.gate.gate_grad_in = None
-        copied_mlp.gate.gate_grad_out = None
-
-        def _get_score_for_expert(mode, expert):    
-            if mode == "expert_out_token_contrib" or mode == "second_attr" or mode == "usage":
-                if not hasattr(expert, mode) or getattr(expert, mode) is None:
-                    return torch.zeros((1,), dtype=torch.float32, device=args.device)
-            elif "H_" in mode: 
-                if not hasattr(expert, mode) or getattr(expert, mode) is None:
-                    return torch.zeros((H, ), dtype=torch.float32, device=args.device)
+    def update(
+        self,
+        layer_idx: int,
+        expert_idx: int,
+        activations: torch.Tensor,
+        text_mask: Optional[torch.Tensor],
+        visual_mask: Optional[torch.Tensor],
+        ema: float,
+    ) -> None:
+        if text_mask is not None and bool(text_mask.any()):
+            text_score = channel_rms(activations[text_mask]).detach().cpu().float()
+            current = self.activation_text[layer_idx][expert_idx]
+            if float(self.usage_text[layer_idx][expert_idx].item()) == 0.0:
+                self.activation_text[layer_idx][expert_idx] = text_score
             else:
-                if not hasattr(expert, mode) or getattr(expert, mode) is None:
-                    return torch.randn(I, dtype=torch.float32, device=args.device) * 1e-25
-            return getattr(expert, mode).clone().detach() if isinstance(getattr(expert, mode), torch.Tensor) else getattr(expert, mode)
-        
-        expert_scores["activation"][layer_idx] = torch.zeros((E, I), dtype=torch.float32, device=args.device)
-        expert_scores["saliency"][layer_idx] = torch.zeros((E, I), dtype=torch.float32, device=args.device)
-        expert_scores["wa"][layer_idx] = torch.zeros((E, I), dtype=torch.float32, device=args.device)
-        expert_scores["grad"][layer_idx] = torch.zeros((E, I), dtype=torch.float32, device=args.device)
-        expert_scores["weight"][layer_idx] = torch.zeros((E, I), dtype=torch.float32, device=args.device)
-        expert_scores["token_contrib"][layer_idx] = torch.zeros((E, I), dtype=torch.float32, device=args.device)
-        expert_scores["wg"][layer_idx] = torch.zeros((E, I), dtype=torch.float32, device=args.device)
-        expert_scores["expert_out_token_contrib"][layer_idx] = torch.zeros((E,), dtype=torch.float32, device=args.device)
-        expert_scores["second_attr"][layer_idx] = torch.zeros((E,), dtype=torch.float32, device=args.device)
-        gate_scores["usage"][layer_idx] = torch.zeros((E,), dtype=torch.float32, device=args.device)
+                self.activation_text[layer_idx][expert_idx] = safe_add_with_ema(current, ema, text_score)
+            self.usage_text[layer_idx][expert_idx] += float(text_mask.sum().item())
 
-        if collect_H_data:
-            H_scores["H_grad"][layer_idx] = torch.zeros((E, H), dtype=torch.float32, device=args.device)
-            H_scores["H_saliency"][layer_idx] = torch.zeros((E, H), dtype=torch.float32, device=args.device)
-            H_scores["H_activation"][layer_idx] = torch.zeros((E, H), dtype=torch.float32, device=args.device)
-            H_scores["H_wa"][layer_idx] = torch.zeros((E, H), dtype=torch.float32, device=args.device)
+        if visual_mask is not None and bool(visual_mask.any()):
+            visual_score = channel_rms(activations[visual_mask]).detach().cpu().float()
+            current = self.activation_visual[layer_idx][expert_idx]
+            if float(self.usage_visual[layer_idx][expert_idx].item()) == 0.0:
+                self.activation_visual[layer_idx][expert_idx] = visual_score
+            else:
+                self.activation_visual[layer_idx][expert_idx] = safe_add_with_ema(current, ema, visual_score)
+            self.usage_visual[layer_idx][expert_idx] += float(visual_mask.sum().item())
 
-        fused_experts = copied_mlp.experts if _is_fused_expert_container(getattr(copied_mlp, "experts", None)) else None
-        if fused_experts is not None:
-            expert_scores["weight"][layer_idx] = _get_fused_expert_score(
-                fused_experts, "weight_scores", (E, I), args.device
+    def finalize(self):
+        self.usage_text = _normalize_per_layer_counts(self.usage_text)
+        self.usage_visual = _normalize_per_layer_counts(self.usage_visual)
+
+
+class RichScoreAccumulator:
+    def __init__(
+        self,
+        layer_to_num_experts: Dict[int, int],
+        layer_to_num_channels: Dict[int, int],
+        score_type: str,
+        modality_aware: bool,
+    ) -> None:
+        self.layer_to_num_experts = layer_to_num_experts
+        self.layer_to_num_channels = layer_to_num_channels
+        self.layers = sorted(layer_to_num_experts.keys())
+        self.score_type = score_type
+        self.modality_aware = modality_aware
+
+        self.expert_scores: Dict[str, Dict[int, torch.Tensor]] = {}
+        for metric in CHANNEL_METRICS:
+            self.expert_scores[metric] = {}
+        for metric in EXPERT_METRICS:
+            self.expert_scores[metric] = {}
+
+        self.gate_scores: Dict[str, Dict[int, torch.Tensor]] = {
+            "usage": {},
+        }
+        self.hit_counts: Dict[int, torch.Tensor] = {}
+        self.layerwise_loss: Dict[int, float] = {}
+
+        for layer_idx in self.layers:
+            e = layer_to_num_experts[layer_idx]
+            i = layer_to_num_channels[layer_idx]
+            for metric in CHANNEL_METRICS:
+                self.expert_scores[metric][layer_idx] = torch.zeros(e, i, dtype=torch.float32)
+            for metric in EXPERT_METRICS:
+                self.expert_scores[metric][layer_idx] = torch.zeros(e, dtype=torch.float32)
+            self.gate_scores["usage"][layer_idx] = torch.zeros(e, dtype=torch.float32)
+            self.hit_counts[layer_idx] = torch.zeros(e, dtype=torch.int64)
+
+        self.modality_scores = (
+            ModalityActivationAccumulator(layer_to_num_experts, layer_to_num_channels)
+            if modality_aware else None
+        )
+
+    def absorb_layer_scores(self, layer_idx: int, copied_block) -> None:
+        experts = list(copied_block.mlp.experts)
+        for eid, expert in enumerate(experts):
+            for metric in CHANNEL_METRICS:
+                value = getattr(expert, metric, None)
+                if value is None:
+                    continue
+                self.expert_scores[metric][layer_idx][eid] = value.detach().cpu().float()
+            for metric in EXPERT_METRICS:
+                value = getattr(expert, metric, None)
+                if value is None:
+                    continue
+                if isinstance(value, torch.Tensor):
+                    self.expert_scores[metric][layer_idx][eid] = value.detach().cpu().float().reshape(()).item()
+                else:
+                    self.expert_scores[metric][layer_idx][eid] = float(value)
+            usage = getattr(expert, "usage", None)
+            if usage is not None:
+                self.gate_scores["usage"][layer_idx][eid] = float(usage)
+            if getattr(expert, "activation", None) is not None:
+                self.hit_counts[layer_idx][eid] = 1
+
+    def finalize(self) -> None:
+        self.gate_scores["usage"] = _normalize_per_layer_counts(self.gate_scores["usage"])
+        if self.modality_scores is not None:
+            self.modality_scores.finalize()
+
+    def build_legacy_payload(self, args) -> dict:
+        payload = {
+            "scores": _tensor_map_to_nested_dict(self.expert_scores["activation"]),
+            "counts": _scalar_map_to_nested_dict(
+                {layer_idx: hits.float() for layer_idx, hits in self.hit_counts.items()}
+            ),
+            "layer_to_num_experts": self.layer_to_num_experts,
+            "layer_to_num_channels": self.layer_to_num_channels,
+            "layers": self.layers,
+            "score_type": self.score_type,
+            "model_name_or_path": args.model_name_or_path,
+            "resolved_model_name_or_path": resolve_model_name_or_path(args.model_name_or_path),
+            "dataset": args.dataset,
+            "num_samples": args.num_samples,
+            "batch_size": args.batch_size,
+            "start_idx": args.start_idx,
+            "subset_seed": args.subset_seed,
+            "modality_aware": self.modality_aware,
+            "expert_out_token_contrib": _scalar_map_to_nested_dict(
+                self.expert_scores["expert_out_token_contrib"]
+            ),
+            "expert_usage": _scalar_map_to_nested_dict(self.gate_scores["usage"]),
+            "layerwise_loss": self.layerwise_loss,
+        }
+        if self.modality_scores is not None:
+            payload["modality_channel_scores"] = {
+                "text": _tensor_map_to_nested_dict(self.modality_scores.activation_text),
+                "visual": _tensor_map_to_nested_dict(self.modality_scores.activation_visual),
+            }
+        return payload
+
+
+def attach_kimi_modality_hooks(model, config, accumulator: ModalityActivationAccumulator, ema: float):
+    states = []
+    for layer_idx, layer in enumerate(model.language_model.model.layers):
+        if not (
+            config.n_routed_experts is not None
+            and layer_idx >= config.first_k_dense_replace
+            and layer_idx % config.moe_layer_freq == 0
+        ):
+            continue
+
+        states.append(
+            (
+                layer.mlp,
+                getattr(layer.mlp, "freq_save_dir", None),
+                getattr(layer.mlp.gate, "layer_idx", None),
+                layer.mlp.moe_infer,
             )
-            expert_scores["wg"][layer_idx] = _get_fused_expert_score(
-                fused_experts, "wg_scores", (E, I), args.device
-            )
-        else:
-            for eid in range(E):
-                expert = copied_mlp.experts[eid]
-                activation = _get_score_for_expert("activation", expert)
-                saliency = _get_score_for_expert("saliency", expert)
-                wa = _get_score_for_expert("wa", expert)
-                wg = _get_score_for_expert("wg", expert)
-                grad = _get_score_for_expert("grad", expert)
-                weight = _get_score_for_expert("weight", expert)
-                token_contrib = _get_score_for_expert("token_contrib", expert)
-                expert_out_token_contrib = _get_score_for_expert("expert_out_token_contrib", expert)
-                second_attr = _get_score_for_expert("second_attr", expert)
-                usage = _get_score_for_expert("usage", expert)
+        )
+        layer.mlp.freq_save_dir = "__observation__"
+        layer.mlp.gate.layer_idx = layer_idx
+        original_moe_infer = layer.mlp.moe_infer
 
-                expert_scores["activation"][layer_idx][eid] = activation
-                expert_scores["saliency"][layer_idx][eid] = saliency
-                expert_scores["wa"][layer_idx][eid] = wa
-                expert_scores["wg"][layer_idx][eid] = wg
-                expert_scores["grad"][layer_idx][eid] = grad
-                expert_scores["weight"][layer_idx][eid] = weight
-                expert_scores["token_contrib"][layer_idx][eid] = token_contrib
-                expert_scores["expert_out_token_contrib"][layer_idx][eid] = expert_out_token_contrib
-                expert_scores["second_attr"][layer_idx][eid] = second_attr
-                gate_scores["usage"][layer_idx][eid] = usage
+        def observed_moe_infer(
+            self,
+            x,
+            topk_ids,
+            topk_weight,
+            *args,
+            __orig=original_moe_infer,
+            __layer_idx=layer_idx,
+            __acc=accumulator,
+            __ema=ema,
+            **kwargs,
+        ):
+            text_mask = getattr(self, "moe_text_mask", None)
+            visual_mask = getattr(self, "moe_media_mask", None)
+            if text_mask is None:
+                text_mask = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
+            else:
+                text_mask = text_mask.to(x.device).view(-1)
+            if visual_mask is None:
+                visual_mask = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
+            else:
+                visual_mask = visual_mask.to(x.device).view(-1)
 
-                if collect_H_data:
-                    H_grad = _get_score_for_expert("H_grad", expert)
-                    H_saliency = _get_score_for_expert("H_saliency", expert)
-                    H_activation = _get_score_for_expert("H_activation", expert)
-                    H_wa = _get_score_for_expert("H_wa", expert)
+            num_experts = len(self.experts)
+            expert_mask = F.one_hot(
+                topk_ids.clamp(max=num_experts - 1), num_classes=num_experts
+            ).permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+            for expert_tensor in expert_hit:
+                expert_idx = int(expert_tensor[0].item())
+                _, token_idx = torch.where(expert_mask[expert_idx])
+                if token_idx.numel() == 0:
+                    continue
+                with torch.no_grad():
+                    activations = compute_generic_expert_activation(
+                        self.experts[expert_idx], x[token_idx]
+                    )
+                __acc.update(
+                    __layer_idx,
+                    expert_idx,
+                    activations,
+                    text_mask[token_idx],
+                    visual_mask[token_idx],
+                    __ema,
+                )
 
-                    H_scores["H_grad"][layer_idx][eid] = H_grad
-                    H_scores["H_saliency"][layer_idx][eid] = H_saliency
-                    H_scores["H_activation"][layer_idx][eid] = H_activation
-                    H_scores["H_wa"][layer_idx][eid] = H_wa
-                    
-                    assert H_grad.shape == (H,), f"H_grad shape mismatch: {H_grad.shape} != {H}"
-                    assert H_saliency.shape == (H,), f"H_saliency shape mismatch: {H_saliency.shape} != {H}"
-                    assert H_activation.shape == (H,), f"H_activation shape mismatch: {H_activation.shape} != {H}"
-                    assert H_wa.shape == (H,), f"H_wa shape mismatch: {H_wa.shape} != {H}"
+            saved = getattr(self, "freq_save_dir", None)
+            self.freq_save_dir = None
+            try:
+                return __orig(x, topk_ids, topk_weight, *args, **kwargs)
+            finally:
+                self.freq_save_dir = saved
 
-                    H_scores["H_grad"][layer_idx] = _layer_norm(H_scores["H_grad"][layer_idx])
-                    H_scores["H_saliency"][layer_idx] = _layer_norm(H_scores["H_saliency"][layer_idx])
-                    H_scores["H_activation"][layer_idx] = _layer_norm(H_scores["H_activation"][layer_idx])
-                    H_scores["H_wa"][layer_idx] = _layer_norm(H_scores["H_wa"][layer_idx])
+        layer.mlp.moe_infer = observed_moe_infer.__get__(layer.mlp)
+    return states
 
-        expert_scores["activation"][layer_idx] = _layer_norm(expert_scores["activation"][layer_idx])
-        expert_scores["saliency"][layer_idx] = _layer_norm(expert_scores["saliency"][layer_idx])
-        expert_scores["wa"][layer_idx] = _layer_norm(expert_scores["wa"][layer_idx])
-        expert_scores["wg"][layer_idx] = _layer_norm(expert_scores["wg"][layer_idx])
-        expert_scores["grad"][layer_idx] = _layer_norm(expert_scores["grad"][layer_idx])
-        expert_scores["weight"][layer_idx] = _layer_norm(expert_scores["weight"][layer_idx])
-        expert_scores["token_contrib"][layer_idx] = _layer_norm(expert_scores["token_contrib"][layer_idx])
-        expert_scores["expert_out_token_contrib"][layer_idx] = expert_scores["expert_out_token_contrib"][layer_idx]
-        expert_scores["second_attr"][layer_idx] = expert_scores["second_attr"][layer_idx]
-        
-        if collect_H_data:
-            # Save all three aggregation strategies
-            head_scores_dict = getattr(copied_block, "wo_group_scores_dict", None) or {}
-            head_shape = (model_cfg.num_attention_heads,)
-            matrix_shape = (model_cfg.num_attention_heads, model_cfg.num_attention_heads)
-            attn_head_scores["wo_group_scores_mean"][layer_idx] = (
-                head_scores_dict.get("mean", torch.zeros(head_shape, dtype=torch.float32, device=args.device))
-                .clone()
-                .detach()
-                .to(torch.float32)
-            )
-            attn_head_scores["wo_group_scores_max"][layer_idx] = (
-                head_scores_dict.get("max", torch.zeros(head_shape, dtype=torch.float32, device=args.device))
-                .clone()
-                .detach()
-                .to(torch.float32)
-            )
-            attn_head_scores["wo_group_scores_sum"][layer_idx] = (
-                head_scores_dict.get("sum", torch.zeros(head_shape, dtype=torch.float32, device=args.device))
-                .clone()
-                .detach()
-                .to(torch.float32)
-            )
 
-            # Save attention head similarity matrix
-            attn_head_scores["similarity_matrix"][layer_idx] = _get_optional_tensor(
-                copied_block,
-                "attention_head_similarity_matrix",
-                matrix_shape,
-                args.device,
-            )
-            
-            # Assertions for all three
-            assert attn_head_scores["wo_group_scores_mean"][layer_idx].shape == (model_cfg.num_attention_heads,)
-            assert attn_head_scores["wo_group_scores_max"][layer_idx].shape == (model_cfg.num_attention_heads,)
-            assert attn_head_scores["wo_group_scores_sum"][layer_idx].shape == (model_cfg.num_attention_heads,)
-            assert attn_head_scores["similarity_matrix"][layer_idx].shape == (model_cfg.num_attention_heads, model_cfg.num_attention_heads)
-    
-    torch.save(gate_scores, os.path.join(output_dir, "gate_scores.pth"))
-    torch.save(expert_scores, os.path.join(output_dir, "expert_scores.pth"))
-    layerwise_loss = torch.tensor(layerwise_loss, dtype=torch.float32, device=args.device)
-    torch.save(layerwise_loss, os.path.join(output_dir, "layerwise_loss.pth"))
-    if collect_H_data:
-        torch.save(H_scores, os.path.join(output_dir, "H_scores.pth"))
-        torch.save(attn_head_scores, os.path.join(output_dir, "attn_head_scores.pth"))
-    
-    _print(f"gate_scores.pth: for gate importance score, keys: {gate_scores.keys()}")
-    _print(f"expert_scores.pth: for intermediate dim score, keys: {expert_scores.keys()}")
-    _print(f"layerwise_loss.pth: for layerwise loss")
-    if collect_H_data:
-        _print(f"H_scores.pth: for hidden dim score (aggregated from mlp linears), keys: {H_scores.keys()}")
-        _print(f"attn_head_scores.pth: for attention head score (aggregated from attention heads), keys: {attn_head_scores.keys()}")
-    _print("=" * 80)
-    _print(f"✅ Scores saved to {output_dir}")
-    _print("Usage: ")
-    _print(f"\t 1. Set scores_dir={output_dir} in `configs/train/qwen1_5_moe_a2_7b_e2e_alpaca.yaml` for mask generation")
+def restore_kimi_modality_hooks(states) -> None:
+    for mlp, old_freq_save_dir, old_layer_idx, old_moe_infer in states:
+        mlp.freq_save_dir = old_freq_save_dir
+        mlp.moe_infer = old_moe_infer
+        mlp.gate.layer_idx = old_layer_idx
+
+
+def collect_weight_scores(model, config, accumulator: RichScoreAccumulator) -> None:
+    for layer_idx, layer in enumerate(model.language_model.model.layers):
+        if not (
+            config.n_routed_experts is not None
+            and layer_idx >= config.first_k_dense_replace
+            and layer_idx % config.moe_layer_freq == 0
+        ):
+            continue
+        for eid, expert in enumerate(layer.mlp.experts):
+            g = expert.gate_proj.weight
+            u = expert.up_proj.weight
+            d = expert.down_proj.weight
+            score = (weight_rms(d, channel_dim=1) + weight_rms(u, channel_dim=0) + weight_rms(g, channel_dim=0)) / 3.0
+            accumulator.expert_scores["activation"][layer_idx][eid] = score.detach().cpu().float()
+            accumulator.expert_scores["weight"][layer_idx][eid] = score.detach().cpu().float()
+            accumulator.hit_counts[layer_idx][eid] = 1
+
+
+def save_score_artifacts(output_dir: str, accumulator: RichScoreAccumulator, args) -> None:
+    accumulator.finalize()
+    expert_scores_path = os.path.join(output_dir, "expert_scores.pth")
+    gate_scores_path = os.path.join(output_dir, "gate_scores.pth")
+    metadata_path = os.path.join(output_dir, "metadata.json")
+    legacy_path = os.path.join(output_dir, "channel_scores.pt")
+    layerwise_loss_path = os.path.join(output_dir, "layerwise_loss.pth")
+
+    torch.save(accumulator.expert_scores, expert_scores_path)
+    torch.save(accumulator.gate_scores, gate_scores_path)
+    torch.save(
+        torch.tensor(
+            [accumulator.layerwise_loss[layer_idx] for layer_idx in accumulator.layers],
+            dtype=torch.float32,
+        ),
+        layerwise_loss_path,
+    )
+
+    metadata = {
+        "model_name_or_path": args.model_name_or_path,
+        "resolved_model_name_or_path": resolve_model_name_or_path(args.model_name_or_path),
+        "dataset": args.dataset,
+        "num_samples": args.num_samples,
+        "batch_size": args.batch_size,
+        "start_idx": args.start_idx,
+        "subset_seed": args.subset_seed,
+        "score_type": args.score_type,
+        "ema": args.ema,
+        "modality_aware": args.modality_aware,
+        "layers": accumulator.layers,
+        "layer_to_num_experts": accumulator.layer_to_num_experts,
+        "layer_to_num_channels": accumulator.layer_to_num_channels,
+        "available_channel_metrics": list(CHANNEL_METRICS),
+        "available_expert_metrics": list(EXPERT_METRICS),
+    }
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+    torch.save(accumulator.build_legacy_payload(args), legacy_path)
+    print(f"[channel_scoring] Saved expert scores: {expert_scores_path}")
+    print(f"[channel_scoring] Saved gate scores: {gate_scores_path}")
+    print(f"[channel_scoring] Saved layerwise loss: {layerwise_loss_path}")
+    print(f"[channel_scoring] Saved metadata: {metadata_path}")
+    print(f"[channel_scoring] Saved legacy payload: {legacy_path}")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Collect channel scores for Kimi-VL on multimodal calibration data."
+    )
+    p.add_argument("--model_name_or_path", type=str, required=True)
+    p.add_argument("--output_dir", type=str, required=True)
+    p.add_argument("--dataset", type=str, default="gqa", choices=["gqa", "coco"])
+    p.add_argument("--num_samples", type=int, default=128)
+    p.add_argument("--batch_size", type=int, default=1)
+    p.add_argument("--start_idx", type=int, default=0)
+    p.add_argument("--subset_seed", type=int, default=42)
+    p.add_argument("--score_type", type=str, default="activation", choices=["activation", "weight"])
+    p.add_argument("--ema", type=float, default=0.9)
+    p.add_argument("--modality_aware", action="store_true")
+    p.add_argument("--force_recompute", action="store_true")
+    return p
+
+
+def run_collection(args) -> None:
+    ensure_dir(args.output_dir)
+    out_path = os.path.join(args.output_dir, "expert_scores.pth")
+    if os.path.exists(out_path) and not args.force_recompute:
+        print(
+            f"[channel_scoring] Found existing scores at {out_path}. "
+            "Pass --force_recompute to overwrite."
+        )
+        return
+
+    bundle = load_model_bundle(args.model_name_or_path)
+    if bundle.family != "kimi":
+        raise NotImplementedError("The current channel_scoring adapter only supports Kimi-VL.")
+
+    model = bundle.model
+    config = model.config.text_config
+    layer_to_num_experts, layer_to_num_channels = discover_layer_structure(bundle)
+    accumulator = RichScoreAccumulator(
+        layer_to_num_experts,
+        layer_to_num_channels,
+        score_type=args.score_type,
+        modality_aware=args.modality_aware,
+    )
+
+    print(
+        f"[channel_scoring] Discovered {len(layer_to_num_experts)} MoE layers, "
+        f"{sum(layer_to_num_experts.values())} experts total."
+    )
+
+    if args.score_type == "weight":
+        collect_weight_scores(model, config, accumulator)
+        save_score_artifacts(args.output_dir, accumulator, args)
+        return
+
+    dataset = build_dataset(args.dataset, bundle.family)
+    pool = list(range(args.start_idx, len(dataset)))
+    if args.subset_seed is not None and args.subset_seed >= 0:
+        rng = random.Random(args.subset_seed)
+        indices = rng.sample(pool, min(args.num_samples, len(pool)))
+    else:
+        indices = pool[: args.num_samples]
+
+    subset = Subset(dataset, indices)
+    loader = DataLoader(
+        subset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=custom_collate_fn,
+    )
+
+    if args.modality_aware and accumulator.modality_scores is not None:
+        print("[channel_scoring] Collecting modality-split activation scores...")
+        hook_states = attach_kimi_modality_hooks(model, config, accumulator.modality_scores, args.ema)
+        try:
+            model.eval()
+            with torch.no_grad():
+                for batch in tqdm(loader, desc="Collecting modality activations", unit="batch"):
+                    inputs = prepare_inputs(bundle, batch, args.dataset)
+                    inputs = move_inputs_to_model_device(model, inputs)
+                    model(**inputs, use_cache=False, return_dict=True)
+        finally:
+            restore_kimi_modality_hooks(hook_states)
+
+    print("[channel_scoring] Collecting block-reconstruction scores with attn_mlp collector...")
+    for layer_idx in accumulator.layers:
+        teacher_block = model.language_model.model.layers[layer_idx]
+        copied_block = copy.deepcopy(teacher_block)
+        block_dtype = next(teacher_block.parameters()).dtype
+        layer_loss = block_forward(
+            bundle=bundle,
+            cnt_block=copied_block,
+            layer_idx=layer_idx,
+            dataloader=loader,
+            dataset_name=args.dataset,
+            saliency_ema=args.ema,
+            loss_fn="rel_l2",
+            second_order_mode="exact",
+            dtype=block_dtype,
+            verbose=True,
+        )
+        accumulator.layerwise_loss[layer_idx] = float(layer_loss)
+        accumulator.absorb_layer_scores(layer_idx, copied_block)
+        print(f"[channel_scoring] Layer {layer_idx}: mean block loss={layer_loss:.6f}")
+
+    save_score_artifacts(args.output_dir, accumulator, args)
+
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
+    run_collection(args)
+
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--model-name-or-path", type=str, required=True)
-    p.add_argument("--calib-datasets", type=str, nargs="+", required=True)
-    p.add_argument("--calib-batches", type=int, default=200)  # 200 for full calibration
-    p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--max-seq-length", type=int, default=512)
-    p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "float16", "bfloat16", "fp32", "fp16", "bf16"])
-    p.add_argument("--trust-remote-code", action="store_true", default=False)
-    p.add_argument("--output-dir", type=str, default="./results/")
-    p.add_argument("--collect-h-data", action="store_true", default=True)
-    p.add_argument("--verbose", action="store_true", default=True)
-    p.add_argument("--second-order-mode", type=str, default="exact", choices=["exact", "approx"])
-
-    p.add_argument("--load-in-4bit", action="store_true", default=False)
-    p.add_argument("--load-in-8bit", action="store_true", default=False)
-    p.add_argument("--test-only", action="store_true", default=False)
-    p.add_argument("--is-multimodal", action="store_true", default=False)
-    args = p.parse_args()
-    
-    dtype_map = {
-        "float32": torch.float32, "fp32": torch.float32,
-        "float16": torch.float16, "fp16": torch.float16,
-        "bfloat16": torch.bfloat16, "bf16": torch.bfloat16
-    }
-    args.dtype = dtype_map.get(args.dtype, torch.bfloat16)
-    
-    model, tokenizer = get_model(args)
-    _print(args)
-    
-    for calib_dataset in args.calib_datasets:
-        model_name = format_name(args.model_name_or_path)
-        output_dir = os.path.join(args.output_dir, model_name, format_name(calib_dataset), "scores")
-        os.makedirs(output_dir, exist_ok=True)
-        main(args, model, tokenizer, output_dir, calib_dataset, collect_H_data=args.collect_h_data, verbose=args.verbose)
+    main()

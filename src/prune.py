@@ -45,6 +45,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
 
 from models.kimi import _normalize_kimi_config_for_remote_code
 from observations.common import resolve_model_name_or_path
+from src.generate_mask import generate_masks as build_masks_pipeline
 
 
 _ROUTED_EXPERT_LOAD_PATCH = """
@@ -422,6 +423,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.30,
         help="Fraction of intermediate channels to remove (0.0 = no pruning, 0.5 = half).",
     )
+    p.add_argument(
+        "--inter_method",
+        type=str,
+        default="uniform",
+        help="Inter-layer planner method for src/generate_mask.",
+    )
+    p.add_argument(
+        "--intra_method",
+        type=str,
+        default="uniform",
+        help="Intra-layer planner method for src/generate_mask.",
+    )
+    p.add_argument(
+        "--intra_expert_metric",
+        type=str,
+        default="activation",
+        help="Per-channel metric to use from expert_scores.pth.",
+    )
+    p.add_argument("--align_inter", type=int, default=0)
+    p.add_argument("--min_per_expert", type=int, default=0)
+    p.add_argument("--modality_aware", action="store_true")
     return p
 
 
@@ -429,24 +451,43 @@ def main() -> None:
     args = build_arg_parser().parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # ---- Load scores ----
+    # ---- Generate masks from the new score pipeline ----
     print(f"[prune] Loading scores from {args.scores_path}")
-    score_payload = torch.load(args.scores_path, weights_only=False)
-    scores           = score_payload["scores"]
-    layer_to_num_experts  = score_payload["layer_to_num_experts"]
-    layer_to_num_channels = score_payload["layer_to_num_channels"]
-    print(
-        f"[prune] Scores: {len(scores)} MoE layers, "
-        f"score_type={score_payload.get('score_type', 'unknown')}"
+    mask_result = build_masks_pipeline(
+        scores_dir=args.scores_path,
+        prune_kwargs={
+            "prune_ratio": args.prune_ratio,
+            "mask_method_kwargs": {
+                "inter_layer_method": args.inter_method,
+                "intra_layer_method": args.intra_method,
+                "intra_expert_metric": args.intra_expert_metric,
+            },
+            "adjust_masks_kwargs": {
+                "align_inter": args.align_inter,
+                "min_per_expert": args.min_per_expert,
+            },
+            "modality_aware": args.modality_aware,
+            "prune_hidden": False,
+            "prune_gqa": False,
+        },
+        device="cpu",
+        verbose=True,
     )
-
-    # ---- Generate masks ----
-    print(f"[prune] Generating masks with prune_ratio={args.prune_ratio}")
-    masks = generate_masks(scores, args.prune_ratio, layer_to_num_experts, layer_to_num_channels)
-    first_layer = sorted(masks.keys())[0]
-    I_orig = layer_to_num_channels[first_layer]
-    I_prime = int(masks[first_layer][0].sum().item())
-    print(f"[prune] I: {I_orig} -> {I_prime}  (keeping {I_prime}/{I_orig} channels)")
+    mask_tensor = mask_result["intermediate_masks"]
+    layers = [int(layer) for layer in mask_result.get("layers", list(range(mask_tensor.shape[0])))]
+    masks = {
+        layer_idx: mask_tensor[pos].detach().cpu().bool()
+        for pos, layer_idx in enumerate(layers)
+    }
+    all_k = mask_result["K_E_inter"].detach().cpu()
+    first_layer = layers[0]
+    I_orig = int(mask_tensor.shape[-1])
+    I_prime = int(all_k[0, 0].item())
+    print(
+        f"[prune] Generated masks for {len(layers)} layers. "
+        f"I_orig={I_orig}, I_prime min={int(all_k.min().item())} "
+        f"max={int(all_k.max().item())} mean={float(all_k.float().mean().item()):.1f}"
+    )
 
     # ---- Load clean model (no monkey-patches) ----
     model_path = resolve_model_name_or_path(args.model_path)

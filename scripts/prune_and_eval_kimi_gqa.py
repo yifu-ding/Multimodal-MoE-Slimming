@@ -18,7 +18,8 @@ from tqdm.auto import tqdm
 
 from models.kimi import load_model
 from observations.common import resolve_model_name_or_path
-from src.prune import apply_structural_pruning, generate_masks
+from src.generate_mask import generate_masks as build_masks_pipeline
+from src.prune import apply_structural_pruning
 from tasks.gqa import (
     gqa_doc_to_answer,
     gqa_doc_to_text,
@@ -43,6 +44,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scores_path", type=str, required=True)
     p.add_argument("--output_dir", type=str, required=True)
     p.add_argument("--prune_ratio", type=float, default=0.30)
+    p.add_argument("--inter_method", type=str, default="uniform")
+    p.add_argument("--intra_method", type=str, default="uniform")
+    p.add_argument("--intra_expert_metric", type=str, default="activation")
+    p.add_argument("--align_inter", type=int, default=0)
+    p.add_argument("--min_per_expert", type=int, default=0)
+    p.add_argument("--modality_aware", action="store_true")
     p.add_argument("--num_samples", type=int, default=0)
     p.add_argument("--start_idx", type=int, default=0)
     p.add_argument("--subset_seed", type=int, default=None)
@@ -56,22 +63,39 @@ def main() -> None:
     os.makedirs(args.output_dir, exist_ok=True)
 
     print(f"[Run] Loading scores from: {args.scores_path}")
-    score_payload = torch.load(args.scores_path, weights_only=False)
-    scores = score_payload["scores"]
-    layer_to_num_experts = score_payload["layer_to_num_experts"]
-    layer_to_num_channels = score_payload["layer_to_num_channels"]
-
-    print(f"[Run] Generating masks with prune_ratio={args.prune_ratio}")
-    masks = generate_masks(
-        scores,
-        args.prune_ratio,
-        layer_to_num_experts,
-        layer_to_num_channels,
+    mask_result = build_masks_pipeline(
+        scores_dir=args.scores_path,
+        prune_kwargs={
+            "prune_ratio": args.prune_ratio,
+            "mask_method_kwargs": {
+                "inter_layer_method": args.inter_method,
+                "intra_layer_method": args.intra_method,
+                "intra_expert_metric": args.intra_expert_metric,
+            },
+            "adjust_masks_kwargs": {
+                "align_inter": args.align_inter,
+                "min_per_expert": args.min_per_expert,
+            },
+            "modality_aware": args.modality_aware,
+            "prune_hidden": False,
+            "prune_gqa": False,
+        },
+        device="cpu",
+        verbose=True,
     )
-    first_layer = sorted(masks.keys())[0]
-    i_orig = layer_to_num_channels[first_layer]
-    i_prime = int(masks[first_layer][0].sum().item())
-    print(f"[Run] I: {i_orig} -> {i_prime}  (keeping {i_prime}/{i_orig} channels)")
+    mask_tensor = mask_result["intermediate_masks"]
+    layers = [int(layer) for layer in mask_result.get("layers", list(range(mask_tensor.shape[0])))]
+    masks = {
+        layer_idx: mask_tensor[pos].detach().cpu().bool()
+        for pos, layer_idx in enumerate(layers)
+    }
+    k_e = mask_result["K_E_inter"].detach().cpu()
+    i_orig = int(mask_tensor.shape[-1])
+    print(
+        f"[Run] Generated masks for {len(layers)} layers. "
+        f"I_orig={i_orig}, I_prime min={int(k_e.min().item())} "
+        f"max={int(k_e.max().item())} mean={float(k_e.float().mean().item()):.1f}"
+    )
 
     resolved_model_path = resolve_model_name_or_path(args.model_path)
     print(f"[Run] Loading model from: {resolved_model_path}")
@@ -165,6 +189,10 @@ def main() -> None:
         "correct": correct,
         "scores_path": args.scores_path,
         "prune_ratio": args.prune_ratio,
+        "inter_method": args.inter_method,
+        "intra_method": args.intra_method,
+        "intra_expert_metric": args.intra_expert_metric,
+        "modality_aware": args.modality_aware,
         "saved_pruned_checkpoint": False,
     }
     summary_path = os.path.join(args.output_dir, "summary.json")

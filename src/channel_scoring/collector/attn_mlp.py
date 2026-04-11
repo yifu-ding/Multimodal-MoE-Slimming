@@ -378,113 +378,19 @@ def collect_scores_attn_mlp(cnt_block,
                     expert_out_token_contrib = token_contrib(down_out_grad, down_output).sum() * usage
                     safe_add_with_ema(expert, ema, expert_out_token_contrib, "expert_out_token_contrib")
                     safe_add_with_ema(expert, ema, usage, "usage")
-                    # second_approx_attr = _compute_second_approx_attr(
-                    #     down_output=down_output,
-                    #     down_out_grad=down_out_grad,
-                    #     expert_out_token_contrib=expert_out_token_contrib,
-                    #     usage=usage,
-                    #     compute_H_scores_kwargs=compute_H_scores_kwargs,
-                    # )
-                    # if second_approx_attr is not None:
-                    #     safe_add_with_ema(expert, ema, second_approx_attr, "second_approx_attr")
+                    
+                    second_exact_attr = _compute_second_exact_attr(
+                        cnt_block=cnt_block,
+                        expert=expert,
+                        compute_H_scores_kwargs=compute_H_scores_kwargs,
+                    )
+                    if second_exact_attr is not None:
+                        safe_add_with_ema(expert, ema, second_exact_attr, "second_exact_attr")
 
-                    # second_exact_attr = _compute_second_exact_attr(
-                    #     cnt_block=cnt_block,
-                    #     expert=expert,
-                    #     compute_H_scores_kwargs=compute_H_scores_kwargs,
-                    # )
-                    # if second_exact_attr is not None:
-                    #     safe_add_with_ema(expert, ema, second_exact_attr, "second_exact_attr")
-
-                    # true_ablate = _compute_true_ablate_attr(
-                    #     cnt_block=cnt_block,
-                    #     expert=expert,
-                    #     compute_H_scores_kwargs=compute_H_scores_kwargs,
-                    # )
-                    # if true_ablate is not None:
-                    #     safe_add_with_ema(expert, ema, true_ablate, "true_ablate")
-
-                    # hidden size channel 的 mlp expert 部分分数收集
-                    if compute_H_scores_kwargs is not None and compute_H_scores_kwargs.get("use_mlp_scores", True):
-                        grad_mean = compute_grad_H(down_out_grad, up_in_grad, gate_in_grad)  # shape [H]
-                        # H_grad_accum = safe_add_with_ema(target=H_grad_accum, ema=ema, value=grad_mean, key=None)
-                        safe_add_with_ema(expert, ema, grad_mean, "H_grad")
-
-                        sal_mean = compute_saliency_H(down_output, down_out_grad, up_input, up_in_grad, gate_input, gate_in_grad)  # shape [H]
-                        # H_saliency_accum = safe_add_with_ema(target=H_saliency_accum, ema=ema, value=sal_mean, key=None)
-                        safe_add_with_ema(expert, ema, sal_mean, "H_saliency")
-                        
-                        act_mean = compute_activation_H(down_output, up_input, gate_input)  # shape [H]
-                        # H_activation_accum = safe_add_with_ema(target=H_activation_accum, ema=ema, value=act_mean, key=None)
-                        safe_add_with_ema(expert, ema, act_mean, "H_activation")
-                        
-                        wa_mean = compute_wa_H(down_input, up_input, gate_input, W_down, W_up, W_gate)  # shape [H]
-                        # H_wa_accum = safe_add_with_ema(target=H_wa_accum, ema=ema, value=wa_mean, key=None)
-                        safe_add_with_ema(expert, ema, wa_mean, "H_wa")
-     
-    # hidden size channel 的 attention 部分分数收集
-    if compute_H_scores_kwargs is not None and compute_H_scores_kwargs.get("use_attn_scores", True):
-        attn_mask = compute_H_scores_kwargs.get("attn_mask", None)
-        assert attn_mask is not None
-
-        self_attn = cnt_block.self_attn
-        self_attn_input = self_attn.saved_input       # input 是 hidden states, shape [B, S, H]
-        self_attn_output = self_attn.saved_output     # shape [B, S, H]
-        self_attn_in_grad = self_attn.saved_grad_in   # shape [B, S, H]
-        self_attn_out_grad = self_attn.saved_grad_out # shape [B, S, H]
-        self_attn.saved_input = None
-        self_attn.saved_output = None
-        self_attn.saved_grad_in = None
-        self_attn.saved_grad_out = None
-
-        # 0. attn_inp_saliency: 相当于 down_proj 的输出的 saliency
-        _attn_inp_saliency = (self_attn_input * self_attn_in_grad).abs().detach()     # [B, S, H]
-        attn_inp_saliency  = masked_mean_bs(_attn_inp_saliency, attn_mask)            # [H]
-
-        # 1. attn_out_saliency: 相当于 up_proj 的输入的 saliency
-        _attn_out_saliency = (self_attn_output * self_attn_out_grad).abs().detach()   # [B, S, H]
-        attn_out_saliency  = masked_mean_bs(_attn_out_saliency, attn_mask)            # [H]
-
-        # 2. attn_inp_grad: 相当于 down_proj 的输出的 grad
-        _attn_inp_grad = self_attn_in_grad.abs().detach()                             # [B, S, H]
-        attn_inp_grad  = masked_mean_bs(_attn_inp_grad, attn_mask)                    # [H]
-
-        # 3. attn_out_grad: 相当于 up_proj 的输入的 grad
-        _attn_out_grad = self_attn_out_grad.abs().detach()                            # [B, S, H]
-        attn_out_grad  = masked_mean_bs(_attn_out_grad, attn_mask)                    # [H]
-
-        # 4. attn_input: 相当于 down_proj 的输出
-        _attn_input = self_attn_input.abs().detach()                                  # [B, S, H]
-        attn_input  = masked_mean_bs(_attn_input, attn_mask)                          # [H]
-
-        # 5. attn_output: 相当于 up_proj 的输入
-        _attn_output = self_attn_output.abs().detach()                                # [B, S, H]
-        attn_output  = masked_mean_bs(_attn_output, attn_mask)                        # [H]
-
-        safe_add_with_ema(self_attn, ema, attn_inp_saliency, "attn_inp_saliency")
-        safe_add_with_ema(self_attn, ema, attn_out_saliency, "attn_out_saliency")
-        safe_add_with_ema(self_attn, ema, attn_inp_grad, "attn_inp_grad")
-        safe_add_with_ema(self_attn, ema, attn_out_grad, "attn_out_grad")
-        safe_add_with_ema(self_attn, ema, attn_input, "attn_input")
-        safe_add_with_ema(self_attn, ema, attn_output, "attn_output")
-        
-        # 6. attn_wa, 每个 linear layer 的 |weight| * ||activation||
-        q_proj = self_attn.q_proj.weight
-        k_proj = self_attn.k_proj.weight
-        v_proj = self_attn.v_proj.weight
-        o_proj = self_attn.o_proj.weight
-        o_input = self_attn.o_proj.saved_input
-        self_attn.o_proj.saved_input = None
-
-        attn_input_ch = channel_rms(attn_input)
-        o_proj_input_ch = channel_rms(o_input)
-        q_wa = wa_score(q_proj, attn_input_ch, sum_dim=0)
-        k_wa = wa_score(k_proj, attn_input_ch, sum_dim=0)
-        v_wa = wa_score(v_proj, attn_input_ch, sum_dim=0)
-        o_wa = wa_score(o_proj, o_proj_input_ch, sum_dim=0)
-        
-        attn_inp_wa = (q_wa + k_wa + v_wa) / 3.0
-        attn_out_wa = o_wa
-        
-        safe_add_with_ema(self_attn, ema, attn_inp_wa, "attn_inp_wa")
-        safe_add_with_ema(self_attn, ema, attn_out_wa, "attn_out_wa")
+                    true_ablate = _compute_true_ablate_attr(
+                        cnt_block=cnt_block,
+                        expert=expert,
+                        compute_H_scores_kwargs=compute_H_scores_kwargs,
+                    )
+                    if true_ablate is not None:
+                        safe_add_with_ema(expert, ema, true_ablate, "true_ablate")

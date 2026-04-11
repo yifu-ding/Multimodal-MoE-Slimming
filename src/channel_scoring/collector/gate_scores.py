@@ -23,7 +23,7 @@ def collect_gate_scores(cnt_mlp, ema=0.9):
         else:
             gate.gate_grad = gate_grad
 
-        gate_output = gate_output.abs().detach().mean(dim=0)  # [E]
+        gate_output = gate_output.abs(  ).detach().mean(dim=0)  # [E]
         if hasattr(gate, 'gate_output') and gate.gate_output is not None:
             gate.gate_output.mul_(ema).add_(gate_output, alpha=1.0 - ema)
         else:

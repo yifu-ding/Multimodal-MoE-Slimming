@@ -1,21 +1,122 @@
-import torch
+import math
 from time import time
-import numpy as np
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional, Set
 
-from src.generate_mask.stages import (
-    prepare_scores, 
-    load_attention_head_scores,
-    init_mask_for_HI, 
-    init_mask_for_I, 
-    init_mask_for_gqa,
-    adjust_masks,
-)
+import torch
+
 from src.base.shared_utils import _print
+from src.generate_mask.stages import (
+    adjust_masks,
+    init_mask_for_I,
+    load_modality_channel_scores,
+    prepare_scores,
+)
 
 __all__ = [
-    "generate_masks", 
+    "generate_masks",
 ]
+
+
+def _pick_topk(available_scores: torch.Tensor, available_idx: torch.Tensor, k: int) -> Set[int]:
+    if k <= 0 or available_idx.numel() == 0:
+        return set()
+    k = min(k, int(available_idx.numel()))
+    local = torch.topk(available_scores, k=k, largest=True).indices
+    return {int(available_idx[idx].item()) for idx in local}
+
+
+def _build_modality_budget_masks(
+    text_scores: torch.Tensor,
+    visual_scores: torch.Tensor,
+    K_E: torch.Tensor,
+) -> torch.Tensor:
+    L, E, I = text_scores.shape
+    masks = torch.zeros((L, E, I), dtype=torch.bool, device=text_scores.device)
+
+    for lid in range(L):
+        for eid in range(E):
+            k = int(K_E[lid, eid].item())
+            if k <= 0:
+                continue
+
+            t = text_scores[lid, eid].float().clamp_min(0.0)
+            v = visual_scores[lid, eid].float().clamp_min(0.0)
+
+            shared = torch.minimum(t, v)
+            visual_specific = torch.clamp(v - t, min=0.0)
+            text_specific = torch.clamp(t - v, min=0.0)
+
+            shared_mass = float(shared.sum().item())
+            visual_mass = float(visual_specific.sum().item())
+            text_mass = float(text_specific.sum().item())
+            total_mass = shared_mass + visual_mass + text_mass
+
+            if total_mass <= 0.0:
+                chosen = torch.topk(torch.maximum(t, v), k=min(k, I), largest=True).indices
+                masks[lid, eid].index_fill_(0, chosen, True)
+                continue
+
+            k_shared = int(round(k * shared_mass / total_mass)) if shared_mass > 0 else 0
+            k_shared = min(k, max(0, k_shared))
+            remaining = k - k_shared
+
+            if visual_mass + text_mass > 0 and remaining > 0:
+                k_visual = int(round(remaining * visual_mass / (visual_mass + text_mass)))
+                k_visual = min(remaining, max(0, k_visual))
+                k_text = remaining - k_visual
+                if visual_mass > 0 and text_mass > 0 and remaining >= 2:
+                    if k_visual == 0:
+                        k_visual = 1
+                        k_text = remaining - 1
+                    elif k_text == 0:
+                        k_text = 1
+                        k_visual = remaining - 1
+            else:
+                k_visual = 0
+                k_text = 0
+
+            chosen: Set[int] = set()
+
+            shared_idx = torch.nonzero(shared > 0, as_tuple=False).flatten()
+            chosen.update(_pick_topk(shared[shared_idx], shared_idx, k_shared))
+
+            remaining_idx = torch.tensor(
+                [idx for idx in range(I) if idx not in chosen],
+                device=text_scores.device,
+                dtype=torch.long,
+            )
+            if remaining_idx.numel() > 0:
+                chosen.update(
+                    _pick_topk(visual_specific[remaining_idx], remaining_idx, k_visual)
+                )
+
+            remaining_idx = torch.tensor(
+                [idx for idx in range(I) if idx not in chosen],
+                device=text_scores.device,
+                dtype=torch.long,
+            )
+            if remaining_idx.numel() > 0:
+                chosen.update(
+                    _pick_topk(text_specific[remaining_idx], remaining_idx, k_text)
+                )
+
+            if len(chosen) < k:
+                remaining_idx = torch.tensor(
+                    [idx for idx in range(I) if idx not in chosen],
+                    device=text_scores.device,
+                    dtype=torch.long,
+                )
+                if remaining_idx.numel() > 0:
+                    fallback = torch.maximum(t, v)
+                    extra = _pick_topk(fallback[remaining_idx], remaining_idx, k - len(chosen))
+                    chosen.update(extra)
+
+            if chosen:
+                chosen_idx = torch.tensor(sorted(chosen), device=text_scores.device, dtype=torch.long)
+                masks[lid, eid].index_fill_(0, chosen_idx, True)
+
+    return masks
+
 
 def generate_masks(
     scores_dir: str,
@@ -24,118 +125,91 @@ def generate_masks(
     device: str = "cpu",
     verbose: bool = False,
 ) -> Dict[str, Any]:
-
-    ##############################################
-    # 1. load masks from mask_dir (if provided)
-    # 为了防止训的 mask 和测试的 mask 不一致, 训练时会保存 mask 到 mask_dir (和 checkpoint 的位置相同)
-    ##############################################
-    
     if mask_dir is not None:
         masks = torch.load(mask_dir, map_location=device)
         if verbose:
-            _print(f"[Mask Loading] ✅ Loaded masks from {mask_dir}, skip mask generate pipeline. ")
-        
-        if isinstance(masks, dict):
-            # 兼容旧代码: 将 drop_kv_idx_plan 重命名为 drop_head_idx_plan
-            if "drop_kv_idx_plan" in masks and "drop_head_idx_plan" not in masks:
-                masks["drop_head_idx_plan"] = masks["drop_kv_idx_plan"]
-                del masks["drop_kv_idx_plan"]
-            elif "drop_kv_idx_plan" in masks and "drop_head_idx_plan" in masks:
-                if verbose:
-                    _print(f"[WARNING] Both 'drop_kv_idx_plan' and 'drop_head_idx_plan' found in masks. "
-                           f"Using 'drop_head_idx_plan' (preferred).")
-                del masks["drop_kv_idx_plan"]
-        elif isinstance(masks, torch.Tensor):
-            if masks.ndim == 2:
-                masks = None
-            else:
-                _print(f"[Mask Loading] Intermediate masks shape: {masks.shape}")
-                masks = {
-                    "intermediate_masks": masks,
-                    "hidden_masks": None,
-                    "drop_head_idx_plan": None,
-                    "distill_layers": None,
-                }        
-        return masks
-    
-    ##############################################
-    # 2. 没有提供 mask_dir, 则从 scores 中生成 masks
-    ##############################################
+            _print(f"[Mask Loading] Loaded masks from {mask_dir}")
+        return masks if isinstance(masks, dict) else {"intermediate_masks": masks}
+
+    prune_kwargs = prune_kwargs or {}
     prune_ratio = prune_kwargs.get("prune_ratio", 0.0)
     mask_method_kwargs = prune_kwargs.get("mask_method_kwargs", {})
     adjust_masks_kwargs = prune_kwargs.get("adjust_masks_kwargs", {})
     smooth_fn = prune_kwargs.get("smooth_fn", "sqrt")
+    modality_aware = bool(prune_kwargs.get("modality_aware", False))
 
-    # 2.1 准备 scores
-    intermediate_scores, expertwise_scores, L, E, I, \
-        loss_based_importance_kwargs = prepare_scores(
-        scores_dir=scores_dir,      # scores 目录路径
-        prune_ratio=prune_ratio,   # 总体目标剪枝率
-        smooth_fn=smooth_fn,       # layerwise loss smoothing variant
-        mask_method_kwargs=mask_method_kwargs,  # 剪枝算法参数
+    (
+        intermediate_scores,
+        hidden_scores,
+        expertwise_scores,
+        L,
+        E,
+        I,
+        H,
+        loss_based_kwargs,
+    ) = prepare_scores(
+        scores_dir=scores_dir,
+        mask_method_kwargs=mask_method_kwargs,
+        HI_ratio_kwargs=prune_kwargs.get("HI_ratio_kwargs", {}),
+        prune_ratio=prune_ratio,
+        prune_hidden=prune_kwargs.get("prune_hidden", False),
+        prune_gqa=prune_kwargs.get("prune_gqa", False),
+        smooth_fn=smooth_fn,
         device=device,
         verbose=verbose,
     )
-    
-    if verbose:
-        _print("[Step 1-2] ✅ Prepare scores and layerwise_keep_plan")
 
-    result = {}  # 结果返回
-    layerwise_keep_plan = loss_based_importance_kwargs["layerwise_keep_plan"]
+    result = {}
+    layerwise_keep_plan = loss_based_kwargs["layerwise_keep_plan"]
+    result["layers"] = loss_based_kwargs.get("layers", list(range(L)))
     result["layerwise_keep_plan"] = layerwise_keep_plan
-    
-    # 2.2 构建 masks
-    start_time = time()
 
+    start_time = time()
     mask_result = init_mask_for_I(
         intermediate_scores=intermediate_scores,
         expertwise_scores=expertwise_scores,
         layerwise_keep_plan=layerwise_keep_plan,
-        intra_layer_method=mask_method_kwargs["intra_layer_method"],
+        intra_layer_method=mask_method_kwargs.get("intra_layer_method", "uniform"),
         L=L,
         E=E,
         I=I,
         verbose=verbose,
     )
-    # intermediate_masks, K_E_inter = mask_result["intermediate_masks"], mask_result["K_E_inter"]
     result.update(mask_result)
     result["hidden_masks"] = None
     result["layerwise_inter_prune_ratio"] = None
-    
-    if verbose:
-        _print(f"[Prune Inter] ✅ Building masks for I")
 
-    ##############################################
-    # 3. 调整 masks, 对齐量化 kernel 形状限制和最少保留通道数
-    ##############################################
+    modality_scores = load_modality_channel_scores(scores_dir, device=device) if modality_aware else None
+    if modality_scores is not None:
+        if verbose:
+            _print("[Mask Building] Applying modality-conditioned channel budgeting.")
+        result["intermediate_masks"] = _build_modality_budget_masks(
+            modality_scores["text"],
+            modality_scores["visual"],
+            result["K_E_inter"],
+        )
+
     align_inter = adjust_masks_kwargs.get("align_inter", 0)
     min_per_expert = adjust_masks_kwargs.get("min_per_expert", 0)
     adjust_method = adjust_masks_kwargs.get("adjust_method", "largest_channel")
 
     if align_inter > 0 or min_per_expert > 0:
-        K_E_inter = result["K_E_inter"]
-        intermediate_masks = result["intermediate_masks"]
-        
-        if K_E_inter is not None:
-            intermediate_masks, K_E_inter = adjust_masks(
-                scores=intermediate_scores,
-                masks=intermediate_masks,
-                K_E=K_E_inter,
-                L=L,
-                E=E,
-                I=I,
-                align=align_inter,
-                min_per_expert=min_per_expert,
-                adjust_method=adjust_method,
-                verbose=verbose,
-            )
-            result["intermediate_masks"] = intermediate_masks
-            result["K_E_inter"] = K_E_inter
-        
-    intra_end_time = time()
+        result["intermediate_masks"], result["K_E_inter"] = adjust_masks(
+            scores=intermediate_scores,
+            masks=result["intermediate_masks"],
+            K_E=result["K_E_inter"],
+            L=L,
+            E=E,
+            I=I,
+            align=align_inter,
+            min_per_expert=min_per_expert,
+            adjust_method=adjust_method,
+            verbose=verbose,
+        )
+
     if verbose:
-        _print(f"Intra-layer mask building time (including adjust): {((intra_end_time - start_time) * 1000):.2f} ms")
-    
-  
-    
+        elapsed = (time() - start_time) * 1000.0
+        keep_ratio = float(result["intermediate_masks"].float().mean().item())
+        _print(f"[Mask Building] keep_ratio={keep_ratio:.4f}, elapsed={elapsed:.2f}ms")
+
     return result
