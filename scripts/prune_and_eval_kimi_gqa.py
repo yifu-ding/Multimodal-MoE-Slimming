@@ -82,6 +82,15 @@ def main() -> None:
     print(f"[Run] Loading scores from: {args.scores_path}")
     score_payload = torch.load(args.scores_path, weights_only=False)
     scores = score_payload["scores"]
+    modality_channel_scores = (
+        score_payload.get("modality_channel_scores", None)
+        if score_payload.get("modality_aware", False)
+        else None
+    )
+    used_modality_channel_budgeting = (
+        score_payload.get("modality_aware", False)
+        and modality_channel_scores is not None
+    )
     layer_to_num_experts = score_payload["layer_to_num_experts"]
     layer_to_num_channels = score_payload["layer_to_num_channels"]
 
@@ -159,6 +168,7 @@ def main() -> None:
         intra_method=args.intra_method,
         layerwise_weights=layerwise_weights,
         expertwise_weights=expertwise_weights,
+        modality_channel_scores=modality_channel_scores,
         evict_min_channels=args.evict_min_channels,
     )
     first_layer = sorted(masks.keys())[0]
@@ -282,6 +292,7 @@ def main() -> None:
         "intra_method": args.intra_method,
         "layerwise_weight_source": args.layerwise_weight_source,
         "expertwise_weight_source": args.expertwise_weight_source,
+        "used_modality_channel_budgeting": used_modality_channel_budgeting,
         "evict_min_channels": args.evict_min_channels,
         "affinity_path": args.affinity_path,
         "affinity_threshold": args.affinity_threshold if args.affinity_path else None,

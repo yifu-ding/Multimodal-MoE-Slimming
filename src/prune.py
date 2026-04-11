@@ -429,6 +429,11 @@ def main() -> None:
     print(f"[prune] Loading scores from {args.scores_path}")
     score_payload = torch.load(args.scores_path, weights_only=False)
     scores                = score_payload["scores"]
+    modality_channel_scores = (
+        score_payload.get("modality_channel_scores", None)
+        if score_payload.get("modality_aware", False)
+        else None
+    )
     layer_to_num_experts  = score_payload["layer_to_num_experts"]
     layer_to_num_channels = score_payload["layer_to_num_channels"]
     print(
@@ -533,6 +538,7 @@ def main() -> None:
         intra_method=args.intra_method,
         layerwise_weights=layerwise_weights,
         expertwise_weights=expertwise_weights,
+        modality_channel_scores=modality_channel_scores,
         evict_min_channels=args.evict_min_channels,
     )
 

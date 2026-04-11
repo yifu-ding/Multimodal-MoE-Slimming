@@ -118,6 +118,57 @@ class ScoreAccumulator:
         }
 
 
+class ModalityScoreAccumulator:
+    """Accumulates per-modality channel scores for each (layer, expert).
+
+    modality_channel_scores[modality][layer_idx][expert_idx]: Tensor[I] or None.
+    """
+
+    def __init__(
+        self,
+        layer_to_num_experts: Dict[int, int],
+        layer_to_num_channels: Dict[int, int],
+    ) -> None:
+        self.layer_to_num_experts = layer_to_num_experts
+        self.layer_to_num_channels = layer_to_num_channels
+        self.layers: List[int] = sorted(layer_to_num_experts.keys())
+        self.modalities = ("text", "visual")
+        self.scores: Dict[str, Dict[int, Dict[int, Optional[torch.Tensor]]]] = {
+            modality: {
+                layer: {eid: None for eid in range(layer_to_num_experts[layer])}
+                for layer in self.layers
+            }
+            for modality in self.modalities
+        }
+        self.counts: Dict[str, Dict[int, Dict[int, int]]] = {
+            modality: {
+                layer: {eid: 0 for eid in range(layer_to_num_experts[layer])}
+                for layer in self.layers
+            }
+            for modality in self.modalities
+        }
+
+    def update(
+        self,
+        modality: str,
+        layer_idx: int,
+        expert_idx: int,
+        score: torch.Tensor,
+        ema: float,
+    ) -> None:
+        score = score.detach().cpu().float()
+        self.scores[modality][layer_idx][expert_idx] = safe_add_with_ema(
+            self.scores[modality][layer_idx][expert_idx], ema, score
+        )
+        self.counts[modality][layer_idx][expert_idx] += 1
+
+    def to_payload(self) -> dict:
+        return {
+            "modality_channel_scores": self.scores,
+            "modality_channel_counts": self.counts,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Contribution accumulator
 # ---------------------------------------------------------------------------
@@ -333,6 +384,7 @@ def attach_scoring_hooks(
     model,
     config,
     accumulator: ScoreAccumulator,
+    modality_acc: Optional[ModalityScoreAccumulator],
     contrib_acc: ContribAccumulator,
     ema: float,
     affinity: Optional[Dict[int, Dict[int, float]]] = None,
@@ -399,6 +451,7 @@ def attach_scoring_hooks(
             __orig=original_moe_infer,
             __layer_idx=layer_idx,
             __acc=accumulator,
+            __macc=modality_acc,
             __cacc=contrib_acc,
             __ema=ema,
             __affinity=affinity,
@@ -423,30 +476,55 @@ def attach_scoring_hooks(
 
                 aff = __affinity.get(__layer_idx, {}).get(eid, 0.0) if __affinity is not None else 0.0
 
+                vis_flat = getattr(self, "moe_media_mask", None)
+                txt_flat = getattr(self, "moe_text_mask", None)
+                T_seq = x.shape[0]
+                if vis_flat is not None:
+                    vis_flat = vis_flat.to(x.device).view(-1)[:T_seq]
+                else:
+                    vis_flat = torch.zeros(T_seq, dtype=torch.bool, device=x.device)
+                if txt_flat is not None:
+                    txt_flat = txt_flat.to(x.device).view(-1)[:T_seq]
+                else:
+                    txt_flat = torch.zeros(T_seq, dtype=torch.bool, device=x.device)
+
+                with torch.no_grad():
+                    act = compute_generic_expert_activation(
+                        self.experts[eid], x[token_idx]
+                    )  # [T', I]
+
+                vis_sel = vis_flat[token_idx]   # [T']
+                txt_sel = txt_flat[token_idx]   # [T']
+
+                if __macc is not None:
+                    if txt_sel.any():
+                        __macc.update(
+                            "text",
+                            __layer_idx,
+                            eid,
+                            channel_rms(act[txt_sel]),
+                            __ema,
+                        )
+                    if vis_sel.any():
+                        __macc.update(
+                            "visual",
+                            __layer_idx,
+                            eid,
+                            channel_rms(act[vis_sel]),
+                            __ema,
+                        )
+
                 if __mode == "threshold" and __affinity is not None:
                     # Hard filter: route this expert's tokens to preferred modality only
-                    score_token_idx = token_idx
+                    score_mask = torch.ones_like(token_idx, dtype=torch.bool)
                     if aff > __threshold:
-                        vis_flat = getattr(self, "moe_media_mask", None)
-                        if vis_flat is not None:
-                            vis_flat = vis_flat.to(x.device).view(-1)
-                            keep = vis_flat[token_idx]
-                            score_token_idx = token_idx[keep]
+                        score_mask = vis_sel
                     elif aff < -__threshold:
-                        txt_flat = getattr(self, "moe_text_mask", None)
-                        if txt_flat is not None:
-                            txt_flat = txt_flat.to(x.device).view(-1)
-                            keep = txt_flat[token_idx]
-                            score_token_idx = token_idx[keep]
+                        score_mask = txt_sel
 
-                    if score_token_idx.numel() == 0:
+                    if not score_mask.any():
                         continue
-
-                    with torch.no_grad():
-                        act = compute_generic_expert_activation(
-                            self.experts[eid], x[score_token_idx]
-                        )  # [T', I]
-                    score = channel_rms(act)  # [I]
+                    score = channel_rms(act[score_mask])  # [I]
 
                 elif __mode == "scalar" and __affinity is not None:
                     # Soft weighting: compute RMS separately for visual and text tokens
@@ -456,27 +534,6 @@ def attach_scoring_hooks(
                     #   vis_weight = max(aff, 0)   → 0 when text-only, 1 when visual-only
                     #   txt_weight = max(-aff, 0)  → 0 when visual-only, 1 when text-only
                     # Balanced experts (aff ≈ 0) contribute equal weight from both modalities.
-                    vis_flat = getattr(self, "moe_media_mask", None)
-                    txt_flat = getattr(self, "moe_text_mask", None)
-                    T_seq = x.shape[0]
-                    if vis_flat is not None:
-                        vis_flat = vis_flat.to(x.device).view(-1)[:T_seq]
-                    else:
-                        vis_flat = torch.zeros(T_seq, dtype=torch.bool, device=x.device)
-                    if txt_flat is not None:
-                        txt_flat = txt_flat.to(x.device).view(-1)[:T_seq]
-                    else:
-                        txt_flat = torch.zeros(T_seq, dtype=torch.bool, device=x.device)
-
-                    # Boolean masks over the tokens that actually hit this expert
-                    vis_sel = vis_flat[token_idx]   # [T']
-                    txt_sel = txt_flat[token_idx]   # [T']
-
-                    with torch.no_grad():
-                        act = compute_generic_expert_activation(
-                            self.experts[eid], x[token_idx]
-                        )  # [T', I]
-                   
                     vis_weight = (aff + 1.0) / 2.0
                     txt_weight = (1.0 - aff) / 2.0
  
@@ -501,10 +558,6 @@ def attach_scoring_hooks(
 
                 else:
                     # No affinity or affinity_mode=None: plain RMS over all routed tokens
-                    with torch.no_grad():
-                        act = compute_generic_expert_activation(
-                            self.experts[eid], x[token_idx]
-                        )  # [T', I]
                     score = channel_rms(act)  # [I]
 
                 __acc.update(__layer_idx, eid, score, __ema)
@@ -1008,6 +1061,11 @@ def main() -> None:
 
     layer_to_num_experts, layer_to_num_channels = discover_layer_structure(bundle)
     accumulator = ScoreAccumulator(layer_to_num_experts, layer_to_num_channels)
+    modality_acc = (
+        ModalityScoreAccumulator(layer_to_num_experts, layer_to_num_channels)
+        if args.modality_aware
+        else None
+    )
     contrib_acc  = ContribAccumulator(layer_to_num_experts)
 
     print(
@@ -1054,14 +1112,14 @@ def main() -> None:
         elif threshold_noop:
             print(
                 "[collect_scores] affinity_mode=threshold with affinity_threshold>=1.0 "
-                "is a strict no-op; skipping affinity computation and scoring will "
-                "match the non-modality-aware path."
+                "disables affinity filtering, but --modality_aware is still on, so "
+                "modality-conditioned channel scores will still be collected."
             )
 
         print(f"[collect_scores] score_type=activation: attaching hooks, "
               f"dataset={args.dataset}.")
         attach_scoring_hooks(
-            model, config, accumulator, contrib_acc, args.ema,
+            model, config, accumulator, modality_acc, contrib_acc, args.ema,
             affinity=None if threshold_noop else affinity,
             affinity_mode=args.affinity_mode,
             affinity_threshold=args.affinity_threshold,
@@ -1145,8 +1203,32 @@ def main() -> None:
                 if s is not None:
                     accumulator.scores[layer_idx][eid] = s / denom
 
+    # Modality-conditioned scores are normalized per modality/per layer so that
+    # lower-amplitude visual activations do not get dominated by text scores.
+        if modality_acc is not None:
+            for modality in modality_acc.modalities:
+                for layer_idx in modality_acc.layers:
+                    E = layer_to_num_experts[layer_idx]
+                    I = layer_to_num_channels[layer_idx]
+                    layer_scores = []
+                    for eid in range(E):
+                        s = modality_acc.scores[modality][layer_idx][eid]
+                        if s is None:
+                            layer_scores.append(torch.zeros(I, dtype=torch.float32))
+                        else:
+                            layer_scores.append(s.float())
+                    stacked = torch.stack(layer_scores, dim=0)
+                    denom = stacked.mean()
+                    if torch.isfinite(denom) and float(denom.item()) > 0.0:
+                        for eid in range(E):
+                            s = modality_acc.scores[modality][layer_idx][eid]
+                            if s is not None:
+                                modality_acc.scores[modality][layer_idx][eid] = s / denom
+
     # Merge and save
     payload = accumulator.to_payload()
+    if modality_acc is not None:
+        payload.update(modality_acc.to_payload())
     payload.update(contrib_acc.to_payload())
     payload["expert_out_token_contrib"] = payload["expert_out_contrib"]
     payload["expertwise_weights"] = {

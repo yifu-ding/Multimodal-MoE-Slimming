@@ -69,6 +69,131 @@ def _topk_mask(scores: torch.Tensor, k: int) -> torch.Tensor:
     return mask
 
 
+def _get_modality_channel_scores(
+    modality_channel_scores: Optional[Dict[str, Dict[int, Dict[int, Optional[torch.Tensor]]]]],
+    modality: str,
+    layer_idx: int,
+    eid: int,
+    I: int,
+) -> Optional[torch.Tensor]:
+    if modality_channel_scores is None:
+        return None
+    modality_map = modality_channel_scores.get(modality, {})
+    layer_map = modality_map.get(layer_idx, {})
+    score = layer_map.get(eid, None)
+    if score is None or score.numel() == 0:
+        return None
+    return score.float().cpu()
+
+
+def _modality_conditioned_topk_mask(
+    raw_scores: torch.Tensor,
+    text_scores: Optional[torch.Tensor],
+    visual_scores: Optional[torch.Tensor],
+    k: int,
+) -> torch.Tensor:
+    """Select channels with a shared + modality-specific budgeting policy.
+
+    1. pick shared channels from min(text, visual)
+    2. split the remaining budget across visual/text according to expert-level
+       modality preference
+    3. fill any leftover budget with the strongest remaining channels
+    """
+    k = max(1, min(k, raw_scores.numel()))
+    if text_scores is None and visual_scores is None:
+        return _topk_mask(raw_scores, k)
+
+    if text_scores is None:
+        text_scores = torch.zeros_like(raw_scores)
+    if visual_scores is None:
+        visual_scores = torch.zeros_like(raw_scores)
+    text_scores = text_scores.clamp_min(0.0).float().cpu()
+    visual_scores = visual_scores.clamp_min(0.0).float().cpu()
+
+    if text_scores.sum().item() <= 0.0 and visual_scores.sum().item() <= 0.0:
+        return _topk_mask(raw_scores, k)
+
+    shared_scores = torch.minimum(text_scores, visual_scores)
+    visual_pref_scores = visual_scores
+    text_pref_scores = text_scores
+
+    shared_mass = float(shared_scores.sum().item())
+    visual_specific_mass = float(torch.clamp(visual_scores - text_scores, min=0.0).sum().item())
+    text_specific_mass = float(torch.clamp(text_scores - visual_scores, min=0.0).sum().item())
+    total_mass = shared_mass + visual_specific_mass + text_specific_mass
+
+    if total_mass <= 0.0:
+        return _topk_mask(torch.maximum(text_scores, visual_scores), k)
+
+    k_shared = int(round(k * shared_mass / total_mass))
+    k_shared = max(0, min(k, k_shared))
+    remaining = k - k_shared
+
+    if remaining > 0:
+        pref_vis = visual_specific_mass
+        pref_txt = text_specific_mass
+        if pref_vis + pref_txt <= 0.0:
+            pref_vis = float(visual_scores.sum().item())
+            pref_txt = float(text_scores.sum().item())
+        if pref_vis + pref_txt <= 0.0:
+            k_visual = remaining // 2
+        else:
+            k_visual = int(round(remaining * pref_vis / (pref_vis + pref_txt)))
+        k_visual = max(0, min(remaining, k_visual))
+        k_text = remaining - k_visual
+        # Keep a minority-modality foothold when both modalities are active.
+        if remaining >= 2:
+            if visual_scores.sum().item() > 0.0 and text_scores.sum().item() > 0.0:
+                if k_visual == 0:
+                    k_visual, k_text = 1, remaining - 1
+                elif k_text == 0:
+                    k_text, k_visual = 1, remaining - 1
+    else:
+        k_visual = 0
+        k_text = 0
+
+    mask = torch.zeros(raw_scores.numel(), dtype=torch.bool)
+
+    def _select(score_vec: torch.Tensor, budget: int) -> int:
+        if budget <= 0:
+            return 0
+        available = ~mask
+        n_available = int(available.sum().item())
+        if n_available <= 0:
+            return 0
+        k_sel = min(budget, n_available)
+        masked_scores = torch.full_like(score_vec, float("-inf"))
+        masked_scores[available] = score_vec[available]
+        idx = torch.topk(masked_scores, k_sel, largest=True).indices
+        mask[idx] = True
+        return k_sel
+
+    _select(shared_scores, k_shared)
+    _select(visual_pref_scores, k_visual)
+    _select(text_pref_scores, k_text)
+    remaining = k - int(mask.sum().item())
+    if remaining > 0:
+        combined = torch.maximum(text_scores, visual_scores)
+        if combined.sum().item() <= 0.0:
+            combined = raw_scores.float().cpu()
+        _select(combined, remaining)
+    return mask
+
+
+def _select_expert_mask(
+    scores: Dict[int, Dict[int, Optional[torch.Tensor]]],
+    layer_idx: int,
+    eid: int,
+    I: int,
+    k: int,
+    modality_channel_scores: Optional[Dict[str, Dict[int, Dict[int, Optional[torch.Tensor]]]]] = None,
+) -> torch.Tensor:
+    raw_scores = _get_expert_scores(scores, layer_idx, eid, I)
+    text_scores = _get_modality_channel_scores(modality_channel_scores, "text", layer_idx, eid, I)
+    visual_scores = _get_modality_channel_scores(modality_channel_scores, "visual", layer_idx, eid, I)
+    return _modality_conditioned_topk_mask(raw_scores, text_scores, visual_scores, k)
+
+
 def _channels_to_cover_fraction(
     prefix: torch.Tensor,   # sorted descending prefix-sum
     total: float,
@@ -240,6 +365,7 @@ def _build_masks_expertwise(
     layer_keep_ratios: List[float],
     layer_to_num_experts: Dict[int, int],
     layer_to_num_channels: Dict[int, int],
+    modality_channel_scores: Optional[Dict[str, Dict[int, Dict[int, Optional[torch.Tensor]]]]] = None,
 ) -> Dict[int, torch.Tensor]:
     """Each expert independently: top-k of its own scores.
     All experts in a layer keep k = round(I * keep_ratio[l])."""
@@ -250,8 +376,9 @@ def _build_masks_expertwise(
         k = max(1, round(I * layer_keep_ratios[li]))
         layer_mask = torch.zeros(E, I, dtype=torch.bool)
         for eid in range(E):
-            s = _get_expert_scores(scores, layer_idx, eid, I)
-            layer_mask[eid] = _topk_mask(s, k)
+            layer_mask[eid] = _select_expert_mask(
+                scores, layer_idx, eid, I, k, modality_channel_scores=modality_channel_scores
+            )
         masks[layer_idx] = layer_mask
     return masks
 
@@ -262,6 +389,7 @@ def _build_masks_layerwise(
     layer_keep_ratios: List[float],
     layer_to_num_experts: Dict[int, int],
     layer_to_num_channels: Dict[int, int],
+    modality_channel_scores: Optional[Dict[str, Dict[int, Dict[int, Optional[torch.Tensor]]]]] = None,
 ) -> Dict[int, torch.Tensor]:
     """Pool all E×I scores per layer; global top-k within the layer,
     back-assigned to experts.  k_layer = round(E * I * keep_ratio[l]).
@@ -284,6 +412,18 @@ def _build_masks_layerwise(
             if not layer_mask[eid].any():
                 layer_mask[eid, int(expert_scores[eid].argmax().item())] = True
 
+        if modality_channel_scores is not None:
+            counts = layer_mask.sum(dim=1).to(torch.int64)
+            for eid in range(E):
+                layer_mask[eid] = _select_expert_mask(
+                    scores,
+                    layer_idx,
+                    eid,
+                    I,
+                    int(counts[eid].item()),
+                    modality_channel_scores=modality_channel_scores,
+                )
+
         masks[layer_idx] = layer_mask
     return masks
 
@@ -294,6 +434,7 @@ def _build_masks_global(
     prune_ratio: float,
     layer_to_num_experts: Dict[int, int],
     layer_to_num_channels: Dict[int, int],
+    modality_channel_scores: Optional[Dict[str, Dict[int, Dict[int, Optional[torch.Tensor]]]]] = None,
 ) -> Dict[int, torch.Tensor]:
     """Budget proportional to per-expert score mass across ALL layers.
     Ignores inter-layer keep_ratio; coverage = None."""
@@ -321,8 +462,9 @@ def _build_masks_global(
         for eid in range(E):
             w = score_mass[layer_idx][eid] / (total_mass + 1e-12)
             k = max(1, min(I, round(w * K_total)))
-            s = _get_expert_scores(scores, layer_idx, eid, I)
-            layer_mask[eid] = _topk_mask(s, k)
+            layer_mask[eid] = _select_expert_mask(
+                scores, layer_idx, eid, I, k, modality_channel_scores=modality_channel_scores
+            )
         masks[layer_idx] = layer_mask
     return masks
 
@@ -334,6 +476,7 @@ def _build_masks_coverage(
     layer_to_num_experts: Dict[int, int],
     layer_to_num_channels: Dict[int, int],
     expertwise_weights: Optional[torch.Tensor] = None,
+    modality_channel_scores: Optional[Dict[str, Dict[int, Dict[int, Optional[torch.Tensor]]]]] = None,
     max_iter: int = 64,
 ) -> Dict[int, torch.Tensor]:
     """
@@ -461,8 +604,9 @@ def _build_masks_coverage(
         layer_mask = torch.zeros(E, I, dtype=torch.bool)
         for eid, info in enumerate(expert_s_info):
             k = max(1, counts[eid])
-            raw_s = _get_expert_scores(scores, layer_idx, eid, I)
-            layer_mask[eid] = _topk_mask(raw_s, k)
+            layer_mask[eid] = _select_expert_mask(
+                scores, layer_idx, eid, I, k, modality_channel_scores=modality_channel_scores
+            )
         masks[layer_idx] = layer_mask
 
     return masks
@@ -511,6 +655,7 @@ def _rebuild_masks_from_K(
     sorted_layers: List[int],
     scores: Dict[int, Dict[int, Optional[torch.Tensor]]],
     layer_to_num_channels: Dict[int, int],
+    modality_channel_scores: Optional[Dict[str, Dict[int, Dict[int, Optional[torch.Tensor]]]]] = None,
 ) -> Dict[int, torch.Tensor]:
     """Build bool keep-masks from a [L, E] integer keep-count tensor."""
     masks: Dict[int, torch.Tensor] = {}
@@ -522,8 +667,9 @@ def _rebuild_masks_from_K(
             k = int(K[li, eid].item())
             if k == 0:
                 continue
-            s = _get_expert_scores(scores, layer_idx, eid, I)
-            layer_mask[eid] = _topk_mask(s, k)
+            layer_mask[eid] = _select_expert_mask(
+                scores, layer_idx, eid, I, k, modality_channel_scores=modality_channel_scores
+            )
         masks[layer_idx] = layer_mask
     return masks
 
@@ -533,6 +679,7 @@ def _evict_adjust_masks(
     scores: Dict[int, Dict[int, Optional[torch.Tensor]]],
     sorted_layers: List[int],
     layer_to_num_channels: Dict[int, int],
+    modality_channel_scores: Optional[Dict[str, Dict[int, Dict[int, Optional[torch.Tensor]]]]] = None,
     min_per_expert: int = 16,
 ) -> Dict[int, torch.Tensor]:
     """Post-planning eviction adjustment.
@@ -588,7 +735,13 @@ def _evict_adjust_masks(
     total_headroom = int(layer_headroom.sum().item())
 
     if total_headroom == 0:
-        return _rebuild_masks_from_K(K, sorted_layers, scores, layer_to_num_channels)
+        return _rebuild_masks_from_K(
+            K,
+            sorted_layers,
+            scores,
+            layer_to_num_channels,
+            modality_channel_scores=modality_channel_scores,
+        )
 
     layer_add = _largest_remainder_alloc(
         ideals=(layer_headroom.double() * (freed_total / max(total_headroom, 1))).to(torch.float64),
@@ -664,7 +817,13 @@ def _evict_adjust_masks(
     for li in range(L):
         K[li][(K[li] > 0) & (K[li] < min_per_expert)] = 0
 
-    return _rebuild_masks_from_K(K, sorted_layers, scores, layer_to_num_channels)
+    return _rebuild_masks_from_K(
+        K,
+        sorted_layers,
+        scores,
+        layer_to_num_channels,
+        modality_channel_scores=modality_channel_scores,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -686,6 +845,8 @@ def generate_masks(
     layerwise_weights: Optional[torch.Tensor] = None,
     # coverage intra-layer kwargs
     expertwise_weights: Optional[torch.Tensor] = None,
+    # modality-conditioned channel budgeting kwargs
+    modality_channel_scores: Optional[Dict[str, Dict[int, Dict[int, Optional[torch.Tensor]]]]] = None,
     # eviction adjuster kwargs
     evict_min_channels: int = 0,
 ) -> Dict[int, torch.Tensor]:
@@ -708,6 +869,10 @@ def generate_masks(
     expertwise_weights : Tensor[L, E], optional
         Per-expert anchor weights for the "coverage" intra-layer planner.
         If None, uses a uniform anchor within each layer.
+    modality_channel_scores : Dict, optional
+        If provided, channel selection inside each expert is done with separate
+        text/visual rankings plus a shared-channel budget, while preserving the
+        expert-level keep counts produced by the planner.
     evict_min_channels : int, optional
         If > 0, run a post-planning eviction pass: any expert left with fewer
         than this many channels is fully evicted (set to 0), and the freed
@@ -730,6 +895,7 @@ def generate_masks(
         return _build_masks_global(
             scores, sorted_layers, prune_ratio,
             layer_to_num_experts, layer_to_num_channels,
+            modality_channel_scores=modality_channel_scores,
         )
 
     # --- inter-layer plan ---
@@ -747,23 +913,27 @@ def generate_masks(
         masks = _build_masks_expertwise(
             scores, sorted_layers, layer_keep_ratios,
             layer_to_num_experts, layer_to_num_channels,
+            modality_channel_scores=modality_channel_scores,
         )
     elif intra_method == "layerwise":  # layerwise rank channels, with each expert non-uniform channels
         masks = _build_masks_layerwise(
             scores, sorted_layers, layer_keep_ratios,
             layer_to_num_experts, layer_to_num_channels,
+            modality_channel_scores=modality_channel_scores,
         )
     else:  # coverage
         masks = _build_masks_coverage(
             scores, sorted_layers, layer_keep_ratios,
             layer_to_num_experts, layer_to_num_channels,
             expertwise_weights=expertwise_weights,
+            modality_channel_scores=modality_channel_scores,
         )
 
     # --- optional eviction pass ---
     if evict_min_channels > 0:
         masks = _evict_adjust_masks(
             masks, scores, sorted_layers, layer_to_num_channels,
+            modality_channel_scores=modality_channel_scores,
             min_per_expert=evict_min_channels,
         )
 
