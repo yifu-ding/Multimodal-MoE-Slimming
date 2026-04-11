@@ -36,8 +36,8 @@ from src.channel_scoring.forward import block_forward
 CHANNEL_METRICS = (
     "activation",
     "gateup_act",
-    "text_act",
-    "visual_act",
+    "activation_text",
+    "activation_visual",
     "saliency",
     "wa",
     "grad",
@@ -48,6 +48,8 @@ CHANNEL_METRICS = (
 EXPERT_METRICS = (
     "expert_out_token_contrib",
     "usage",
+    "usage_text",
+    "usage_visual",
     "second_exact_attr",
     "true_ablate",
 )
@@ -172,6 +174,8 @@ class RichScoreAccumulator:
 
         self.gate_scores: Dict[str, Dict[int, torch.Tensor]] = {
             "usage": {},
+            "usage_text": {},
+            "usage_visual": {},
         }
         self.hit_counts: Dict[int, torch.Tensor] = {}
         self.layerwise_loss: Dict[int, float] = {}
@@ -184,6 +188,8 @@ class RichScoreAccumulator:
             for metric in EXPERT_METRICS:
                 self.expert_scores[metric][layer_idx] = torch.zeros(e, dtype=torch.float32)
             self.gate_scores["usage"][layer_idx] = torch.zeros(e, dtype=torch.float32)
+            self.gate_scores["usage_text"][layer_idx] = torch.zeros(e, dtype=torch.float32)
+            self.gate_scores["usage_visual"][layer_idx] = torch.zeros(e, dtype=torch.float32)
             self.hit_counts[layer_idx] = torch.zeros(e, dtype=torch.int64)
 
         self.modality_scores = (
@@ -210,11 +216,19 @@ class RichScoreAccumulator:
             usage = getattr(expert, "usage", None)
             if usage is not None:
                 self.gate_scores["usage"][layer_idx][eid] = float(usage)
+            usage_text = getattr(expert, "usage_text", None)
+            if usage_text is not None:
+                self.gate_scores["usage_text"][layer_idx][eid] = float(usage_text)
+            usage_visual = getattr(expert, "usage_visual", None)
+            if usage_visual is not None:
+                self.gate_scores["usage_visual"][layer_idx][eid] = float(usage_visual)
             if getattr(expert, "activation", None) is not None:
                 self.hit_counts[layer_idx][eid] = 1
 
     def finalize(self) -> None:
         self.gate_scores["usage"] = _normalize_per_layer_counts(self.gate_scores["usage"])
+        self.gate_scores["usage_text"] = _normalize_per_layer_counts(self.gate_scores["usage_text"])
+        self.gate_scores["usage_visual"] = _normalize_per_layer_counts(self.gate_scores["usage_visual"])
         if self.modality_scores is not None:
             self.modality_scores.finalize()
 
@@ -258,13 +272,12 @@ class RichScoreAccumulator:
             )
             for metric in tuple(CHANNEL_METRICS) + tuple(EXPERT_METRICS)
         }
-        # Compatibility aliases for downstream modality-aware loaders.
-        expert_scores["activation_text"] = _to_nested_expert_dict(
-            self.expert_scores["text_act"], scalar=False
-        )
-        expert_scores["activation_visual"] = _to_nested_expert_dict(
-            self.expert_scores["visual_act"], scalar=False
-        )
+        ema_matrix = {}
+        for layer_idx in self.layers:
+            text_freq = self.gate_scores["usage_text"][layer_idx]
+            visual_freq = self.gate_scores["usage_visual"][layer_idx]
+            ema_matrix[layer_idx] = (visual_freq - text_freq) / (visual_freq + text_freq + 1e-8)
+
         payload = {
             "model_name_or_path": args.model_name_or_path,
             "resolved_model_name_or_path": resolve_model_name_or_path(args.model_name_or_path),
@@ -284,7 +297,10 @@ class RichScoreAccumulator:
             "expert_scores": expert_scores,
             "gate_scores": {
                 "usage": _to_nested_expert_dict(self.gate_scores["usage"], scalar=True),
+                "usage_text": _to_nested_expert_dict(self.gate_scores["usage_text"], scalar=True),
+                "usage_visual": _to_nested_expert_dict(self.gate_scores["usage_visual"], scalar=True),
             },
+            "ema_matrix": _to_nested_expert_dict(ema_matrix, scalar=True),
             "layerwise_loss": dict(self.layerwise_loss),
             # Backward-compatible aliases
             "scores": _tensor_map_to_nested_dict(self.expert_scores["activation"]),
@@ -486,18 +502,18 @@ def run_collection(args) -> None:
         collate_fn=custom_collate_fn,
     )
 
-    if args.modality_aware and accumulator.modality_scores is not None:
-        print("[channel_scoring] Collecting modality-split activation scores...")
-        hook_states = attach_kimi_modality_hooks(model, config, accumulator.modality_scores, args.ema)
-        try:
-            model.eval()
-            with torch.no_grad():
-                for batch in tqdm(loader, desc="Collecting modality activations", unit="batch"):
-                    inputs = prepare_inputs(bundle, batch, args.dataset)
-                    inputs = move_inputs_to_model_device(model, inputs)
-                    model(**inputs, use_cache=False, return_dict=True)
-        finally:
-            restore_kimi_modality_hooks(hook_states)
+    # if args.modality_aware and accumulator.modality_scores is not None:
+    #     print("[channel_scoring] Collecting modality-split activation scores...")
+    #     hook_states = attach_kimi_modality_hooks(model, config, accumulator.modality_scores, args.ema)
+    #     try:
+    #         model.eval()
+    #         with torch.no_grad():
+    #             for batch in tqdm(loader, desc="Collecting modality activations", unit="batch"):
+    #                 inputs = prepare_inputs(bundle, batch, args.dataset)
+    #                 inputs = move_inputs_to_model_device(model, inputs)
+    #                 model(**inputs, use_cache=False, return_dict=True)
+    #     finally:
+    #         restore_kimi_modality_hooks(hook_states)
 
     print("[channel_scoring] Collecting block-reconstruction scores with attn_mlp collector...")
     for layer_idx in accumulator.layers:

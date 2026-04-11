@@ -97,7 +97,6 @@ def _load_scores_payload(path: str, device: str):
 
 def load_channel_scores(
     scores_dir: str,
-    prune_hidden: bool,
     device: str,
     verbose: bool = True,
 ) -> Tuple[Dict[str, Dict[int, torch.Tensor]], Optional[Dict[str, Dict[int, torch.Tensor]]], Dict[str, Any], Optional[dict]]:
@@ -168,37 +167,53 @@ def load_attention_head_scores(scores_dir: str, verbose: bool = True):
 
 
 def load_modality_channel_scores(scores_dir: str, device: str = "cpu"):
-    expert_scores, _, aux, payload = load_channel_scores(scores_dir, prune_hidden=False, device=device, verbose=False)
-    metadata = aux["metadata"]
-    modality_aware = bool(metadata.get("modality_aware", False))
-    if not modality_aware:
-        return None
-    text_scores = expert_scores.get("activation_text")
-    visual_scores = expert_scores.get("activation_visual")
+    expert_scores, _, aux, payload = load_channel_scores(scores_dir, device=device, verbose=False)
+    gate_scores = aux.get("gate_scores", {})
+    text_scores = expert_scores.get("activation_text", None)
+    visual_scores = expert_scores.get("activation_visual", None)
     if text_scores is None or visual_scores is None:
         if payload is not None and payload.get("modality_channel_scores") is not None:
             text_scores = _nested_scores_to_layer_tensors(payload["modality_channel_scores"]["text"])
             visual_scores = _nested_scores_to_layer_tensors(payload["modality_channel_scores"]["visual"])
         else:
-            return None
+            raise ValueError(f"modality-split scores are required, but not found in {scores_dir}")
+
+    ema_nested = payload.get("ema_matrix") if payload is not None else None
+    if ema_nested is None:
+        usage_text = gate_scores.get("usage_text")
+        usage_visual = gate_scores.get("usage_visual")
+        if usage_text is not None and usage_visual is not None:
+            ema_nested = {}
+            for lid in sorted(usage_text.keys()):
+                t = usage_text[lid].detach().cpu().float()
+                v = usage_visual[lid].detach().cpu().float()
+                ema_nested[lid] = (v - t) / (v + t + 1e-8)
+
+    ema_tensor = None
+    if ema_nested is not None:
+        if isinstance(next(iter(ema_nested.values())), torch.Tensor):
+            ema_tensor = dict_to_tensor(ema_nested).to(device=device, dtype=torch.float32)
+        else:
+            ema_tensor = dict_to_tensor(_nested_scores_to_layer_tensors(ema_nested)).to(
+                device=device, dtype=torch.float32
+            )
+
     return {
         "text": dict_to_tensor(text_scores).to(device=device, dtype=torch.float32),
         "visual": dict_to_tensor(visual_scores).to(device=device, dtype=torch.float32),
+        "ema_matrix": ema_tensor,
     }
 
 
 def prepare_scores(
     scores_dir: str,
     mask_method_kwargs: Dict[str, Any],
-    HI_ratio_kwargs: Dict[str, Any],
     prune_ratio: float,
-    prune_hidden: bool,
-    prune_gqa: bool,
     smooth_fn: str = "sqrt",
     device: str = "cpu",
     verbose: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, int, Dict[str, Any]]:
-    expert_scores, _, aux, _ = load_channel_scores(scores_dir, prune_hidden, device, verbose)
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, Dict[str, Any]]:
+    expert_scores, _, aux, _ = load_channel_scores(scores_dir, device, verbose)
     gate_scores = aux["gate_scores"]
 
     intra_expert_metric = mask_method_kwargs.get("intra_expert_metric", "activation")
@@ -210,8 +225,6 @@ def prepare_scores(
 
     intermediate_scores = dict_to_tensor(expert_scores[intra_expert_metric]).to(device=device, dtype=torch.float32)
     L, E, I = intermediate_scores.shape
-    hidden_scores = None
-    H = None
 
     intra_layer_method = mask_method_kwargs.get("intra_layer_method", "uniform")
     if intra_layer_method in ("attr_coverage", "loss_coverage"):
@@ -244,11 +257,9 @@ def prepare_scores(
 
     return (
         intermediate_scores,
-        hidden_scores,
         expertwise_scores,
         L,
         E,
         I,
-        H,
         loss_based_kwargs,
     )

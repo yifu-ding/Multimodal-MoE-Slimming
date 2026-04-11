@@ -1,4 +1,5 @@
 import copy
+import os
 import types
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -162,14 +163,18 @@ def _kimi_teacher_block(model) -> Iterable[nn.Module]:
     return model.language_model.model.layers
 
 
-def _patch_grad_enabled_kimi_moe_infer(block: nn.Module):
+def _patch_grad_enabled_kimi_moe_infer(block: nn.Module, layer_idx: int):
     mlp = getattr(block, "mlp", None)
     if mlp is None or not hasattr(mlp, "moe_infer"):
         return None
 
     original = mlp.moe_infer
+    debug_routing = os.environ.get("MODES_DEBUG_ROUTING", "0") == "1"
+    debug_max_calls = int(os.environ.get("MODES_DEBUG_ROUTING_MAX_CALLS", "2"))
+    debug_state = {"calls": 0}
 
     def _grad_enabled_moe_infer(self, x, topk_ids, topk_weight, **kwargs):
+        original_topk_ids = topk_ids
         skip_expert_idx = kwargs.get("skip_expert_idx", None)
         skip_modality = kwargs.get("skip_modality", None)
         batch_idx = kwargs.get("batch_idx", None)
@@ -224,6 +229,7 @@ def _patch_grad_enabled_kimi_moe_infer(block: nn.Module):
 
         outputs = []
         start_idx = 0
+        called_experts = 0
         for i, num_tokens in enumerate(tokens_per_expert):
             end_idx = start_idx + int(num_tokens)
             if num_tokens == 0:
@@ -236,7 +242,31 @@ def _patch_grad_enabled_kimi_moe_infer(block: nn.Module):
             expert.saved_text_mask = sorted_text_mask[start_idx:end_idx]
             expert.saved_visual_mask = sorted_visual_mask[start_idx:end_idx]
             outputs.append(expert(tokens_for_this_expert))
+            called_experts += 1
             start_idx = end_idx
+
+        if debug_routing and debug_state["calls"] < debug_max_calls:
+            total_experts = len(self.experts)
+            pre_unique = torch.unique(original_topk_ids)
+            pre_unique = pre_unique[pre_unique < total_experts]
+            post_unique = torch.unique(topk_ids)
+            post_unique = post_unique[post_unique < total_experts]
+            skipped_ratio = float((topk_ids == total_experts).float().mean().item())
+            has_gate_dict = hasattr(self, "gate_dict") and self.gate_dict is not None
+            valid_ratio = (
+                float(self.valid_expert_mask.float().mean().item())
+                if has_gate_dict and hasattr(self, "valid_expert_mask")
+                else 1.0
+            )
+            print(
+                f"[routing-debug] L{layer_idx} call={debug_state['calls']} "
+                f"gate_dict={has_gate_dict} valid_ratio={valid_ratio:.4f} "
+                f"pre_unique={int(pre_unique.numel())} post_unique={int(post_unique.numel())} "
+                f"called_experts={called_experts} skipped_ratio={skipped_ratio:.4f} "
+                f"post_sample={post_unique[:12].detach().cpu().tolist()}",
+                flush=True,
+            )
+            debug_state["calls"] += 1
 
         outs = torch.cat(outputs, dim=0) if outputs else sorted_tokens.new_empty((0, x.shape[-1]))
         new_x = torch.empty_like(outs)
@@ -277,12 +307,13 @@ def block_forward(
     teacher_state: Dict[str, Any] = {}
     teacher_handle = _register_teacher_block_hook(teacher_block, teacher_state)
     copied_handles = _register_copied_block_hooks(cnt_block)
-    moe_infer_state = _patch_grad_enabled_kimi_moe_infer(cnt_block)
+    moe_infer_state = _patch_grad_enabled_kimi_moe_infer(cnt_block, layer_idx=layer_idx)
 
     total_loss = 0.0
     total_batches = 0
     device_type = block_device.type
     autocast_enabled = device_type == "cuda" and dtype in (torch.float16, torch.bfloat16)
+    debug_routing = os.environ.get("MODES_DEBUG_ROUTING", "0") == "1"
 
     try:
         iterator = tqdm(dataloader, desc=f"Calibrating L{layer_idx}", disable=not verbose, leave=False)
@@ -291,6 +322,20 @@ def block_forward(
             inputs = prepare_inputs(bundle, batch, dataset_name)
             inputs = move_inputs_to_model_device(model, inputs)
             attn_mask = inputs["attention_mask"].to(block_device)
+            input_ids = inputs.get("input_ids", None)
+
+            # Ensure copied-block moe_infer can access per-token modality masks.
+            # Unlike full-model forward, block-only calibration does not automatically
+            # refresh these fields on the copied block.
+            if input_ids is not None and hasattr(cnt_block, "mlp"):
+                special_ids = getattr(model, "special_token_id_tensor", None)
+                media_token_id = getattr(model.config, "media_placeholder_token_id", None)
+                if special_ids is not None and media_token_id is not None:
+                    special_ids = special_ids.to(input_ids.device)
+                    moe_text_mask = ~torch.isin(input_ids, special_ids).view(-1)
+                    moe_media_mask = (input_ids == media_token_id).view(-1)
+                    cnt_block.mlp.moe_text_mask = moe_text_mask[:, None]
+                    cnt_block.mlp.moe_media_mask = moe_media_mask[:, None]
 
             with torch.no_grad():
                 model(**inputs, use_cache=False, return_dict=True)
@@ -337,8 +382,27 @@ def block_forward(
                     "second_order_mode": second_order_mode,
                     "autocast_dtype": dtype,
                     "autocast_device_type": device_type,
+                    "layer_idx": layer_idx,
+                    "debug_batch_idx": total_batches - 1,
                 },
             )
+            if debug_routing and total_batches <= 1:
+                experts = _iter_experts(cnt_block.mlp)
+                hook_hits = sum(
+                    1
+                    for expert in experts
+                    if getattr(expert.down_proj, "saved_input", None) is not None
+                )
+                gateup_hits = 0
+                for expert in experts:
+                    gateup = getattr(expert, "gateup_act", None)
+                    if isinstance(gateup, torch.Tensor) and float(gateup.abs().sum().item()) > 0:
+                        gateup_hits += 1
+                print(
+                    f"[routing-debug] L{layer_idx} post_collect hook_hits={hook_hits}/{len(experts)} "
+                    f"gateup_hits={gateup_hits}/{len(experts)}",
+                    flush=True,
+                )
             _clear_block_saved_tensors(cnt_block)
     finally:
         teacher_handle.remove()

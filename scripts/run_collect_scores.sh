@@ -30,7 +30,6 @@ SUBSET_SEED="${SUBSET_SEED:-42}"
 SCORE_TYPE="${SCORE_TYPE:-activation}"
 EMA="${EMA:-0.9}"
 
-MODALITY_AWARE="${MODALITY_AWARE:-0}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/kimi_gqa-modal2}"
 
 EXTRA_ARGS=("$@")
@@ -48,16 +47,11 @@ CMD=(
     --ema                "${EMA}"
 )
 
-if [[ "${MODALITY_AWARE}" == "1" ]]; then
-    CMD+=(--modality_aware)
-fi
-
 CMD+=("${EXTRA_ARGS[@]}")
 
 echo "Model      : ${MODEL_PATH}"
 echo "Dataset    : ${DATASET} (${NUM_SAMPLES} samples)"
 echo "Score type : ${SCORE_TYPE}"
-echo "Modality   : $([[ "${MODALITY_AWARE}" == "1" ]] && echo "text+visual" || echo "disabled")"
 echo "Output     : ${OUTPUT_DIR}"
 echo "GPU        : ${CUDA_VISIBLE_DEVICES}"
 echo ""

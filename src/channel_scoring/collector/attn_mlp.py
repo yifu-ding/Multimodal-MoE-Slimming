@@ -1,4 +1,5 @@
 import contextlib
+import os
 import types
 
 import torch
@@ -338,11 +339,17 @@ def _compute_true_ablate_attr(
 def collect_scores_attn_mlp(cnt_block, 
                             ema: float = 0.9, 
                             _kwargs: dict = None) -> None:
+    debug_routing = os.environ.get("MODES_DEBUG_ROUTING", "0") == "1"
+    debug_down_input_hits = 0
+    debug_gateup_hits = 0
+    debug_total_experts = 0
     experts = getattr(cnt_block.mlp, "experts", None)
     if _is_fused_expert_container(experts):
         _collect_scores_fused_experts(experts, ema=ema)
     else:
+        experts_for_second_order = []
         for expert in cnt_block.mlp.experts:
+            debug_total_experts += 1
             # 取出并清空 hook 保存的张量
             down_input    = getattr(expert.down_proj, "saved_input", None)
             down_output   = getattr(expert.down_proj, "saved_output", None)
@@ -383,17 +390,23 @@ def collect_scores_attn_mlp(cnt_block,
                 safe_add_with_ema(expert, ema, w_norm_mean, "weight")
                 
                 if down_input is not None:
+                    debug_down_input_hits += 1
                     wg_mean = compute_wg_I(W_down, W_up, W_gate, W_down.grad, W_up.grad, W_gate.grad)
                     safe_add_with_ema(expert, ema, wg_mean, "wg")
 
                     gateup_act = _compute_gateup_act(expert, gate_output, up_output)
-                    safe_add_with_ema(expert, ema, gateup_act, "gateup_act")
+                    if gateup_act is not None:
+                        safe_add_with_ema(expert, ema, gateup_act, "gateup_act")
+                    if isinstance(gateup_act, torch.Tensor) and float(gateup_act.abs().sum().item()) > 0:
+                        debug_gateup_hits += 1
 
                     text_act = _compute_gateup_act(expert, gate_output, up_output, token_mask=text_mask)
-                    safe_add_with_ema(expert, ema, text_act, "text_act")
+                    if text_act is not None:
+                        safe_add_with_ema(expert, ema, text_act, "activation_text")
 
                     visual_act = _compute_gateup_act(expert, gate_output, up_output, token_mask=visual_mask)
-                    safe_add_with_ema(expert, ema, visual_act, "visual_act")
+                    if visual_act is not None:
+                        safe_add_with_ema(expert, ema, visual_act, "activation_visual")
 
                     token_contrib_I = compute_token_contrib_I(down_input, down_grad, up_output, up_out_grad, gate_output, gate_grad)
                     safe_add_with_ema(expert, ema, token_contrib_I, "token_contrib")
@@ -414,22 +427,46 @@ def collect_scores_attn_mlp(cnt_block,
                     attn_mask = _kwargs.get("attn_mask", None)
                     total_tokens = float(attn_mask.sum().item())
                     usage = float(down_output.shape[0]) / max(total_tokens, 1.0)
+                    usage_text = (
+                        float(text_mask.sum().item())
+                        if isinstance(text_mask, torch.Tensor)
+                        else 0.0
+                    )
+                    usage_visual = (
+                        float(visual_mask.sum().item())
+                        if isinstance(visual_mask, torch.Tensor)
+                        else 0.0
+                    )
                     expert_out_token_contrib = token_contrib(down_out_grad, down_output).sum() * usage
                     safe_add_with_ema(expert, ema, expert_out_token_contrib, "expert_out_token_contrib")
                     safe_add_with_ema(expert, ema, usage, "usage")
-                    
-                    second_exact_attr = _compute_second_exact_attr(
-                        cnt_block=cnt_block,
-                        expert=expert,
-                        _kwargs=_kwargs,
-                    )
-                    if second_exact_attr is not None:
-                        safe_add_with_ema(expert, ema, second_exact_attr, "second_exact_attr")
+                    expert.usage_text = float(getattr(expert, "usage_text", 0.0)) + usage_text
+                    expert.usage_visual = float(getattr(expert, "usage_visual", 0.0)) + usage_visual
+                    experts_for_second_order.append(expert)
 
-                    true_ablate = _compute_true_ablate_attr(
-                        cnt_block=cnt_block,
-                        expert=expert,
-                        _kwargs=_kwargs,
-                    )
-                    if true_ablate is not None:
-                        safe_add_with_ema(expert, ema, true_ablate, "true_ablate")
+        # IMPORTANT: second-order / ablation probes trigger extra forwards.
+        # Run them after all hook-derived tensors are consumed, otherwise
+        # intermediate probe forwards can overwrite remaining experts' saved hooks.
+        for expert in experts_for_second_order:
+            second_exact_attr = _compute_second_exact_attr(
+                cnt_block=cnt_block,
+                expert=expert,
+                _kwargs=_kwargs,
+            )
+            if second_exact_attr is not None:
+                safe_add_with_ema(expert, ema, second_exact_attr, "second_exact_attr")
+
+            true_ablate = _compute_true_ablate_attr(
+                cnt_block=cnt_block,
+                expert=expert,
+                _kwargs=_kwargs,
+            )
+            if true_ablate is not None:
+                safe_add_with_ema(expert, ema, true_ablate, "true_ablate")
+
+    if debug_routing and _kwargs is not None and int(_kwargs.get("debug_batch_idx", -1)) == 0:
+        print(
+            f"[routing-debug] L{_kwargs.get('layer_idx', -1)} collect down_input_hits="
+            f"{debug_down_input_hits}/{debug_total_experts} gateup_hits={debug_gateup_hits}/{debug_total_experts}",
+            flush=True,
+        )
