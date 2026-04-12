@@ -98,6 +98,7 @@ def generate_masks(
             layerwise_keep_plan=layerwise_keep_plan,
             intra_layer_method=mask_method_kwargs.get("intra_layer_method", "uniform"),
             ema_matrix=modality_scores.get("ema_matrix", None),
+            verbose=verbose,
         )
 
         if thresholds_path is not None:
@@ -136,7 +137,7 @@ def generate_masks(
         result["intermediate_masks"] = trim_masks_to_layer_budget(
             masks=modality_masks,
             shared_masks=shared_masks,
-            intermediate_scores=intermediate_scores,
+            modality_scores=modality_scores,
             layerwise_keep_plan=layerwise_keep_plan,
             verbose=verbose,
         )

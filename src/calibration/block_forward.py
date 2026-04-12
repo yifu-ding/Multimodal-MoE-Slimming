@@ -316,7 +316,6 @@ def block_forward(
     total_batches = 0
     device_type = block_device.type
     autocast_enabled = device_type == "cuda" and dtype in (torch.float16, torch.bfloat16)
-    # debug_routing = os.environ.get("MODES_DEBUG_ROUTING", "0") == "1"
 
     try:
         iterator = tqdm(dataloader, desc=f"Calibrating L{layer_idx}", disable=not verbose, leave=False)

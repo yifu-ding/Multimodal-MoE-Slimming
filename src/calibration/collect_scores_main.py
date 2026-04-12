@@ -16,7 +16,6 @@ for _p in (REPO_PARENT, REPO_ROOT):
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
-from tqdm.auto import tqdm
 
 from observations.common import (
     build_dataset,
@@ -25,16 +24,22 @@ from observations.common import (
     discover_layer_structure,
     ensure_dir,
     load_model_bundle,
-    move_inputs_to_model_device,
-    prepare_inputs,
     resolve_model_name_or_path,
 )
-from src.calibration.collector.utils import channel_rms, safe_add_with_ema, weight_rms
-from src.calibration.forward import block_forward
-from src.calibration.threshold_calibration import (
-    run_threshold_calibration as _run_threshold_calibration,
-    build_arg_parser as _threshold_arg_parser,
+from src.calibration.collector.utils import (
+    safe_add_with_ema,
+    _is_fused_expert_container,
+    _normalize_per_layer_counts,
+    _to_nested_expert_dict,
+    _tensor_map_to_nested_dict,
+    _scalar_map_to_nested_dict,
 )
+from src.calibration.collector.naive_metric_fn import channel_rms, weight_rms
+from src.calibration.block_forward import block_forward
+# from src.calibration.threshold_calibration import (
+#     run_threshold_calibration as _run_threshold_calibration,
+#     build_arg_parser as _threshold_arg_parser,
+# )
 
 
 CHANNEL_METRICS = (
@@ -59,61 +64,6 @@ EXPERT_METRICS = (
     "second_exact_attr",
     "true_ablate",
 )
-
-
-def _is_fused_expert_container(experts) -> bool:
-    return (
-        experts is not None
-        and getattr(experts, "__class__", type(None)).__name__ == "Qwen3VLMoeTextExperts"
-        and hasattr(experts, "gate_up_proj")
-        and hasattr(experts, "down_proj")
-    )
-
-
-def _tensor_map_to_nested_dict(layer_map: Dict[int, torch.Tensor]) -> Dict[int, Dict[int, torch.Tensor]]:
-    return {
-        layer_idx: {
-            eid: tensor[eid].detach().cpu().float()
-            for eid in range(tensor.shape[0])
-        }
-        for layer_idx, tensor in layer_map.items()
-    }
-
-
-def _scalar_map_to_nested_dict(layer_map: Dict[int, torch.Tensor]) -> Dict[int, Dict[int, float]]:
-    return {
-        layer_idx: {
-            eid: float(tensor[eid].item())
-            for eid in range(tensor.shape[0])
-        }
-        for layer_idx, tensor in layer_map.items()
-    }
-
-
-def _normalize_per_layer_counts(counts_map: Dict[int, torch.Tensor]) -> Dict[int, torch.Tensor]:
-    output = {}
-    for layer_idx, counts in counts_map.items():
-        counts = counts.detach().cpu().float()
-        denom = counts.sum().clamp_min(1.0)
-        output[layer_idx] = counts / denom
-    return output
-
-
-def _to_nested_expert_dict(layer_map: Dict[int, torch.Tensor], scalar: bool = False):
-    nested = {}
-    for layer_idx, tensor in layer_map.items():
-        if scalar:
-            nested[layer_idx] = {
-                eid: float(tensor[eid].item())
-                for eid in range(tensor.shape[0])
-            }
-        else:
-            nested[layer_idx] = {
-                eid: tensor[eid].detach().cpu().float()
-                for eid in range(tensor.shape[0])
-            }
-    return nested
-
 
 class ModalityActivationAccumulator:
     def __init__(self, layer_to_num_experts: Dict[int, int], layer_to_num_channels: Dict[int, int]) -> None:
@@ -563,7 +513,7 @@ def run_collection(args) -> None:
             dataloader=loader,
             dataset_name=args.dataset,
             saliency_ema=args.ema,
-            loss_fn="rel_l2",
+            loss_fn="l2",
             second_order_mode="exact",  # default second-order mode is exact
             dtype=block_dtype,
             verbose=True,
@@ -578,14 +528,14 @@ def run_collection(args) -> None:
 
 
 def main() -> None:
-    import sys as _sys
-    if len(_sys.argv) > 1 and _sys.argv[1] == "threshold":
-        _sys.argv.pop(1)
-        args = _threshold_arg_parser().parse_args()
-        _run_threshold_calibration(args)
-    else:
-        args = build_arg_parser().parse_args()
-        run_collection(args)
+    # import sys as _sys
+    # if len(_sys.argv) > 1 and _sys.argv[1] == "threshold":
+    #     _sys.argv.pop(1)
+    #     args = _threshold_arg_parser().parse_args()
+    #     _run_threshold_calibration(args)
+    # else:
+    args = build_arg_parser().parse_args()
+    run_collection(args)
 
 
 if __name__ == "__main__":

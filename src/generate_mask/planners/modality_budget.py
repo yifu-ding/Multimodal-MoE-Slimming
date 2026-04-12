@@ -3,6 +3,7 @@ from typing import Optional, Set
 import torch
 
 from src.generate_mask.planners.intra_layer import intra_layer_planner
+from src.base.shared_utils import _print
 
 
 def _pick_topk(available_scores: torch.Tensor, available_idx: torch.Tensor, k: int) -> Set[int]:
@@ -20,6 +21,7 @@ def build_modality_budget_masks(
     layerwise_keep_plan: torch.Tensor,
     intra_layer_method: str,
     ema_matrix: Optional[torch.Tensor] = None,
+    verbose: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     
     def _tentative(scores: torch.Tensor) -> torch.Tensor:
@@ -30,7 +32,7 @@ def build_modality_budget_masks(
             scores_to_use = weighted
         else:
             scores_to_use = scores
-        masks_float, _ = intra_layer_planner(
+        masks_float, K_E = intra_layer_planner(
             scores=scores_to_use,
             expertwise_scores=expertwise_scores,
             keep_ratio=layerwise_keep_plan,
@@ -40,18 +42,25 @@ def build_modality_budget_masks(
             I=scores.shape[2],
             verbose=False,
         )
-        return masks_float.bool()
+        return masks_float.bool(), K_E
     
     # 计算文本和视觉各自的 tentative masks
-    text_tentative = _tentative(text_scores)
-    visual_tentative = _tentative(visual_scores)
-
+    text_tentative, text_K_E = _tentative(text_scores)
+    visual_tentative, visual_K_E = _tentative(visual_scores)
+    # target_budget = (text_K_E + visual_K_E)/2
+    
+    if verbose:
+        _print(f"[Modality-aware Budget] before: text: {text_K_E[0]}, \n visual: {visual_K_E[0]}")
+        
     L, E, I = text_scores.shape
     masks = torch.zeros((L, E, I), dtype=torch.bool, device=text_scores.device)
     shared_masks = torch.zeros((L, E, I), dtype=torch.bool, device=text_scores.device)
 
     for lid in range(L):
         for eid in range(E):
+            # if eid == E-1:
+            #     import ipdb; ipdb.set_trace()
+                
             t = text_scores[lid, eid].float().clamp_min(0.0)
             v = visual_scores[lid, eid].float().clamp_min(0.0)
 
@@ -73,19 +82,30 @@ def build_modality_budget_masks(
                 norm_vis_ema = (affinity + 1.0) / 2.0
             norm_text_ema = 1.0 - norm_vis_ema
 
+            # target_budget = text_K_E[lid, eid] * norm_text_ema + visual_K_E[lid, eid] * norm_vis_ema
+            target_budget = (text_K_E[lid, eid] + visual_K_E[lid, eid]) / 2.0
+
             visual_only_idx = torch.nonzero(visual_only_mask, as_tuple=False).flatten()
             text_only_idx = torch.nonzero(text_only_mask, as_tuple=False).flatten()
 
-            k_visual = int(round(float(visual_only_idx.numel()) * norm_vis_ema))
-            k_text = int(round(float(text_only_idx.numel()) * norm_text_ema))
-            k_visual = min(int(visual_only_idx.numel()), max(0, k_visual))
-            k_text = min(int(text_only_idx.numel()), max(0, k_text))
+            # k_visual = int(round(float(visual_only_idx.numel()) * norm_vis_ema))
+            # k_text = int(round(float(text_only_idx.numel()) * norm_text_ema))
+            # k_visual = min(int(visual_only_idx.numel()), max(0, k_visual))
+            # k_text = min(int(text_only_idx.numel()), max(0, k_text))
+            remaining_budget = float(target_budget) - len(chosen)
+            k_visual = min(int(round(remaining_budget * norm_vis_ema)), int(visual_only_idx.numel()))
+            k_text = min(int(round(remaining_budget * norm_text_ema)), int(text_only_idx.numel()))
 
             chosen.update(_pick_topk(v[visual_only_idx], visual_only_idx, k_visual))
             chosen.update(_pick_topk(t[text_only_idx], text_only_idx, k_text))
             if chosen:
                 chosen_idx = torch.tensor(sorted(chosen), device=text_scores.device, dtype=torch.long)
                 masks[lid, eid].index_fill_(0, chosen_idx, True)
+
+
+    if verbose:
+        K_E = masks.sum(dim=-1)
+        _print(f"[Modality-aware Budget] after modality-aware budget: {K_E[0]}")
 
     return masks, shared_masks
 

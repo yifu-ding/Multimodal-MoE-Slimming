@@ -20,7 +20,7 @@ export PYTHONPATH="${PREFIX}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
-SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/debug/scores.pt}"
+SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa-second_order-rell2/scores.pt}"
 
 PRUNE_RATIO="${PRUNE_RATIO:-0.50}"
 # INTER_METHOD options (inter-layer planner):
@@ -49,7 +49,7 @@ INTER_METHOD="${INTER_METHOD:-uniform}"
 INTRA_METHOD="${INTRA_METHOD:-second_attr_coverage}"
 # INTRA_EXPERT_METRIC options (must exist in scores payload expert_scores):
 #   activation, wa, grad, gateup_act, activation_text, activation_visual, saliency, token_contrib, wg, weight
-INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-channel_second_order}"  # threshold 的话直接读 pt 里存储的值，不需要传入，会覆盖
+INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-activation}"
 ALIGN_INTER="${ALIGN_INTER:-0}"
 MIN_PER_EXPERT="${MIN_PER_EXPERT:-128}"
 
@@ -57,7 +57,7 @@ MODALITY_AWARE="${MODALITY_AWARE:-1}"  # 是否开启双模态
 # THRESHOLDS_PATH="${THRESHOLDS_PATH:-${PREFIX}/storage/prune/thresholds/kimi_gqa/thresholds.pt}"
 THRESHOLDS_PATH="${THRESHOLDS_PATH:-}" 
 
-NUM_SAMPLES="${NUM_SAMPLES:-500}"  # 样本数
+NUM_SAMPLES="${NUM_SAMPLES:-1000}"  # 样本数
 START_IDX="${START_IDX:-0}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"

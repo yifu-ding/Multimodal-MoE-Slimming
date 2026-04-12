@@ -29,16 +29,15 @@ BATCH_SIZE="${BATCH_SIZE:-1}"
 START_IDX="${START_IDX:-0}"
 SUBSET_SEED="${SUBSET_SEED:-42}"
 
-SCORE_TYPE="${SCORE_TYPE:-activation}"
 EMA="${EMA:-0.9}"
 
 # OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/kimi_gqa-second_order}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/debug}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/kimi_gqa-second_order-l2}"
 
 EXTRA_ARGS=("$@")
 
 CMD=(
-    python -m src.calibration.main
+    python -m src.calibration.collect_scores_main
     --model_name_or_path "${MODEL_PATH}"
     --output_dir         "${OUTPUT_DIR}"
     --dataset            "${DATASET}"
@@ -46,7 +45,6 @@ CMD=(
     --batch_size         "${BATCH_SIZE}"
     --start_idx          "${START_IDX}"
     --subset_seed        "${SUBSET_SEED}"
-    --score_type         "${SCORE_TYPE}"
     --ema                "${EMA}"
 )
 
@@ -56,7 +54,6 @@ CMD+=("${EXTRA_ARGS[@]}")
 
 echo "Model      : ${MODEL_PATH}"
 echo "Dataset    : ${DATASET} (${NUM_SAMPLES} samples)"
-echo "Score type : ${SCORE_TYPE}"
 echo "Output     : ${OUTPUT_DIR}"
 echo "GPU        : ${CUDA_VISIBLE_DEVICES}"
 echo ""

@@ -269,6 +269,22 @@ def resolve_activation_fn(expert: nn.Module):
             return fn
     return torch.nn.functional.silu
 
+def compute_channel_hessian_diag(
+    W_down: torch.Tensor,
+    down_input: torch.Tensor,
+    token_mask: torch.Tensor = None,
+) -> torch.Tensor:
+    """Analytic Hessian diagonal: importance_j = ‖W_down[:,j]‖² · Σ_t h_{t,j}²."""
+    w_col_norm2 = W_down.detach().float().pow(2).sum(dim=0)  # [I]
+    h = down_input.detach().float()
+    if token_mask is not None:
+        token_mask = token_mask.to(device=h.device).view(-1).bool()
+        if not bool(token_mask.any()):
+            return torch.zeros(h.shape[-1], dtype=torch.float32, device=h.device)
+        h = h[token_mask]
+    return (w_col_norm2 * h.pow(2).sum(dim=0)).float()
+
+
 def compute_gateup_act(
     expert: nn.Module,
     gate_output: torch.Tensor,

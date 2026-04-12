@@ -4,13 +4,17 @@ from src.base.shared_utils import _print
 def trim_masks_to_layer_budget(
     masks: torch.Tensor,
     shared_masks: torch.Tensor,
-    intermediate_scores: torch.Tensor,
+    modality_scores: torch.Tensor,
     layerwise_keep_plan: torch.Tensor,
     verbose: bool = False,
 ) -> torch.Tensor:
     """Trim per-layer mask counts to layer budgets while protecting shared channels."""
     L, E, I = masks.shape
     total_per_layer = E * I
+    
+    # max_scores = torch.maximum(modality_scores["text"], modality_scores["visual"])
+    _scores = modality_scores["text"] + modality_scores["visual"]
+    _scores = _scores / 2.0
 
     for lid in range(L):
         keep_ratio = layerwise_keep_plan[lid]
@@ -30,7 +34,7 @@ def trim_masks_to_layer_budget(
             addable_idx = torch.nonzero(addable_mask, as_tuple=False)
             if addable_idx.numel() == 0:
                 continue
-            addable_scores = intermediate_scores[lid, addable_idx[:, 0], addable_idx[:, 1]].float()
+            addable_scores = _scores[lid, addable_idx[:, 0], addable_idx[:, 1]].float()
             order = torch.argsort(addable_scores, descending=True)
             add_cnt = min(int(need_add), int(addable_idx.shape[0]))
             to_add = addable_idx[order[:add_cnt]]
@@ -54,7 +58,7 @@ def trim_masks_to_layer_budget(
             continue
 
         need_remove = current_keep - target_keep
-        removable_scores = intermediate_scores[lid, removable_idx[:, 0], removable_idx[:, 1]].float()
+        removable_scores = _scores[lid, removable_idx[:, 0], removable_idx[:, 1]].float()
         order = torch.argsort(removable_scores, descending=False)
         remove_cnt = min(int(need_remove), int(removable_idx.shape[0]))
         to_remove = removable_idx[order[:remove_cnt]]

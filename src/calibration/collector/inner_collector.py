@@ -9,7 +9,7 @@ from .naive_metric_fn import *
 
 
 
-def loop_1_collect_naive_scores(
+def loop_1_channelwise_scores(
     expert_iter,
     *,
     experts,
@@ -30,7 +30,7 @@ def loop_1_collect_naive_scores(
     expert_records = []
     
         
-    def _compute_naive_metric_bundle(
+    def _compute_metric_bundle(
         activation_owner: nn.Module,
         W_down: torch.Tensor,
         W_up: torch.Tensor,
@@ -84,6 +84,23 @@ def loop_1_collect_naive_scores(
             down_grad_ch = None
             up_out_grad_ch = None
             gate_grad_ch = None
+
+        _want_text = _kwargs is not None and _kwargs.get("moe_text_mask", None) is not None
+        _want_visual = _kwargs is not None and _kwargs.get("moe_media_mask", None) is not None
+        _num_ch = W_down.size(1)
+        _ch_dev = W_down.device
+
+        if _want_text:
+            if down_input is not None and text_mask is not None and isinstance(text_mask, torch.Tensor) and bool(text_mask.any()):
+                metrics["channel_second_order_text"] = compute_channel_hessian_diag(W_down, down_input, text_mask)
+            else:
+                metrics["channel_second_order_text"] = torch.zeros(_num_ch, dtype=torch.float32, device=_ch_dev)
+
+        if _want_visual:
+            if down_input is not None and visual_mask is not None and isinstance(visual_mask, torch.Tensor) and bool(visual_mask.any()):
+                metrics["channel_second_order_visual"] = compute_channel_hessian_diag(W_down, down_input, visual_mask)
+            else:
+                metrics["channel_second_order_visual"] = torch.zeros(_num_ch, dtype=torch.float32, device=_ch_dev)
 
         if down_input is None or up_output is None or gate_output is None:
             return metrics
@@ -157,7 +174,7 @@ def loop_1_collect_naive_scores(
         )
 
         with torch.no_grad():
-            metrics = _compute_naive_metric_bundle(
+            metrics = _compute_metric_bundle(
                 activation_owner=activation_owner,
                 W_down=W_down,
                 W_up=W_up,
@@ -218,7 +235,7 @@ def loop_1_collect_naive_scores(
     return expert_records, debug_down_input_hits, debug_gateup_hits, debug_total_experts
 
 
-def loop_2_collect_second_order_scores(
+def loop_2_expertwise_scores(
     expert_records,
     *,
     cnt_block,
@@ -228,22 +245,10 @@ def loop_2_collect_second_order_scores(
     ema: float,
     _kwargs: dict = None,
 ):
-    moe_text_mask = None if _kwargs is None else _kwargs.get("moe_text_mask", None)
-    moe_media_mask = None if _kwargs is None else _kwargs.get("moe_media_mask", None)
-
     for record in expert_records:
         if not record["has_activation"]:
             if is_fused:
-                num_channels = record["num_channels"]
                 device = experts.gate_up_proj.device
-                if moe_text_mask is not None:
-                    fused_metric_stacks.setdefault("channel_second_order_text", []).append(
-                        torch.zeros(num_channels, dtype=torch.float32, device=device)
-                    )
-                if moe_media_mask is not None:
-                    fused_metric_stacks.setdefault("channel_second_order_visual", []).append(
-                        torch.zeros(num_channels, dtype=torch.float32, device=device)
-                    )
                 fused_metric_stacks.setdefault("second_exact_attr", []).append(
                     torch.zeros((), dtype=torch.float32, device=device)
                 )
@@ -252,36 +257,6 @@ def loop_2_collect_second_order_scores(
         expert_idx = record["expert_idx"]
         expert = record["expert"]
         expert_proxy = make_fused_expert_proxy(experts, expert_idx) if is_fused else expert
-
-        if moe_text_mask is not None:
-            ch_text = compute_channel_second_order(
-                cnt_block=cnt_block,
-                expert=expert_proxy,
-                _kwargs=_kwargs,
-                modality_mask=moe_text_mask,
-            )
-            if ch_text is not None:
-                if is_fused:
-                    fused_metric_stacks.setdefault("channel_second_order_text", []).append(
-                        ch_text.detach().to(torch.float32)
-                    )
-                else:
-                    safe_add_with_ema(expert, ema, ch_text, "channel_second_order_text")
-
-        if moe_media_mask is not None:
-            ch_visual = compute_channel_second_order(
-                cnt_block=cnt_block,
-                expert=expert_proxy,
-                _kwargs=_kwargs,
-                modality_mask=moe_media_mask,
-            )
-            if ch_visual is not None:
-                if is_fused:
-                    fused_metric_stacks.setdefault("channel_second_order_visual", []).append(
-                        ch_visual.detach().to(torch.float32)
-                    )
-                else:
-                    safe_add_with_ema(expert, ema, ch_visual, "channel_second_order_visual")
 
         second_exact_attr = compute_expert_second_order(
             cnt_block=cnt_block,
@@ -351,7 +326,7 @@ def collect_scores_from_moe_module(cnt_block,
         gate_grad_w = None
 
     expert_records, debug_down_input_hits, debug_gateup_hits, debug_total_experts = (
-        loop_1_collect_naive_scores(
+        loop_1_channelwise_scores(
             expert_iter,
             experts=experts,
             is_fused=is_fused,
@@ -367,7 +342,7 @@ def collect_scores_from_moe_module(cnt_block,
         )
     )
 
-    loop_2_collect_second_order_scores(
+    loop_2_expertwise_scores(
         expert_records,
         cnt_block=cnt_block,
         experts=experts,

@@ -1,5 +1,60 @@
 import torch
 import torch.nn as nn
+from typing import Dict
+
+def _is_fused_expert_container(experts) -> bool:
+    return (
+        experts is not None
+        and getattr(experts, "__class__", type(None)).__name__ == "Qwen3VLMoeTextExperts"
+        and hasattr(experts, "gate_up_proj")
+        and hasattr(experts, "down_proj")
+    )
+
+
+def _tensor_map_to_nested_dict(layer_map: Dict[int, torch.Tensor]) -> Dict[int, Dict[int, torch.Tensor]]:
+    return {
+        layer_idx: {
+            eid: tensor[eid].detach().cpu().float()
+            for eid in range(tensor.shape[0])
+        }
+        for layer_idx, tensor in layer_map.items()
+    }
+
+
+def _scalar_map_to_nested_dict(layer_map: Dict[int, torch.Tensor]) -> Dict[int, Dict[int, float]]:
+    return {
+        layer_idx: {
+            eid: float(tensor[eid].item())
+            for eid in range(tensor.shape[0])
+        }
+        for layer_idx, tensor in layer_map.items()
+    }
+
+
+def _normalize_per_layer_counts(counts_map: Dict[int, torch.Tensor]) -> Dict[int, torch.Tensor]:
+    output = {}
+    for layer_idx, counts in counts_map.items():
+        counts = counts.detach().cpu().float()
+        denom = counts.sum().clamp_min(1.0)
+        output[layer_idx] = counts / denom
+    return output
+
+
+def _to_nested_expert_dict(layer_map: Dict[int, torch.Tensor], scalar: bool = False):
+    nested = {}
+    for layer_idx, tensor in layer_map.items():
+        if scalar:
+            nested[layer_idx] = {
+                eid: float(tensor[eid].item())
+                for eid in range(tensor.shape[0])
+            }
+        else:
+            nested[layer_idx] = {
+                eid: tensor[eid].detach().cpu().float()
+                for eid in range(tensor.shape[0])
+            }
+    return nested
+
 
 def is_fused_expert_container(experts: nn.Module) -> bool:
     return (
