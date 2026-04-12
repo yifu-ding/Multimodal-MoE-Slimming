@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from observations.common import move_inputs_to_model_device, prepare_inputs
 from src.base.shared_utils import angle_loss
-from src.channel_scoring.collector import collect_scores_from_moe_module
+from src.calibration.collector import collect_scores_from_moe_module
 
 __all__ = [
     "block_forward",

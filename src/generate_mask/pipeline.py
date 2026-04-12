@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional
 import torch
 
 from src.base.shared_utils import _print
+from src.calibration.threshold_calibration import generate_mask_from_thresholds
 from src.generate_mask.adjusters import trim_masks_to_layer_budget
 from src.generate_mask.planners import build_modality_budget_masks
 from src.generate_mask.stages import (
@@ -32,6 +33,22 @@ def generate_masks(
         return masks if isinstance(masks, dict) else {"intermediate_masks": masks}
 
     prune_kwargs = prune_kwargs or {}
+
+    # --- threshold-based path ---
+    thresholds_path = prune_kwargs.get("thresholds_path")
+    if thresholds_path is not None:
+        prune_ratio = prune_kwargs.get("prune_ratio", 0.0)
+        if verbose:
+            _print(
+                f"[Mask Building] Using threshold-based masks from {thresholds_path} "
+                f"(target_ratio={prune_ratio:.2f})"
+            )
+        return generate_mask_from_thresholds(
+            thresholds_path=thresholds_path,
+            scores_path=scores_dir,
+            target_ratio=prune_ratio,
+            device=device,
+        )
     prune_ratio = prune_kwargs.get("prune_ratio", 0.0)
     mask_method_kwargs = prune_kwargs.get("mask_method_kwargs", {})
     adjust_masks_kwargs = prune_kwargs.get("adjust_masks_kwargs", {})

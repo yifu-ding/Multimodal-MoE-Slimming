@@ -38,7 +38,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/debug}"
 EXTRA_ARGS=("$@")
 
 CMD=(
-    python -m src.channel_scoring.main
+    python -m src.calibration.main
     --model_name_or_path "${MODEL_PATH}"
     --output_dir         "${OUTPUT_DIR}"
     --dataset            "${DATASET}"

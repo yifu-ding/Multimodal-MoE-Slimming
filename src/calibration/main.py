@@ -29,8 +29,12 @@ from observations.common import (
     prepare_inputs,
     resolve_model_name_or_path,
 )
-from src.channel_scoring.collector.utils import channel_rms, safe_add_with_ema, weight_rms
-from src.channel_scoring.forward import block_forward
+from src.calibration.collector.utils import channel_rms, safe_add_with_ema, weight_rms
+from src.calibration.forward import block_forward
+from src.calibration.threshold_calibration import (
+    run_threshold_calibration as _run_threshold_calibration,
+    build_arg_parser as _threshold_arg_parser,
+)
 
 
 CHANNEL_METRICS = (
@@ -467,7 +471,7 @@ def save_score_artifacts(output_dir: str, accumulator: RichScoreAccumulator, arg
     snapshot.finalize()
     scores_path = os.path.join(output_dir, "scores.pt")
     torch.save(snapshot.build_scores_payload(args), scores_path)
-    print(f"[channel_scoring] Saved scores: {scores_path}")
+    print(f"[calibration] Saved scores: {scores_path}")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -492,14 +496,14 @@ def run_collection(args) -> None:
     out_path = os.path.join(args.output_dir, "scores.pt")
     if os.path.exists(out_path) and not args.force:
         print(
-            f"[channel_scoring] Found existing scores at {out_path}. "
+            f"[calibration] Found existing scores at {out_path}. "
             "Pass --force to overwrite."
         )
         return
 
     bundle = load_model_bundle(args.model_name_or_path)
     if bundle.family != "kimi":
-        raise NotImplementedError("The current channel_scoring adapter only supports Kimi-VL.")
+        raise NotImplementedError("The current calibration adapter only supports Kimi-VL.")
 
     model = bundle.model
     config = model.config.text_config
@@ -511,7 +515,7 @@ def run_collection(args) -> None:
     )
 
     print(
-        f"[channel_scoring] Discovered {len(layer_to_num_experts)} MoE layers, "
+        f"[calibration] Discovered {len(layer_to_num_experts)} MoE layers, "
         f"{sum(layer_to_num_experts.values())} experts total."
     )
 
@@ -535,7 +539,7 @@ def run_collection(args) -> None:
     )
 
     # if args.modality_aware and accumulator.modality_scores is not None:
-    #     print("[channel_scoring] Collecting modality-split activation scores...")
+    #     print("[calibration] Collecting modality-split activation scores...")
     #     hook_states = attach_kimi_modality_hooks(model, config, accumulator.modality_scores, args.ema)
     #     try:
     #         model.eval()
@@ -547,7 +551,7 @@ def run_collection(args) -> None:
     #     finally:
     #         restore_kimi_modality_hooks(hook_states)
 
-    print("[channel_scoring] Collecting block-reconstruction scores with attn_mlp collector...")
+    print("[calibration] Collecting block-reconstruction scores with attn_mlp collector...")
     for layer_idx in accumulator.layers:
         teacher_block = model.language_model.model.layers[layer_idx]
         copied_block = copy.deepcopy(teacher_block)
@@ -567,15 +571,21 @@ def run_collection(args) -> None:
         accumulator.layerwise_loss[layer_idx] = float(layer_loss)
         accumulator.absorb_layer_scores(layer_idx, copied_block)
         save_score_artifacts(args.output_dir, accumulator, args)
-        print(f"[channel_scoring] Layer {layer_idx}: layer loss={layer_loss:.6f}. "
+        print(f"[calibration] Layer {layer_idx}: layer loss={layer_loss:.6f}. "
               f"Have saved to {args.output_dir}/scores.pt")
 
     save_score_artifacts(args.output_dir, accumulator, args)
 
 
 def main() -> None:
-    args = build_arg_parser().parse_args()
-    run_collection(args)
+    import sys as _sys
+    if len(_sys.argv) > 1 and _sys.argv[1] == "threshold":
+        _sys.argv.pop(1)
+        args = _threshold_arg_parser().parse_args()
+        _run_threshold_calibration(args)
+    else:
+        args = build_arg_parser().parse_args()
+        run_collection(args)
 
 
 if __name__ == "__main__":
