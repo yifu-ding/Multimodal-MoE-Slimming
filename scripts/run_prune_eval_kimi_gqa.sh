@@ -33,6 +33,8 @@ PRUNE_RATIO="${PRUNE_RATIO:-0.50}"
 #   loss_coverage
 #   raw_loss_coverage
 INTER_METHOD="${INTER_METHOD:-uniform}"
+# 在 loss_smooth 的时候会读取，可选：sqrt, cbrt, fourth_root, log, ...
+SMOOTH_FN="${SMOOTH_FN:-fourth_root}"
 # INTRA_METHOD options (intra-layer planner, 基于 EXPERT_METRICS):
 #   uniform
 #   usage              # gate_scores.usage
@@ -45,7 +47,7 @@ INTER_METHOD="${INTER_METHOD:-uniform}"
 #   true_ablate_coverage
 INTRA_METHOD="${INTRA_METHOD:-second_attr_coverage}"
 # INTRA_EXPERT_METRIC options (must exist in scores payload channel_scores):
-# 每个 metric 都有 _text / _visual 后缀版本，开双模态时用 xxx_text + xxx_visual
+# 下列 metric 都有 _text / _visual 后缀版本，开双模态时用 xxx_text + xxx_visual
 #   gateup_act, gateup_text, gateup_visual
 #   3proj_act, 3proj_act_text, 3proj_act_visual
 #   down_second_order, down_second_order_text, down_second_order_visual
@@ -54,13 +56,15 @@ INTRA_METHOD="${INTRA_METHOD:-second_attr_coverage}"
 #   3proj_saliency, 3proj_saliency_text, 3proj_saliency_visual
 #   wa, wa_text, wa_visual
 #   3proj_grad, 3proj_grad_text, 3proj_grad_visual
-#   wg, weight
+# 这两个 metric 没有双模态版本
+#   wg 
+#   weight
+MODALITY_AWARE="${MODALITY_AWARE:-0}"  # 是否开启双模态
 INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-3proj_second_order}"
-SMOOTH_FN="${SMOOTH_FN:-fourth_root}"  # sqrt, cbrt, fourth_root, log, ...
+
 ALIGN_INTER="${ALIGN_INTER:-0}"
 MIN_PER_EXPERT="${MIN_PER_EXPERT:-128}"
 
-MODALITY_AWARE="${MODALITY_AWARE:-0}"  # 是否开启双模态
 # THRESHOLDS_PATH="${THRESHOLDS_PATH:-${PREFIX}/storage/prune/thresholds/kimi_gqa/thresholds.pt}"
 THRESHOLDS_PATH="${THRESHOLDS_PATH:-}" 
 
