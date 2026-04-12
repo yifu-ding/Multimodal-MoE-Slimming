@@ -152,11 +152,21 @@ def videommmu_doc_to_visual(doc):
     video_path = os.path.join(videommmu_cache_dir, video_path)
 
     if os.path.exists(video_path):
-        video_path = video_path
-    else:
-        sys.exit(f"video path:{video_path} does not exist, please check")
+        return process_media(video_path)
 
-    return process_media(video_path)
+    image_payload = doc.get("image")
+    if isinstance(image_payload, dict):
+        image_bytes = image_payload.get("bytes")
+        if image_bytes is not None:
+            from io import BytesIO
+
+            with Image.open(BytesIO(image_bytes)) as img:
+                frame = _resize_frame(img.convert("RGB"), max_long_side=480)
+            return [frame], 1
+
+    raise FileNotFoundError(
+        f"video path:{video_path} does not exist, and no fallback image was found in the parquet row"
+    )
 
 
 def videommmu_doc_to_text_adaptation(doc):
@@ -261,12 +271,13 @@ def videommmu_transform(batch):
     processed_full_answers = []
     processed_org_texts = []
     frames = []
-    for id, q_text, q_type, options, a_text in zip(
+    for id, q_text, q_type, options, a_text, image in zip(
         batch["id"],
         batch["question"],
         batch["question_type"],
         batch["options"],
         batch["answer"],
+        batch["image"],
     ):
         doc = {
             "id": id,
@@ -274,6 +285,7 @@ def videommmu_transform(batch):
             "question_type": q_type,
             "options": options,
             "answer": a_text,
+            "image": image,
         }
         visuals = videommmu_doc_to_visual(doc)
         if doc["question_type"].endswith("Adaptation") or doc["question_type"].endswith(
