@@ -367,7 +367,7 @@ def move_inputs_to_model_device(model, inputs: Dict[str, Any]) -> Dict[str, Any]
     return moved
 
 
-def _resolve_activation_fn(obj: Any) -> Callable[[torch.Tensor], torch.Tensor]:
+def resolve_activation_fn(obj: Any) -> Callable[[torch.Tensor], torch.Tensor]:
     for attr in ("act_fn", "activation_fn"):
         fn = getattr(obj, attr, None)
         if callable(fn):
@@ -391,15 +391,15 @@ def compute_generic_expert_activation(expert: Any, hidden_states: torch.Tensor):
     if hasattr(expert, "gate_proj") and hasattr(expert, "up_proj"):
         gate = _linear_from_module_or_param(expert.gate_proj, hidden_states)
         up = _linear_from_module_or_param(expert.up_proj, hidden_states)
-        return _resolve_activation_fn(expert)(gate) * up
+        return resolve_activation_fn(expert)(gate) * up
     if hasattr(expert, "gate_up_proj"):
         gate_up = _linear_from_module_or_param(expert.gate_up_proj, hidden_states)
         gate, up = gate_up.chunk(2, dim=-1)
-        return _resolve_activation_fn(expert)(gate) * up
+        return resolve_activation_fn(expert)(gate) * up
     if hasattr(expert, "w1") and hasattr(expert, "w3"):
         gate = _linear_from_module_or_param(expert.w1, hidden_states)
         up = _linear_from_module_or_param(expert.w3, hidden_states)
-        return _resolve_activation_fn(expert)(gate) * up
+        return resolve_activation_fn(expert)(gate) * up
     raise NotImplementedError(
         f"Cannot infer expert activation structure for expert type: {type(expert)}"
     )
@@ -1022,5 +1022,5 @@ def build_base_arg_parser(description: str) -> argparse.ArgumentParser:
     )
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--raw_stats_path", type=str, default="")
-    parser.add_argument("--force_recompute", action="store_true")
+    parser.add_argument("--force", action="store_true")
     return parser

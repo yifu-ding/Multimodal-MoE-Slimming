@@ -82,7 +82,15 @@ def generate_masks(
         result.update(mask_result)
 
     else:
-        modality_scores = load_modality_channel_scores(scores_dir, device=device) if modality_aware else None
+        modality_scores = (
+            load_modality_channel_scores(
+                scores_dir,
+                device=device,
+                intra_expert_metric=mask_method_kwargs.get("intra_expert_metric", "activation"),
+            )
+            if modality_aware
+            else None
+        )
         if modality_scores is None:
             raise ValueError(f"modality-aware scores are required, but not found in {scores_dir}")
         if verbose:
@@ -92,7 +100,7 @@ def generate_masks(
             modality_scores["text"],
             modality_scores["visual"],
             expertwise_scores=expertwise_scores,
-            layerwise_keep_plan=layerwise_keep_plan,  # 0.1 is a small buffer leaving for complement
+            layerwise_keep_plan=layerwise_keep_plan,
             intra_layer_method=mask_method_kwargs.get("intra_layer_method", "uniform"),
             ema_matrix=modality_scores.get("ema_matrix", None),
         )

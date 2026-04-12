@@ -12,13 +12,15 @@ set -euo pipefail
 # Full eval:
 #   NUM_SAMPLES=0 CUDA_VISIBLE_DEVICES=1 bash scripts/run_prune_eval_kimi_gqa.sh
 
+source scripts/select_least_used_gpu.sh # 自动选择显存使用量最少的 gpu
+
 PREFIX="${PREFIX:-$(pwd)}"
 export PYTHONPATH="${PREFIX}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
-SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa-modal2/scores.pt}"
+SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa-second_order/scores.pt}"
 
 PRUNE_RATIO="${PRUNE_RATIO:-0.50}"
 # INTER_METHOD options (inter-layer planner):
@@ -29,7 +31,7 @@ PRUNE_RATIO="${PRUNE_RATIO:-0.50}"
 #   loss_smooth_<N>      # e.g. loss_smooth_1, loss_smooth_2
 #   loss_coverage
 #   raw_loss_coverage
-INTER_METHOD="${INTER_METHOD:-loss_smooth_2}"
+INTER_METHOD="${INTER_METHOD:-loss_smooth_1}"
 # INTRA_METHOD options (intra-layer planner):
 #   uniform
 #   channel_ranking
@@ -41,17 +43,13 @@ INTER_METHOD="${INTER_METHOD:-loss_smooth_2}"
 #   second_attr_coverage
 #   true_ablate
 #   true_ablate_coverage
-#   loss_coverage
+#   loss_coverage  # 没有计算逐个expert loss的话就不支持这个参数
 #   usage_coverage
 #   router_coverage
 INTRA_METHOD="${INTRA_METHOD:-second_attr_coverage}"
 # INTRA_EXPERT_METRIC options (must exist in scores payload expert_scores):
-#   activation
-#   wa
-#   grad
-# Common extra metrics if your scores.pt contains them:
-#   gateup_act, activation_text, activation_visual, saliency, token_contrib, wg, weight
-INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-wa}"
+#   activation, wa, grad, gateup_act, activation_text, activation_visual, saliency, token_contrib, wg, weight
+INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-activation}"
 ALIGN_INTER="${ALIGN_INTER:-0}"
 MIN_PER_EXPERT="${MIN_PER_EXPERT:-128}"
 

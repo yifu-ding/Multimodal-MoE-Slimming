@@ -38,6 +38,8 @@ CHANNEL_METRICS = (
     "gateup_act",
     "activation_text",
     "activation_visual",
+    "channel_second_order_text",
+    "channel_second_order_visual",
     "saliency",
     "wa",
     "grad",
@@ -46,13 +48,22 @@ CHANNEL_METRICS = (
     "weight",
 )
 EXPERT_METRICS = (
-    "expert_out_token_contrib",
+    "first_attr_usage",
     "usage",
     "usage_text",
     "usage_visual",
     "second_exact_attr",
     "true_ablate",
 )
+
+
+def _is_fused_expert_container(experts) -> bool:
+    return (
+        experts is not None
+        and getattr(experts, "__class__", type(None)).__name__ == "Qwen3VLMoeTextExperts"
+        and hasattr(experts, "gate_up_proj")
+        and hasattr(experts, "down_proj")
+    )
 
 
 def _tensor_map_to_nested_dict(layer_map: Dict[int, torch.Tensor]) -> Dict[int, Dict[int, torch.Tensor]]:
@@ -157,13 +168,11 @@ class RichScoreAccumulator:
         self,
         layer_to_num_experts: Dict[int, int],
         layer_to_num_channels: Dict[int, int],
-        score_type: str,
         modality_aware: bool,
     ) -> None:
         self.layer_to_num_experts = layer_to_num_experts
         self.layer_to_num_channels = layer_to_num_channels
         self.layers = sorted(layer_to_num_experts.keys())
-        self.score_type = score_type
         self.modality_aware = modality_aware
 
         self.expert_scores: Dict[str, Dict[int, torch.Tensor]] = {}
@@ -174,6 +183,7 @@ class RichScoreAccumulator:
 
         self.gate_scores: Dict[str, Dict[int, torch.Tensor]] = {
             "usage": {},
+            "router": {},
             "usage_text": {},
             "usage_visual": {},
         }
@@ -188,6 +198,7 @@ class RichScoreAccumulator:
             for metric in EXPERT_METRICS:
                 self.expert_scores[metric][layer_idx] = torch.zeros(e, dtype=torch.float32)
             self.gate_scores["usage"][layer_idx] = torch.zeros(e, dtype=torch.float32)
+            self.gate_scores["router"][layer_idx] = torch.zeros(e, dtype=torch.float32)
             self.gate_scores["usage_text"][layer_idx] = torch.zeros(e, dtype=torch.float32)
             self.gate_scores["usage_visual"][layer_idx] = torch.zeros(e, dtype=torch.float32)
             self.hit_counts[layer_idx] = torch.zeros(e, dtype=torch.int64)
@@ -198,7 +209,27 @@ class RichScoreAccumulator:
         )
 
     def absorb_layer_scores(self, layer_idx: int, copied_block) -> None:
-        experts = list(copied_block.mlp.experts)
+        expert_container = copied_block.mlp.experts
+        if _is_fused_expert_container(expert_container):
+            num_experts = self.layer_to_num_experts[layer_idx]
+            for metric in CHANNEL_METRICS:
+                value = getattr(expert_container, metric, None)
+                if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[0] == num_experts:
+                    self.expert_scores[metric][layer_idx] = value.detach().cpu().float()
+            for metric in EXPERT_METRICS:
+                value = getattr(expert_container, metric, None)
+                if isinstance(value, torch.Tensor) and value.ndim >= 1 and value.shape[0] == num_experts:
+                    self.expert_scores[metric][layer_idx] = value.detach().cpu().float().view(-1)
+            for metric in ("usage", "router", "usage_text", "usage_visual"):
+                value = getattr(expert_container, metric, None)
+                if isinstance(value, torch.Tensor) and value.ndim >= 1 and value.shape[0] == num_experts:
+                    self.gate_scores[metric][layer_idx] = value.detach().cpu().float().view(-1)
+            activation = getattr(expert_container, "activation", None)
+            if isinstance(activation, torch.Tensor) and activation.ndim >= 2 and activation.shape[0] == num_experts:
+                self.hit_counts[layer_idx] = (activation.detach().cpu().float().abs().sum(dim=1) > 0).to(torch.int64)
+            return
+
+        experts = list(expert_container)
         for eid, expert in enumerate(experts):
             for metric in CHANNEL_METRICS:
                 value = getattr(expert, metric, None)
@@ -216,6 +247,9 @@ class RichScoreAccumulator:
             usage = getattr(expert, "usage", None)
             if usage is not None:
                 self.gate_scores["usage"][layer_idx][eid] = float(usage)
+            router = getattr(expert, "router", None)
+            if router is not None:
+                self.gate_scores["router"][layer_idx][eid] = float(router)
             usage_text = getattr(expert, "usage_text", None)
             if usage_text is not None:
                 self.gate_scores["usage_text"][layer_idx][eid] = float(usage_text)
@@ -227,6 +261,7 @@ class RichScoreAccumulator:
 
     def finalize(self) -> None:
         self.gate_scores["usage"] = _normalize_per_layer_counts(self.gate_scores["usage"])
+        self.gate_scores["router"] = _normalize_per_layer_counts(self.gate_scores["router"])
         self.gate_scores["usage_text"] = _normalize_per_layer_counts(self.gate_scores["usage_text"])
         self.gate_scores["usage_visual"] = _normalize_per_layer_counts(self.gate_scores["usage_visual"])
         if self.modality_scores is not None:
@@ -241,7 +276,6 @@ class RichScoreAccumulator:
             "layer_to_num_experts": self.layer_to_num_experts,
             "layer_to_num_channels": self.layer_to_num_channels,
             "layers": self.layers,
-            "score_type": self.score_type,
             "model_name_or_path": args.model_name_or_path,
             "resolved_model_name_or_path": resolve_model_name_or_path(args.model_name_or_path),
             "dataset": args.dataset,
@@ -250,10 +284,11 @@ class RichScoreAccumulator:
             "start_idx": args.start_idx,
             "subset_seed": args.subset_seed,
             "modality_aware": self.modality_aware,
-            "expert_out_token_contrib": _scalar_map_to_nested_dict(
-                self.expert_scores["expert_out_token_contrib"]
+            "first_attr_usage": _scalar_map_to_nested_dict(
+                self.expert_scores["first_attr_usage"]
             ),
             "expert_usage": _scalar_map_to_nested_dict(self.gate_scores["usage"]),
+            "expert_router": _scalar_map_to_nested_dict(self.gate_scores["router"]),
             "layerwise_loss": self.layerwise_loss,
         }
         if self.modality_scores is not None:
@@ -286,7 +321,6 @@ class RichScoreAccumulator:
             "batch_size": args.batch_size,
             "start_idx": args.start_idx,
             "subset_seed": args.subset_seed,
-            "score_type": args.score_type,
             "ema": args.ema,
             "modality_aware": self.modality_aware,
             "layers": self.layers,
@@ -297,6 +331,7 @@ class RichScoreAccumulator:
             "expert_scores": expert_scores,
             "gate_scores": {
                 "usage": _to_nested_expert_dict(self.gate_scores["usage"], scalar=True),
+                "router": _to_nested_expert_dict(self.gate_scores["router"], scalar=True),
                 "usage_text": _to_nested_expert_dict(self.gate_scores["usage_text"], scalar=True),
                 "usage_visual": _to_nested_expert_dict(self.gate_scores["usage_visual"], scalar=True),
             },
@@ -304,10 +339,11 @@ class RichScoreAccumulator:
             "layerwise_loss": dict(self.layerwise_loss),
             # Backward-compatible aliases
             "scores": _tensor_map_to_nested_dict(self.expert_scores["activation"]),
-            "expert_out_token_contrib": _scalar_map_to_nested_dict(
-                self.expert_scores["expert_out_token_contrib"]
+            "first_attr_usage": _scalar_map_to_nested_dict(
+                self.expert_scores["first_attr_usage"]
             ),
             "expert_usage": _scalar_map_to_nested_dict(self.gate_scores["usage"]),
+            "expert_router": _scalar_map_to_nested_dict(self.gate_scores["router"]),
         }
         if self.modality_scores is not None:
             payload["modality_channel_scores"] = {
@@ -422,15 +458,15 @@ def collect_weight_scores(model, config, accumulator: RichScoreAccumulator) -> N
             u = expert.up_proj.weight
             d = expert.down_proj.weight
             score = (weight_rms(d, channel_dim=1) + weight_rms(u, channel_dim=0) + weight_rms(g, channel_dim=0)) / 3.0
-            accumulator.expert_scores["activation"][layer_idx][eid] = score.detach().cpu().float()
             accumulator.expert_scores["weight"][layer_idx][eid] = score.detach().cpu().float()
             accumulator.hit_counts[layer_idx][eid] = 1
 
 
 def save_score_artifacts(output_dir: str, accumulator: RichScoreAccumulator, args) -> None:
-    accumulator.finalize()
+    snapshot = copy.deepcopy(accumulator)
+    snapshot.finalize()
     scores_path = os.path.join(output_dir, "scores.pt")
-    torch.save(accumulator.build_scores_payload(args), scores_path)
+    torch.save(snapshot.build_scores_payload(args), scores_path)
     print(f"[channel_scoring] Saved scores: {scores_path}")
 
 
@@ -445,20 +481,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--start_idx", type=int, default=0)
     p.add_argument("--subset_seed", type=int, default=42)
-    p.add_argument("--score_type", type=str, default="activation", choices=["activation", "weight"])
     p.add_argument("--ema", type=float, default=0.9)
     p.add_argument("--modality_aware", action="store_true")
-    p.add_argument("--force_recompute", action="store_true")
+    p.add_argument("--force", "-f", action="store_true")
     return p
 
 
 def run_collection(args) -> None:
     ensure_dir(args.output_dir)
     out_path = os.path.join(args.output_dir, "scores.pt")
-    if os.path.exists(out_path) and not args.force_recompute:
+    if os.path.exists(out_path) and not args.force:
         print(
             f"[channel_scoring] Found existing scores at {out_path}. "
-            "Pass --force_recompute to overwrite."
+            "Pass --force to overwrite."
         )
         return
 
@@ -472,7 +507,6 @@ def run_collection(args) -> None:
     accumulator = RichScoreAccumulator(
         layer_to_num_experts,
         layer_to_num_channels,
-        score_type=args.score_type,
         modality_aware=args.modality_aware,
     )
 
@@ -481,10 +515,8 @@ def run_collection(args) -> None:
         f"{sum(layer_to_num_experts.values())} experts total."
     )
 
-    if args.score_type == "weight":
-        collect_weight_scores(model, config, accumulator)
-        save_score_artifacts(args.output_dir, accumulator, args)
-        return
+    collect_weight_scores(model, config, accumulator)
+    save_score_artifacts(args.output_dir, accumulator, args)
 
     dataset = build_dataset(args.dataset, bundle.family)
     pool = list(range(args.start_idx, len(dataset)))
@@ -528,13 +560,15 @@ def run_collection(args) -> None:
             dataset_name=args.dataset,
             saliency_ema=args.ema,
             loss_fn="rel_l2",
-            second_order_mode="exact",
+            second_order_mode="exact",  # default second-order mode is exact
             dtype=block_dtype,
             verbose=True,
         )
         accumulator.layerwise_loss[layer_idx] = float(layer_loss)
         accumulator.absorb_layer_scores(layer_idx, copied_block)
-        print(f"[channel_scoring] Layer {layer_idx}: mean block loss={layer_loss:.6f}")
+        save_score_artifacts(args.output_dir, accumulator, args)
+        print(f"[channel_scoring] Layer {layer_idx}: layer loss={layer_loss:.6f}. "
+              f"Have saved to {args.output_dir}/scores.pt")
 
     save_score_artifacts(args.output_dir, accumulator, args)
 

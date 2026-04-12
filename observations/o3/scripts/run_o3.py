@@ -33,7 +33,7 @@ def main():
 
     ensure_dir(args.output_dir)
     raw_stats_path = args.raw_stats_path or os.path.join(args.output_dir, "raw_stats.pt")
-    if os.path.exists(raw_stats_path) and not args.force_recompute:
+    if os.path.exists(raw_stats_path) and not args.force:
         print(f"[O3] 检测到已有缓存，直接加载统计结果: {raw_stats_path}")
         raw_stats = torch.load(raw_stats_path, weights_only=False)
     else:

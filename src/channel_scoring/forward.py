@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from observations.common import move_inputs_to_model_device, prepare_inputs
 from src.base.shared_utils import angle_loss
-from src.channel_scoring.collector import collect_scores_attn_mlp
+from src.channel_scoring.collector import collect_scores_from_moe_module
 
 __all__ = [
     "block_forward",
@@ -51,13 +51,13 @@ def _enable_input_grads(obj: Any):
     return obj
 
 
-def _unwrap_output(output):
+def unwrap_output(output):
     return output[0] if isinstance(output, (tuple, list)) else output
 
 
 def _clear_block_saved_tensors(block: nn.Module) -> None:
     for expert in _iter_experts(block.mlp):
-        for attr in ("saved_text_mask", "saved_visual_mask"):
+        for attr in ("saved_text_mask", "saved_visual_mask", "saved_router_weights"):
             setattr(expert, attr, None)
         for proj_name in ("down_proj", "up_proj", "gate_proj"):
             proj = getattr(expert, proj_name, None)
@@ -94,7 +94,7 @@ def _register_tensor_hooks(module: nn.Module) -> List[Any]:
             mod.saved_output = None
             mod.saved_grad_out = None
             return
-        out = _unwrap_output(output)
+        out = unwrap_output(output)
         if not isinstance(out, torch.Tensor):
             mod.saved_output = None
             mod.saved_grad_out = None
@@ -127,7 +127,7 @@ def _register_copied_block_hooks(block: nn.Module) -> List[Any]:
     return handles
 
 
-def _compute_block_loss(
+def compute_block_loss(
     pred: torch.Tensor,
     teacher_target: torch.Tensor,
     attn_mask: torch.Tensor,
@@ -193,6 +193,7 @@ def _patch_grad_enabled_kimi_moe_infer(block: nn.Module, layer_idx: int):
         for expert in self.experts:
             expert.saved_text_mask = None
             expert.saved_visual_mask = None
+            expert.saved_router_weights = None
 
         if skip_expert_idx is not None:
             if batch_idx is not None:
@@ -219,6 +220,7 @@ def _patch_grad_enabled_kimi_moe_infer(block: nn.Module, layer_idx: int):
 
         idxs = topk_ids.view(-1).argsort()
         flat_token_idx = idxs // topk_ids.shape[1]
+        flat_routing_weight = topk_weight.reshape(-1)[idxs]
         sorted_tokens = x[flat_token_idx]
         sorted_text_mask = text_mask[flat_token_idx]
         sorted_visual_mask = visual_mask[flat_token_idx]
@@ -241,6 +243,7 @@ def _patch_grad_enabled_kimi_moe_infer(block: nn.Module, layer_idx: int):
             expert = self.experts[i + self.ep_rank * self.experts_per_rank]
             expert.saved_text_mask = sorted_text_mask[start_idx:end_idx]
             expert.saved_visual_mask = sorted_visual_mask[start_idx:end_idx]
+            expert.saved_router_weights = flat_routing_weight[start_idx:end_idx]
             outputs.append(expert(tokens_for_this_expert))
             called_experts += 1
             start_idx = end_idx
@@ -313,7 +316,7 @@ def block_forward(
     total_batches = 0
     device_type = block_device.type
     autocast_enabled = device_type == "cuda" and dtype in (torch.float16, torch.bfloat16)
-    debug_routing = os.environ.get("MODES_DEBUG_ROUTING", "0") == "1"
+    # debug_routing = os.environ.get("MODES_DEBUG_ROUTING", "0") == "1"
 
     try:
         iterator = tqdm(dataloader, desc=f"Calibrating L{layer_idx}", disable=not verbose, leave=False)
@@ -327,6 +330,7 @@ def block_forward(
             # Ensure copied-block moe_infer can access per-token modality masks.
             # Unlike full-model forward, block-only calibration does not automatically
             # refresh these fields on the copied block.
+            # 构造 block 级别的 modality mask（用于 channel 二阶计算）
             if input_ids is not None and hasattr(cnt_block, "mlp"):
                 special_ids = getattr(model, "special_token_id_tensor", None)
                 media_token_id = getattr(model.config, "media_placeholder_token_id", None)
@@ -349,13 +353,13 @@ def block_forward(
             in_kwargs = _enable_input_grads(
                 _move_to_device_dtype(teacher_state["in_kwargs"], block_device, dtype)
             )
-            teacher_target = _unwrap_output(teacher_state["output"])
+            teacher_target = unwrap_output(teacher_state["output"])
             teacher_target = _move_to_device_dtype(teacher_target, block_device, dtype)
 
             cnt_block.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device_type, dtype=dtype, enabled=autocast_enabled):
-                pred = _unwrap_output(cnt_block(*in_args, **in_kwargs))
-                loss_sum, rel_l2_inv_base_mean = _compute_block_loss(
+                pred = unwrap_output(cnt_block(*in_args, **in_kwargs))
+                loss_sum, rel_l2_inv_base_mean = compute_block_loss(
                     pred=pred,
                     teacher_target=teacher_target,
                     attn_mask=attn_mask,
@@ -365,7 +369,7 @@ def block_forward(
             total_loss += float(loss_sum.detach().float().item())
             total_batches += 1
 
-            collect_scores_attn_mlp(
+            collect_scores_from_moe_module(
                 cnt_block,
                 ema=saliency_ema,
                 _kwargs={
@@ -384,25 +388,27 @@ def block_forward(
                     "autocast_device_type": device_type,
                     "layer_idx": layer_idx,
                     "debug_batch_idx": total_batches - 1,
+                    "moe_text_mask": moe_text_mask.view_as(attn_mask),
+                    "moe_media_mask": moe_media_mask.view_as(attn_mask),
                 },
             )
-            if debug_routing and total_batches <= 1:
-                experts = _iter_experts(cnt_block.mlp)
-                hook_hits = sum(
-                    1
-                    for expert in experts
-                    if getattr(expert.down_proj, "saved_input", None) is not None
-                )
-                gateup_hits = 0
-                for expert in experts:
-                    gateup = getattr(expert, "gateup_act", None)
-                    if isinstance(gateup, torch.Tensor) and float(gateup.abs().sum().item()) > 0:
-                        gateup_hits += 1
-                print(
-                    f"[routing-debug] L{layer_idx} post_collect hook_hits={hook_hits}/{len(experts)} "
-                    f"gateup_hits={gateup_hits}/{len(experts)}",
-                    flush=True,
-                )
+            # if debug_routing and total_batches <= 1:
+            #     experts = _iter_experts(cnt_block.mlp)
+            #     hook_hits = sum(
+            #         1
+            #         for expert in experts
+            #         if getattr(expert.down_proj, "saved_input", None) is not None
+            #     )
+            #     gateup_hits = 0
+            #     for expert in experts:
+            #         gateup = getattr(expert, "gateup_act", None)
+            #         if isinstance(gateup, torch.Tensor) and float(gateup.abs().sum().item()) > 0:
+            #             gateup_hits += 1
+            #     print(
+            #         f"[routing-debug] L{layer_idx} post_collect hook_hits={hook_hits}/{len(experts)} "
+            #         f"gateup_hits={gateup_hits}/{len(experts)}",
+            #         flush=True,
+            #     )
             _clear_block_saved_tensors(cnt_block)
     finally:
         teacher_handle.remove()

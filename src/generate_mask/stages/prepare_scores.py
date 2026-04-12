@@ -47,6 +47,14 @@ def _load_legacy_payload(path: str, device: str):
             )
             for lid in sorted(payload["expert_usage"].keys())
         }
+    if payload.get("expert_router") is not None:
+        gate_scores["router"] = {
+            lid: torch.tensor(
+                [payload["expert_router"][lid][eid] for eid in sorted(payload["expert_router"][lid].keys())],
+                dtype=torch.float32,
+            )
+            for lid in sorted(payload["expert_router"].keys())
+        }
     metadata = {
         "modality_aware": bool(payload.get("modality_aware", False)),
         "layers": sorted(payload["scores"].keys()),
@@ -166,17 +174,30 @@ def load_attention_head_scores(scores_dir: str, verbose: bool = True):
     return None
 
 
-def load_modality_channel_scores(scores_dir: str, device: str = "cpu"):
+def load_modality_channel_scores(
+    scores_dir: str,
+    device: str = "cpu",
+    intra_expert_metric: str = "activation",
+):
     expert_scores, _, aux, payload = load_channel_scores(scores_dir, device=device, verbose=False)
     gate_scores = aux.get("gate_scores", {})
-    text_scores = expert_scores.get("activation_text", None)
-    visual_scores = expert_scores.get("activation_visual", None)
-    if text_scores is None or visual_scores is None:
-        if payload is not None and payload.get("modality_channel_scores") is not None:
-            text_scores = _nested_scores_to_layer_tensors(payload["modality_channel_scores"]["text"])
-            visual_scores = _nested_scores_to_layer_tensors(payload["modality_channel_scores"]["visual"])
-        else:
-            raise ValueError(f"modality-split scores are required, but not found in {scores_dir}")
+    if intra_expert_metric == "second_order":
+        text_scores = expert_scores.get("channel_second_order_text", None)
+        visual_scores = expert_scores.get("channel_second_order_visual", None)
+        if text_scores is None or visual_scores is None:
+            raise ValueError(
+                "Requested modality-aware second_order masks, but "
+                "`channel_second_order_text/visual` were not found in scores payload."
+            )
+    else:
+        text_scores = expert_scores.get("activation_text", None)
+        visual_scores = expert_scores.get("activation_visual", None)
+        if text_scores is None or visual_scores is None:
+            if payload is not None and payload.get("modality_channel_scores") is not None:
+                text_scores = _nested_scores_to_layer_tensors(payload["modality_channel_scores"]["text"])
+                visual_scores = _nested_scores_to_layer_tensors(payload["modality_channel_scores"]["visual"])
+            else:
+                raise ValueError(f"modality-split scores are required, but not found in {scores_dir}")
 
     ema_nested = payload.get("ema_matrix") if payload is not None else None
     if ema_nested is None:
@@ -216,36 +237,80 @@ def prepare_scores(
     expert_scores, _, aux, _ = load_channel_scores(scores_dir, device, verbose)
     gate_scores = aux["gate_scores"]
 
+    ####################################
+    # source of channel ranking score  # 
+    ####################################
+    
     intra_expert_metric = mask_method_kwargs.get("intra_expert_metric", "activation")
-    if intra_expert_metric not in expert_scores:
-        raise KeyError(
-            f"Requested intra_expert_metric={intra_expert_metric}, "
-            f"available={sorted(expert_scores.keys())}"
-        )
-
-    intermediate_scores = dict_to_tensor(expert_scores[intra_expert_metric]).to(device=device, dtype=torch.float32)
+    if intra_expert_metric == "second_order":
+        text_scores = expert_scores.get("channel_second_order_text")
+        visual_scores = expert_scores.get("channel_second_order_visual")
+        if text_scores is None or visual_scores is None:
+            raise KeyError(
+                "Requested intra_expert_metric=second_order, but "
+                "`channel_second_order_text/visual` are missing from scores payload."
+            )
+        intermediate_scores = (
+            dict_to_tensor(text_scores).to(device=device, dtype=torch.float32)
+            + dict_to_tensor(visual_scores).to(device=device, dtype=torch.float32)
+        ) / 2.0
+        
+        _print("[prepare_scores] intermediate_scores is mean of text and visual scores")
+    else:
+        if intra_expert_metric not in expert_scores:
+            raise KeyError(
+                f"Requested intra_expert_metric={intra_expert_metric}, "
+                f"available={sorted(expert_scores.keys())}"
+            )
+        intermediate_scores = dict_to_tensor(expert_scores[intra_expert_metric]).to(device=device, dtype=torch.float32)
     L, E, I = intermediate_scores.shape
 
+    ####################################
+    # source of expert-level scores    # 
+    ####################################
+    
     intra_layer_method = mask_method_kwargs.get("intra_layer_method", "uniform")
-    if intra_layer_method in ("attr_coverage", "loss_coverage"):
-        if "expert_out_token_contrib" not in expert_scores:
-            raise KeyError("expert_out_token_contrib is required for attr_coverage.")
-        expertwise_scores = dict_to_tensor(expert_scores["expert_out_token_contrib"]).to(device=device, dtype=torch.float32)
-    elif "usage" in intra_layer_method:
-        if "usage" not in gate_scores:
-            raise KeyError("gate_scores['usage'] is required for usage-based planning.")
-        expertwise_scores = dict_to_tensor(gate_scores["usage"]).to(device=device, dtype=torch.float32)
-    else:
+    # A. 根据 expert 输出来分配 expert budget
+    expert_metric_by_method = {
+        "attr_coverage": "first_attr_usage",
+        "second_attr_coverage": "second_exact_attr",
+        "true_ablate": "true_ablate",
+        "true_ablate_coverage": "true_ablate",
+    }
+    # B. 根据 gate 输出来分配 expert budget
+    gate_metric_by_method = {
+        "usage": "usage",
+        "usage_coverage": "usage",
+        "router": "router",
+        "router_coverage": "router",
+    }
+    if intra_layer_method in expert_metric_by_method:
+        metric_name = expert_metric_by_method[intra_layer_method]
+        if metric_name not in expert_scores:
+            raise KeyError(
+                f"{metric_name} is required for intra_layer_method={intra_layer_method}."
+            )
+        expertwise_scores = dict_to_tensor(expert_scores[metric_name]).to(
+            device=device, dtype=torch.float32
+        )
+    elif intra_layer_method in gate_metric_by_method:
+        metric_name = gate_metric_by_method[intra_layer_method]
+        if metric_name not in gate_scores:
+            raise KeyError(
+                f"gate_scores['{metric_name}'] is required for intra_layer_method={intra_layer_method}."
+            )
+        expertwise_scores = dict_to_tensor(gate_scores[metric_name]).to(device=device, dtype=torch.float32)
+    elif intra_layer_method == "uniform":
         expertwise_scores = torch.ones((L, E), dtype=torch.float32, device=device)
+    else:
+        raise ValueError(f"Invalid intra_layer_method: {intra_layer_method}")
 
     inter_layer_method = mask_method_kwargs.get("inter_layer_method", "uniform")
     loss_based_kwargs = load_layerwise_loss(scores_dir, inter_layer_method, smooth_fn, device, verbose)
     loss_based_kwargs["inter_layer_method"] = inter_layer_method
     layers = aux["metadata"].get("layers")
-    if layers is None:
-        layers = list(range(L))
+    if layers is None: layers = list(range(L))
     
-
     return (
         intermediate_scores,
         expertwise_scores,

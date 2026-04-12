@@ -16,11 +16,12 @@ def _pick_topk(available_scores: torch.Tensor, available_idx: torch.Tensor, k: i
 def build_modality_budget_masks(
     text_scores: torch.Tensor,
     visual_scores: torch.Tensor,
-    expertwise_scores: torch.Tensor,
+    expertwise_scores: torch.Tensor | None,
     layerwise_keep_plan: torch.Tensor,
     intra_layer_method: str,
     ema_matrix: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    
     def _tentative(scores: torch.Tensor) -> torch.Tensor:
         if expertwise_scores is not None:
             weighted = torch.zeros_like(scores)
@@ -40,7 +41,8 @@ def build_modality_budget_masks(
             verbose=False,
         )
         return masks_float.bool()
-
+    
+    # 计算文本和视觉各自的 tentative masks
     text_tentative = _tentative(text_scores)
     visual_tentative = _tentative(visual_scores)
 
@@ -60,13 +62,14 @@ def build_modality_budget_masks(
             visual_only_mask = visual_mask & (~text_mask)
             shared_masks[lid, eid] = shared_mask
 
+            # chosen channel ids for shared mask
             chosen: Set[int] = set(torch.nonzero(shared_mask, as_tuple=False).flatten().tolist())
 
             if ema_matrix is None:
                 norm_vis_ema = 0.5
             else:
                 affinity = float(ema_matrix[lid, eid].item())
-                affinity = max(-1.0, min(1.0, affinity))
+                assert affinity >= -1.0 and affinity <= 1.0, f"affinity should be in [-1.0, 1.0], but got {affinity}"
                 norm_vis_ema = (affinity + 1.0) / 2.0
             norm_text_ema = 1.0 - norm_vis_ema
 

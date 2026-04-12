@@ -1,0 +1,489 @@
+import os
+
+import torch
+import torch.nn as nn
+
+from .utils import *
+from .second_order_fn import *
+
+
+
+def _compute_intermediate_metric_bundle(
+    activation_owner: nn.Module,
+    W_down: torch.Tensor,
+    W_up: torch.Tensor,
+    W_gate: torch.Tensor,
+    *,
+    W_down_grad: torch.Tensor = None,
+    W_up_grad: torch.Tensor = None,
+    W_gate_grad: torch.Tensor = None,
+    down_input: torch.Tensor = None,
+    down_output: torch.Tensor = None,
+    down_grad: torch.Tensor = None,
+    down_out_grad: torch.Tensor = None,
+    up_input: torch.Tensor = None,
+    up_output: torch.Tensor = None,
+    up_in_grad: torch.Tensor = None,
+    up_out_grad: torch.Tensor = None,
+    gate_input: torch.Tensor = None,
+    gate_output: torch.Tensor = None,
+    gate_in_grad: torch.Tensor = None,
+    gate_grad: torch.Tensor = None,
+    text_mask: torch.Tensor = None,
+    visual_mask: torch.Tensor = None,
+    router_weights: torch.Tensor = None,
+    attn_mask: torch.Tensor = None,
+):
+    metrics = {
+        "weight": (
+            weight_rms(W_down, channel_dim=1)
+            + weight_rms(W_up, channel_dim=0)
+            + weight_rms(W_gate, channel_dim=0)
+        ).to(torch.float32)
+        / 3.0
+    }
+
+    if W_down_grad is not None and W_up_grad is not None and W_gate_grad is not None:
+        metrics["wg"] = compute_wg_I(
+            W_down=W_down,
+            W_up=W_up,
+            W_gate=W_gate,
+            W_down_grad=W_down_grad,
+            W_up_grad=W_up_grad,
+            W_gate_grad=W_gate_grad,
+        ).to(torch.float32)
+
+    if down_grad is not None and up_out_grad is not None and gate_grad is not None:
+        grad_I, down_grad_ch, up_out_grad_ch, gate_grad_ch = compute_grad_I(
+            down_grad, up_out_grad, gate_grad
+        )
+        metrics["grad"] = grad_I.to(torch.float32)
+    else:
+        down_grad_ch = None
+        up_out_grad_ch = None
+        gate_grad_ch = None
+
+    if down_input is None or up_output is None or gate_output is None:
+        return metrics
+
+    gateup_act = compute_gateup_act(activation_owner, gate_output, up_output)
+    if gateup_act is not None:
+        metrics["gateup_act"] = gateup_act.to(torch.float32)
+
+    text_act = compute_gateup_act(
+        activation_owner, gate_output, up_output, token_mask=text_mask
+    )
+    if text_act is not None:
+        metrics["activation_text"] = text_act.to(torch.float32)
+
+    visual_act = compute_gateup_act(
+        activation_owner, gate_output, up_output, token_mask=visual_mask
+    )
+    if visual_act is not None:
+        metrics["activation_visual"] = visual_act.to(torch.float32)
+
+    act_mean, _ = compute_activation_I(down_input, up_output, gate_output)
+    metrics["activation"] = act_mean.to(torch.float32)
+
+    if (
+        down_grad_ch is not None
+        and up_out_grad_ch is not None
+        and gate_grad_ch is not None
+    ):
+        saliency_I = compute_saliency_I(
+            down_input,
+            down_grad_ch,
+            up_output,
+            up_out_grad_ch,
+            gate_output,
+            gate_grad_ch,
+        )
+        metrics["saliency"] = saliency_I.to(torch.float32)
+
+    if down_output is None or attn_mask is None:
+        return metrics
+
+    total_tokens = float(attn_mask.sum().item())
+    usage = float(down_output.shape[0]) / max(total_tokens, 1.0)
+    metrics["usage"] = usage
+    if router_weights is not None:
+        metrics["router"] = float(router_weights.detach().float().sum().item()) / max(total_tokens, 1.0)
+    metrics["usage_text"] = (
+        float(text_mask.sum().item()) if isinstance(text_mask, torch.Tensor) else 0.0
+    )
+    metrics["usage_visual"] = (
+        float(visual_mask.sum().item()) if isinstance(visual_mask, torch.Tensor) else 0.0
+    )
+    if down_out_grad is not None:
+        first_attr_usage = token_contrib(down_out_grad, down_output).sum() * usage
+        metrics["first_attr_usage"] = float(first_attr_usage.item())
+
+    return metrics
+
+
+def _get_saved_tensors(experts=None, expert_idx=None, is_fused=False, expert=None, 
+                       down_proj_t=None, up_proj=None, gate_proj=None, down_grad_t=None, 
+                       up_grad_w=None, gate_grad_w=None):
+    if is_fused:
+        activation_owner = experts
+        down_input = get_fused_saved_tensor(experts, "saved_down_input", expert_idx)
+        down_output = get_fused_saved_tensor(experts, "saved_down_output", expert_idx)
+        down_grad = get_fused_saved_tensor(experts, "saved_down_grad", expert_idx)
+        down_out_grad = get_fused_saved_tensor(experts, "saved_down_out_grad", expert_idx)
+        up_input = get_fused_saved_tensor(experts, "saved_up_input", expert_idx)
+        up_output = get_fused_saved_tensor(experts, "saved_up_output", expert_idx)
+        up_in_grad = get_fused_saved_tensor(experts, "saved_up_in_grad", expert_idx)
+        up_out_grad = get_fused_saved_tensor(experts, "saved_up_out_grad", expert_idx)
+        gate_input = get_fused_saved_tensor(experts, "saved_gate_input", expert_idx)
+        gate_output = get_fused_saved_tensor(experts, "saved_gate_output", expert_idx)
+        gate_in_grad = get_fused_saved_tensor(experts, "saved_gate_in_grad", expert_idx)
+        gate_grad = get_fused_saved_tensor(experts, "saved_gate_grad", expert_idx)
+        text_mask = get_fused_saved_tensor(experts, "saved_text_mask", expert_idx)
+        visual_mask = get_fused_saved_tensor(experts, "saved_visual_mask", expert_idx)
+        router_weights = get_fused_saved_tensor(experts, "saved_router_weights", expert_idx)
+
+        W_down = down_proj_t[expert_idx]
+        W_up = up_proj[expert_idx]
+        W_gate = gate_proj[expert_idx]
+        W_down_grad = None if down_grad_t is None else down_grad_t[expert_idx]
+        W_up_grad = None if up_grad_w is None else up_grad_w[expert_idx]
+        W_gate_grad = None if gate_grad_w is None else gate_grad_w[expert_idx]
+    else:
+        activation_owner = expert
+        # 取出并清空 hook 保存的张量
+        down_input    = getattr(expert.down_proj, "saved_input", None)
+        down_output   = getattr(expert.down_proj, "saved_output", None)
+        down_grad     = getattr(expert.down_proj, "saved_grad_in", None)
+        down_out_grad = getattr(expert.down_proj, "saved_grad_out", None)
+        expert.down_proj.saved_input    = None
+        expert.down_proj.saved_output   = None
+        expert.down_proj.saved_grad_in  = None
+        expert.down_proj.saved_grad_out = None
+
+        up_input    = getattr(expert.up_proj, "saved_input", None)
+        up_output   = getattr(expert.up_proj, "saved_output", None)
+        up_in_grad  = getattr(expert.up_proj, "saved_grad_in", None)
+        up_out_grad = getattr(expert.up_proj, "saved_grad_out", None)
+        expert.up_proj.saved_input    = None
+        expert.up_proj.saved_output   = None
+        expert.up_proj.saved_grad_in  = None
+        expert.up_proj.saved_grad_out = None
+
+        gate_input      = getattr(expert.gate_proj, "saved_input", None)
+        gate_output     = getattr(expert.gate_proj, "saved_output", None)
+        gate_in_grad    = getattr(expert.gate_proj, "saved_grad_in", None)
+        gate_grad       = getattr(expert.gate_proj, "saved_grad_out", None)
+        expert.gate_proj.saved_input    = None
+        expert.gate_proj.saved_output   = None
+        expert.gate_proj.saved_grad_in  = None
+        expert.gate_proj.saved_grad_out = None
+        text_mask = getattr(expert, "saved_text_mask", None)
+        visual_mask = getattr(expert, "saved_visual_mask", None)
+        router_weights = getattr(expert, "saved_router_weights", None)
+        expert.saved_text_mask = None
+        expert.saved_visual_mask = None
+        expert.saved_router_weights = None
+
+        W_down, W_up, W_gate = expert.down_proj.weight, expert.up_proj.weight, expert.gate_proj.weight
+        W_down_grad = W_down.grad
+        W_up_grad = W_up.grad
+        W_gate_grad = W_gate.grad
+    
+    return activation_owner, down_input, down_output, down_grad, \
+        down_out_grad, up_input, up_output, up_in_grad, up_out_grad, \
+        gate_input, gate_output, gate_in_grad, gate_grad, text_mask, \
+        visual_mask, router_weights, W_down, W_up, W_gate, W_down_grad, W_up_grad, W_gate_grad
+
+
+
+def _clear_fused_saved_tensors(experts: nn.Module) -> None:
+    for name in (
+        "saved_down_input",
+        "saved_down_output",
+        "saved_down_grad",
+        "saved_down_out_grad",
+        "saved_up_input",
+        "saved_up_output",
+        "saved_up_in_grad",
+        "saved_up_out_grad",
+        "saved_gate_input",
+        "saved_gate_output",
+        "saved_gate_in_grad",
+        "saved_gate_grad",
+        "saved_text_mask",
+        "saved_visual_mask",
+        "saved_router_weights",
+    ):
+        if hasattr(experts, name):
+            setattr(experts, name, None)
+
+
+def loop_1_collect_intermediate_scores(
+    expert_iter,
+    *,
+    experts,
+    is_fused: bool,
+    down_proj_t,
+    up_proj,
+    gate_proj,
+    down_grad_t,
+    up_grad_w,
+    gate_grad_w,
+    fused_metric_stacks: dict,
+    ema: float,
+    _kwargs: dict = None,
+):
+    debug_down_input_hits = 0
+    debug_gateup_hits = 0
+    debug_total_experts = 0
+    expert_records = []
+
+    for expert_idx, expert in enumerate(expert_iter):
+        debug_total_experts += 1
+
+        activation_owner, down_input, down_output, down_grad, \
+        down_out_grad, up_input, up_output, up_in_grad, up_out_grad, \
+        gate_input, gate_output, gate_in_grad, gate_grad, text_mask, \
+        visual_mask, router_weights, W_down, W_up, W_gate, W_down_grad, \
+        W_up_grad, W_gate_grad = _get_saved_tensors(
+            experts=experts, expert_idx=expert_idx, is_fused=is_fused, expert=expert,
+            down_proj_t=down_proj_t, up_proj=up_proj, gate_proj=gate_proj, down_grad_t=down_grad_t,
+            up_grad_w=up_grad_w, gate_grad_w=gate_grad_w
+        )
+
+        with torch.no_grad():
+            metrics = _compute_intermediate_metric_bundle(
+                activation_owner=activation_owner,
+                W_down=W_down,
+                W_up=W_up,
+                W_gate=W_gate,
+                W_down_grad=W_down_grad,
+                W_up_grad=W_up_grad,
+                W_gate_grad=W_gate_grad,
+                down_input=down_input,
+                down_output=down_output,
+                down_grad=down_grad,
+                down_out_grad=down_out_grad,
+                up_input=up_input,
+                up_output=up_output,
+                up_in_grad=up_in_grad,
+                up_out_grad=up_out_grad,
+                gate_input=gate_input,
+                gate_output=gate_output,
+                gate_in_grad=gate_in_grad,
+                gate_grad=gate_grad,
+                text_mask=text_mask,
+                visual_mask=visual_mask,
+                router_weights=router_weights,
+                attn_mask=None if _kwargs is None else _kwargs.get("attn_mask", None),
+            )
+
+            gateup_act = metrics.get("gateup_act", None)
+            if down_input is not None:
+                debug_down_input_hits += 1
+            if isinstance(gateup_act, torch.Tensor) and float(gateup_act.abs().sum().item()) > 0:
+                debug_gateup_hits += 1
+
+            if is_fused:
+                for key, value in metrics.items():
+                    if isinstance(value, torch.Tensor):
+                        stacked_value = value.to(torch.float32)
+                    else:
+                        stacked_value = torch.tensor(
+                            float(value), dtype=torch.float32, device=experts.gate_up_proj.device
+                        )
+                    fused_metric_stacks.setdefault(key, []).append(stacked_value)
+            else:
+                for key, value in metrics.items():
+                    if key in ("usage_text", "usage_visual"):
+                        current = float(getattr(expert, key, 0.0))
+                        setattr(expert, key, current + float(value))
+                    else:
+                        safe_add_with_ema(expert, ema, value, key)
+
+            expert_records.append(
+                {
+                    "expert_idx": expert_idx,
+                    "expert": expert,
+                    "has_activation": down_input is not None,
+                    "num_channels": int(W_up.shape[0]),
+                }
+            )
+
+    return expert_records, debug_down_input_hits, debug_gateup_hits, debug_total_experts
+
+
+def loop_2_collect_second_order_scores(
+    expert_records,
+    *,
+    cnt_block,
+    experts,
+    is_fused: bool,
+    fused_metric_stacks: dict,
+    ema: float,
+    _kwargs: dict = None,
+):
+    moe_text_mask = None if _kwargs is None else _kwargs.get("moe_text_mask", None)
+    moe_media_mask = None if _kwargs is None else _kwargs.get("moe_media_mask", None)
+
+    for record in expert_records:
+        if not record["has_activation"]:
+            if is_fused:
+                num_channels = record["num_channels"]
+                device = experts.gate_up_proj.device
+                if moe_text_mask is not None:
+                    fused_metric_stacks.setdefault("channel_second_order_text", []).append(
+                        torch.zeros(num_channels, dtype=torch.float32, device=device)
+                    )
+                if moe_media_mask is not None:
+                    fused_metric_stacks.setdefault("channel_second_order_visual", []).append(
+                        torch.zeros(num_channels, dtype=torch.float32, device=device)
+                    )
+                fused_metric_stacks.setdefault("second_exact_attr", []).append(
+                    torch.zeros((), dtype=torch.float32, device=device)
+                )
+            continue
+
+        expert_idx = record["expert_idx"]
+        expert = record["expert"]
+        expert_proxy = make_fused_expert_proxy(experts, expert_idx) if is_fused else expert
+
+        if moe_text_mask is not None:
+            ch_text = compute_channel_second_order(
+                cnt_block=cnt_block,
+                expert=expert_proxy,
+                _kwargs=_kwargs,
+                modality_mask=moe_text_mask,
+            )
+            if ch_text is not None:
+                if is_fused:
+                    fused_metric_stacks.setdefault("channel_second_order_text", []).append(
+                        ch_text.detach().to(torch.float32)
+                    )
+                else:
+                    safe_add_with_ema(expert, ema, ch_text, "channel_second_order_text")
+
+        if moe_media_mask is not None:
+            ch_visual = compute_channel_second_order(
+                cnt_block=cnt_block,
+                expert=expert_proxy,
+                _kwargs=_kwargs,
+                modality_mask=moe_media_mask,
+            )
+            if ch_visual is not None:
+                if is_fused:
+                    fused_metric_stacks.setdefault("channel_second_order_visual", []).append(
+                        ch_visual.detach().to(torch.float32)
+                    )
+                else:
+                    safe_add_with_ema(expert, ema, ch_visual, "channel_second_order_visual")
+
+        second_exact_attr = compute_expert_second_order(
+            cnt_block=cnt_block,
+            expert=expert_proxy,
+            _kwargs=_kwargs,
+        )
+        if second_exact_attr is not None:
+            if is_fused:
+                fused_metric_stacks.setdefault("second_exact_attr", []).append(
+                    second_exact_attr.detach().to(torch.float32)
+                )
+            else:
+                safe_add_with_ema(expert, ema, second_exact_attr, "second_exact_attr")
+
+        # true_ablate = compute_true_ablate_attr(
+        #     cnt_block=cnt_block,
+        #     expert=expert_proxy,
+        #     _kwargs=_kwargs,
+        # )
+        # if true_ablate is not None:
+        #     if is_fused:
+        #         fused_metric_stacks.setdefault("true_ablate", []).append(
+        #             true_ablate.detach().to(torch.float32)
+        #         )
+        #     else:
+        #         safe_add_with_ema(expert, ema, true_ablate, "true_ablate")
+
+
+def collect_scores_from_moe_module(cnt_block, 
+                            ema: float = 0.9, 
+                            _kwargs: dict = None) -> None:
+    debug_routing = os.environ.get("MODES_DEBUG_ROUTING", "0") == "1"
+    experts = getattr(cnt_block.mlp, "experts", None)
+    is_fused = is_fused_expert_container(experts)
+    fused_metric_stacks = {}
+    if is_fused:
+        gate_up_proj = experts.gate_up_proj
+        down_proj = experts.down_proj
+
+        e, _, doubled_intermediate = gate_up_proj.shape
+        intermediate_size = doubled_intermediate // 2
+
+        gate_up_proj_t = gate_up_proj.detach().transpose(1, 2)  # [E, 2I, H]
+        gate_proj = gate_up_proj_t[:, :intermediate_size, :]
+        up_proj = gate_up_proj_t[:, intermediate_size:, :]
+        down_proj_t = down_proj.detach().transpose(1, 2)  # [E, H, I]
+
+        gate_up_grad = gate_up_proj.grad
+        down_proj_grad = down_proj.grad
+        if gate_up_grad is not None:
+            gate_up_grad_t = gate_up_grad.detach().transpose(1, 2)
+            gate_grad_w = gate_up_grad_t[:, :intermediate_size, :]
+            up_grad_w = gate_up_grad_t[:, intermediate_size:, :]
+        else:
+            gate_grad_w = None
+            up_grad_w = None
+        down_grad_t = (
+            down_proj_grad.detach().transpose(1, 2) if down_proj_grad is not None else None
+        )
+        expert_iter = range(e)
+    else:
+        expert_iter = cnt_block.mlp.experts
+        down_proj_t = None
+        up_proj = None
+        gate_proj = None
+        down_grad_t = None
+        up_grad_w = None
+        gate_grad_w = None
+
+    expert_records, debug_down_input_hits, debug_gateup_hits, debug_total_experts = (
+        loop_1_collect_intermediate_scores(
+            expert_iter,
+            experts=experts,
+            is_fused=is_fused,
+            down_proj_t=down_proj_t,
+            up_proj=up_proj,
+            gate_proj=gate_proj,
+            down_grad_t=down_grad_t,
+            up_grad_w=up_grad_w,
+            gate_grad_w=gate_grad_w,
+            fused_metric_stacks=fused_metric_stacks,
+            ema=ema,
+            _kwargs=_kwargs,
+        )
+    )
+
+    loop_2_collect_second_order_scores(
+        expert_records,
+        cnt_block=cnt_block,
+        experts=experts,
+        is_fused=is_fused,
+        fused_metric_stacks=fused_metric_stacks,
+        ema=ema,
+        _kwargs=_kwargs,
+    )
+
+    if is_fused:
+        for key, values in fused_metric_stacks.items():
+            if not values:
+                continue
+            stacked = torch.stack(values, dim=0)
+            if key in ("usage_text", "usage_visual"):
+                current = getattr(experts, key, None)
+                if current is None:
+                    setattr(experts, key, stacked)
+                else:
+                    setattr(experts, key, current + stacked)
+            else:
+                safe_add_with_ema(experts, ema, stacked, key)
+        _clear_fused_saved_tensors(experts)

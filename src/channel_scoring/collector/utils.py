@@ -1,5 +1,30 @@
 import torch
 import torch.nn as nn
+import contextlib
+import types
+from typing import Optional
+
+from src.base.shared_utils import angle_loss
+
+from .utils import *
+
+
+def is_fused_expert_container(experts: nn.Module) -> bool:
+    return (
+        experts is not None
+        and getattr(experts, "__class__", type(None)).__name__ == "Qwen3VLMoeTextExperts"
+        and hasattr(experts, "gate_up_proj")
+        and hasattr(experts, "down_proj")
+    )
+
+
+def get_fused_saved_tensor(experts: nn.Module, name: str, expert_idx: int):
+    value = getattr(experts, name, None)
+    if not isinstance(value, torch.Tensor):
+        return None
+    if value.ndim == 0 or value.shape[0] <= expert_idx:
+        return None
+    return value[expert_idx]
 
 
 def weight_rms(weight: torch.Tensor, channel_dim: int = 0) -> torch.Tensor:
@@ -95,6 +120,7 @@ def channel_saliency(act: torch.Tensor, grad: torch.Tensor) -> torch.Tensor:
     s = (act * grad).abs().detach()
     dims = tuple[int, ...](range(s.dim() - 1))  # 平均 batch, seq 维度
     return s.mean(dim=dims)    
+
 
 def safe_add_with_ema(target, ema, value, key=None):
     if isinstance(value, torch.Tensor):
@@ -310,3 +336,34 @@ def masked_mean_bs(x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
     denom = mask.sum().clamp_min(1.0)      # 标量，防止除零
     # 等价于在 B, S 上做 mean
     return x_masked.sum(dim=(0, 1)) / denom  # [H]
+
+
+def unwrap_output(output):
+    return output[0] if isinstance(output, (tuple, list)) else output
+
+
+def resolve_activation_fn(expert: nn.Module):
+    for attr in ("act_fn", "activation_fn"):
+        fn = getattr(expert, attr, None)
+        if fn is not None:
+            return fn
+    return torch.nn.functional.silu
+
+
+def compute_gateup_act(
+    expert: nn.Module,
+    gate_output: torch.Tensor,
+    up_output: torch.Tensor,
+    token_mask: torch.Tensor | None = None,
+):
+    if gate_output is None or up_output is None:
+        return None
+    activation = resolve_activation_fn(expert)(gate_output.detach()) * up_output.detach()
+    if token_mask is not None:
+        token_mask = token_mask.to(device=activation.device).view(-1).bool()
+        if token_mask.numel() != activation.shape[0] or not bool(token_mask.any()):
+            return None
+        activation = activation[token_mask]
+    dims = tuple(range(activation.dim() - 1))
+    return activation.abs().to(torch.float32).mean(dim=dims)
+

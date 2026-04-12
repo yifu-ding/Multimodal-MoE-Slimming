@@ -15,6 +15,8 @@ set -euo pipefail
 # Full run:
 #   CUDA_VISIBLE_DEVICES=0 NUM_SAMPLES=512 bash scripts/run_collect_scores.sh
 
+source scripts/select_least_used_gpu.sh # 自动选择显存使用量最少的 gpu
+
 PREFIX="${PREFIX:-$(pwd)}"
 export PYTHONPATH="${PREFIX}"
 
@@ -30,7 +32,8 @@ SUBSET_SEED="${SUBSET_SEED:-42}"
 SCORE_TYPE="${SCORE_TYPE:-activation}"
 EMA="${EMA:-0.9}"
 
-OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/kimi_gqa-modal2}"
+# OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/kimi_gqa-second_order}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/debug}"
 
 EXTRA_ARGS=("$@")
 
@@ -46,6 +49,8 @@ CMD=(
     --score_type         "${SCORE_TYPE}"
     --ema                "${EMA}"
 )
+
+# --force if you want to recompute the scores and overwrite the existing ones
 
 CMD+=("${EXTRA_ARGS[@]}")
 
