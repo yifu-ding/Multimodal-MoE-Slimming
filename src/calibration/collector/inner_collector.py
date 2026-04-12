@@ -147,12 +147,14 @@ def loop_1_channelwise_scores(
         metrics["usage"] = usage
         if router_weights is not None:
             metrics["router"] = float(router_weights.detach().float().sum().item()) / max(total_tokens, 1.0)
-        metrics["usage_text"] = (
-            float(text_mask.sum().item()) if isinstance(text_mask, torch.Tensor) else 0.0
-        )
-        metrics["usage_visual"] = (
-            float(visual_mask.sum().item()) if isinstance(visual_mask, torch.Tensor) else 0.0
-        )
+        t_count = float(text_mask.sum().item()) if isinstance(text_mask, torch.Tensor) else 0.0
+        v_count = float(visual_mask.sum().item()) if isinstance(visual_mask, torch.Tensor) else 0.0
+        metrics["usage_text"] = t_count
+        metrics["usage_visual"] = v_count
+        # ema_matrix 在外部计算过了，我感觉不用 ema 平滑来算
+        # Expert Modality Affinity: (visual - text) / (visual + text + eps), per batch, EMA-accumulated.
+        # +1 means visual-preferring, -1 means text-preferring, 0 means balanced.
+        # metrics["expert_modality_affinity"] = (v_count - t_count) / (v_count + t_count + 1e-8)
         if down_out_grad is not None:
             first_attr_usage = token_contrib(down_out_grad, down_output).sum() * usage
             metrics["first_attr_usage"] = float(first_attr_usage.item())

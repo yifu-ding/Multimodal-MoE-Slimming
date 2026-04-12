@@ -63,6 +63,7 @@ EXPERT_METRICS = (
     "usage_visual",
     "second_exact_attr",
     "true_ablate",
+    "expert_modality_affinity",
 )
 
 class ModalityActivationAccumulator:
@@ -220,37 +221,6 @@ class RichScoreAccumulator:
         self.gate_scores["usage_visual"] = _normalize_per_layer_counts(self.gate_scores["usage_visual"])
         if self.modality_scores is not None:
             self.modality_scores.finalize()
-
-    def build_legacy_payload(self, args) -> dict:
-        payload = {
-            "scores": _tensor_map_to_nested_dict(self.expert_scores["activation"]),
-            "counts": _scalar_map_to_nested_dict(
-                {layer_idx: hits.float() for layer_idx, hits in self.hit_counts.items()}
-            ),
-            "layer_to_num_experts": self.layer_to_num_experts,
-            "layer_to_num_channels": self.layer_to_num_channels,
-            "layers": self.layers,
-            "model_name_or_path": args.model_name_or_path,
-            "resolved_model_name_or_path": resolve_model_name_or_path(args.model_name_or_path),
-            "dataset": args.dataset,
-            "num_samples": args.num_samples,
-            "batch_size": args.batch_size,
-            "start_idx": args.start_idx,
-            "subset_seed": args.subset_seed,
-            "modality_aware": self.modality_aware,
-            "first_attr_usage": _scalar_map_to_nested_dict(
-                self.expert_scores["first_attr_usage"]
-            ),
-            "expert_usage": _scalar_map_to_nested_dict(self.gate_scores["usage"]),
-            "expert_router": _scalar_map_to_nested_dict(self.gate_scores["router"]),
-            "layerwise_loss": self.layerwise_loss,
-        }
-        if self.modality_scores is not None:
-            payload["modality_channel_scores"] = {
-                "text": _tensor_map_to_nested_dict(self.modality_scores.activation_text),
-                "visual": _tensor_map_to_nested_dict(self.modality_scores.activation_visual),
-            }
-        return payload
 
     def build_scores_payload(self, args) -> dict:
         expert_scores = {

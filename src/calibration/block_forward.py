@@ -364,7 +364,19 @@ def block_forward(
                     attn_mask=attn_mask,
                     loss_fn=loss_fn,
                 )
-            loss_sum.backward()
+
+            # For first-order gradient scores, backward through output-energy
+            # instead of reconstruction loss. Since cnt_block has identical
+            # weights to the teacher, reconstruction loss ≈ 0 and produces
+            # trivial gradients. Output-energy ||pred||² gives non-zero
+            # gradients reflecting each channel's contribution to the block
+            # output. This does NOT affect second-order scores (computed
+            # independently from saved activations, not from backward).
+            mask_flat = attn_mask.float().view(-1)
+            energy = pred.float().view(-1, pred.size(-1)).pow(2).sum(dim=-1)
+            energy_loss = (energy * mask_flat).sum()
+            energy_loss.backward()
+
             total_loss += float(loss_sum.detach().float().item())
             total_batches += 1
 
