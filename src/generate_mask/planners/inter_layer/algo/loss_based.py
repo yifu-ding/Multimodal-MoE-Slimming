@@ -30,7 +30,7 @@ def smooth_layerwise_loss_with_fn(
     if smooth_fn == "raw":
         return layerwise_loss.clone().float()
     if smooth_fn == "sqrt":
-        return smooth_layerwise_loss(layerwise_loss, smooth_times=smooth_times, power=0.5)
+        return smooth_layerwise_loss(layerwise_loss, smooth_times=smooth_times, power=0.25)
     if smooth_fn == "cbrt":
         return smooth_layerwise_loss(layerwise_loss, smooth_times=smooth_times, power=1.0 / 3.0)
     if smooth_fn == "fourth_root":

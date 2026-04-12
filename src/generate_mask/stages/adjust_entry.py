@@ -8,7 +8,7 @@ from src.base.shared_utils import _print
 def adjust_masks(scores, masks, K_E, L, E, I, align=0, min_per_expert=0, verbose=False, **kwargs):
     layers = list(range(L))
     D_layer = {lid: E * I for lid in layers}
-    adjust_method = kwargs.get("adjust_method", "largest_channel")
+    adjust_method = kwargs.get("adjust_method", "largest_score_sum")
     
     if align is not None and align > 0:
         if adjust_method == "largest_channel":

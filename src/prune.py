@@ -61,21 +61,95 @@ from transformers import modeling_utils as _modes_modeling_utils
 _MODES_ROUTED_WEIGHT_RE = _modes_re.compile(
     r"^(.*)\\.experts\\.(\\d+)\\.(gate_proj|up_proj|down_proj)\\.weight$"
 )
+_MODES_ROUTER_PARAM_RE = _modes_re.compile(
+    r"^(.*)\\.gate\\.(weight|e_score_correction_bias)$"
+)
 
 
-def _modes_resolve_experts_container(model, moe_path):
+def _modes_resolve_moe_module(model, moe_path):
     try:
         module = model.get_submodule(moe_path)
     except AttributeError:
         module, _ = _modes_modeling_utils.get_module_from_name(model, moe_path)
-    if hasattr(module, "experts"):
-        return module.experts
-    if hasattr(module, "mlp") and hasattr(module.mlp, "experts"):
-        return module.mlp.experts
+    if hasattr(module, "gate") and hasattr(module, "experts"):
+        return module
+    if hasattr(module, "mlp") and hasattr(module.mlp, "gate") and hasattr(module.mlp, "experts"):
+        return module.mlp
     raise AttributeError(
-        f"Could not resolve experts container from '{moe_path}' "
+        f"Could not resolve MoE module from '{moe_path}' "
         f"(got {type(module).__name__})."
     )
+
+
+def _modes_resolve_experts_container(model, moe_path):
+    return _modes_resolve_moe_module(model, moe_path).experts
+
+
+def _modes_fix_gate_layout(module, target_n_routed_experts):
+    gate = module.gate
+    target_n_routed_experts = int(target_n_routed_experts)
+    gate.n_routed_experts = target_n_routed_experts
+    if hasattr(module, "num_experts_per_tok"):
+        module.num_experts_per_tok = min(int(module.num_experts_per_tok), target_n_routed_experts)
+    if hasattr(gate, "top_k"):
+        gate.top_k = min(int(gate.top_k), target_n_routed_experts)
+    if hasattr(module, "experts_per_rank"):
+        module.experts_per_rank = len(module.experts)
+    if hasattr(gate, "experts_len"):
+        gate.experts_len = len(module.experts)
+    if getattr(gate, "topk_method", None) == "noaux_tc":
+        n_group = int(getattr(gate, "n_group", 1))
+        per_group = target_n_routed_experts // max(n_group, 1) if n_group > 0 else 0
+        topk_group = int(getattr(gate, "topk_group", 1))
+        if (
+            n_group <= 0
+            or target_n_routed_experts % n_group != 0
+            or per_group < 2
+            or topk_group > n_group
+        ):
+            gate.topk_method = "greedy"
+
+
+def _modes_maybe_resize_active_experts(model, param_name, tensor):
+    match = _MODES_ROUTER_PARAM_RE.match(param_name)
+    if match is None:
+        return
+
+    moe_path, gate_param_name = match.groups()
+    module = _modes_resolve_moe_module(model, moe_path)
+    base_config = getattr(model.config, "text_config", model.config)
+    target_n_routed_experts = int(tensor.shape[0])
+    current_n_routed_experts = len(module.experts)
+
+    if current_n_routed_experts == target_n_routed_experts:
+        _modes_fix_gate_layout(module, target_n_routed_experts)
+        return
+
+    if current_n_routed_experts > target_n_routed_experts:
+        module.experts = nn.ModuleList(
+            [module.experts[i] for i in range(target_n_routed_experts)]
+        )
+    else:
+        for _ in range(target_n_routed_experts - current_n_routed_experts):
+            module.experts.append(
+                DeepseekV3MLP(
+                    base_config,
+                    intermediate_size=base_config.moe_intermediate_size,
+                ).to(device=tensor.device, dtype=tensor.dtype)
+            )
+
+    if gate_param_name == "weight":
+        target_hidden = int(tensor.shape[1])
+        gate_dtype = tensor.dtype
+        gate_device = tensor.device
+        new_weight = nn.Parameter(torch.empty((target_n_routed_experts, target_hidden), device=gate_device, dtype=gate_dtype))
+        module.gate.weight = new_weight
+    if gate_param_name == "e_score_correction_bias":
+        module.gate.e_score_correction_bias = nn.Parameter(
+            torch.empty((target_n_routed_experts,), device=tensor.device, dtype=tensor.dtype)
+        )
+
+    _modes_fix_gate_layout(module, target_n_routed_experts)
 
 
 def _modes_maybe_resize_routed_expert(model, param_name, tensor):
@@ -85,6 +159,11 @@ def _modes_maybe_resize_routed_expert(model, param_name, tensor):
 
     moe_path, expert_idx_str, proj_name = match.groups()
     expert_idx = int(expert_idx_str)
+    _modes_maybe_resize_active_experts(
+        model,
+        f"{moe_path}.gate.weight",
+        torch.empty((expert_idx + 1, int(tensor.shape[1] if proj_name in ('gate_proj', 'up_proj') else tensor.shape[0])), device=tensor.device, dtype=tensor.dtype),
+    )
     experts = _modes_resolve_experts_container(model, moe_path)
     expert = experts[expert_idx]
     base_config = getattr(model.config, "text_config", model.config)
@@ -215,6 +294,51 @@ def _is_moe_layer(layer_idx: int, config) -> bool:
     )
 
 
+def _shrink_kimi_router_for_active_experts(module: nn.Module, keep_mask: torch.Tensor) -> int:
+    keep_mask = keep_mask.to(dtype=torch.bool)
+    gate = module.gate
+    old_num_experts = int(keep_mask.numel())
+    n_active = int(keep_mask.sum().item())
+    if n_active == 0:
+        raise RuntimeError("All experts in this layer were fully pruned.")
+
+    keep_idx = torch.nonzero(keep_mask.to(gate.weight.device), as_tuple=False).view(-1)
+    gate.weight = nn.Parameter(gate.weight.data.index_select(0, keep_idx).contiguous())
+
+    if hasattr(gate, "e_score_correction_bias") and gate.e_score_correction_bias is not None:
+        gate.e_score_correction_bias = nn.Parameter(
+            gate.e_score_correction_bias.data.index_select(0, keep_idx).contiguous()
+        )
+
+    gate.n_routed_experts = n_active
+    if hasattr(module, "num_experts_per_tok"):
+        module.num_experts_per_tok = min(int(module.num_experts_per_tok), n_active)
+    if hasattr(gate, "top_k"):
+        gate.top_k = min(int(gate.top_k), n_active)
+
+    if hasattr(module, "experts_per_rank"):
+        module.experts_per_rank = len(module.experts)
+
+    if hasattr(gate, "experts_len"):
+        gate.experts_len = len(module.experts)
+
+    # noaux_tc requires a valid grouped layout; if the pruned expert count no longer
+    # fits the original grouping assumptions, fall back to greedy top-k.
+    if getattr(gate, "topk_method", None) == "noaux_tc":
+        n_group = int(getattr(gate, "n_group", 1))
+        per_group = n_active // max(n_group, 1) if n_group > 0 else 0
+        topk_group = int(getattr(gate, "topk_group", 1))
+        if (
+            n_group <= 0
+            or n_active % n_group != 0
+            or per_group < 2
+            or topk_group > n_group
+        ):
+            gate.topk_method = "greedy"
+
+    return old_num_experts - n_active
+
+
 # ---------------------------------------------------------------------------
 # Structural pruning
 # ---------------------------------------------------------------------------
@@ -243,6 +367,8 @@ def apply_structural_pruning(
 
     params_removed = 0
     params_kept = 0
+    inactive_experts = 0
+    shrink_gate_cnt = 0
 
     for layer_idx, layer in enumerate(layers):
         pbar.update(1)
@@ -252,6 +378,13 @@ def apply_structural_pruning(
             continue
 
         layer_mask = masks[layer_idx]  # [E, I]
+        old_num_experts = len(layer.mlp.experts)
+        if layer_mask.shape[0] != old_num_experts:
+            raise RuntimeError(
+                f"Layer {layer_idx}: mask expert dim={int(layer_mask.shape[0])} "
+                f"but model has {old_num_experts} experts."
+            )
+        layer_active_expert = torch.ones(old_num_experts, dtype=torch.bool)
 
         for eid, expert in enumerate(layer.mlp.experts):
             m_inter = layer_mask[eid].to(
@@ -259,9 +392,11 @@ def apply_structural_pruning(
             )  # [I]
             I_prime = int(m_inter.sum().item())
             if I_prime == 0:
-                # Degenerate: keep at least one channel to avoid zero-dim layers
-                m_inter[0] = True
-                I_prime = 1
+                layer_active_expert[eid] = False
+                I_old = expert.gate_proj.out_features
+                H = expert.gate_proj.in_features
+                params_removed += int(I_old * H * 3)
+                continue
 
             dtype = expert.gate_proj.weight.dtype
             device = expert.gate_proj.weight.device
@@ -287,6 +422,18 @@ def apply_structural_pruning(
             expert.up_proj   = new_up
             expert.down_proj = new_down
 
+        n_active = int(layer_active_expert.sum().item())
+        if n_active == 0:
+            raise RuntimeError(
+                f"All experts in layer {layer_idx} were fully pruned. "
+                "Adjust masks to keep at least one expert."
+            )
+        inactive_experts += old_num_experts - n_active
+        if n_active != old_num_experts:
+            keep_eids = torch.nonzero(layer_active_expert, as_tuple=False).view(-1).tolist()
+            layer.mlp.experts = nn.ModuleList([layer.mlp.experts[eid] for eid in keep_eids])
+            shrink_gate_cnt += _shrink_kimi_router_for_active_experts(layer.mlp, layer_active_expert)
+        
     pbar.close()
     total = params_removed + params_kept
     pct = 100.0 * params_removed / total if total > 0 else 0.0
@@ -295,6 +442,11 @@ def apply_structural_pruning(
         f"kept: {params_kept:,}  "
         f"({pct:.1f}% removed)"
     )
+    if shrink_gate_cnt > 0:
+        print(
+            f"[prune] Removed {inactive_experts} fully pruned experts and shrank "
+            f"{shrink_gate_cnt} gate entries."
+        )
 
 
 # ---------------------------------------------------------------------------

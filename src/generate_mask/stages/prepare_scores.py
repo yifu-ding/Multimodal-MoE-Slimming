@@ -212,7 +212,7 @@ def prepare_scores(
     smooth_fn: str = "sqrt",
     device: str = "cpu",
     verbose: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, Dict[str, Any]]:
+) -> Tuple[torch.Tensor, torch.Tensor, int, int, int, Dict[str, Any], list]:
     expert_scores, _, aux, _ = load_channel_scores(scores_dir, device, verbose)
     gate_scores = aux["gate_scores"]
 
@@ -240,20 +240,11 @@ def prepare_scores(
 
     inter_layer_method = mask_method_kwargs.get("inter_layer_method", "uniform")
     loss_based_kwargs = load_layerwise_loss(scores_dir, inter_layer_method, smooth_fn, device, verbose)
+    loss_based_kwargs["inter_layer_method"] = inter_layer_method
     layers = aux["metadata"].get("layers")
     if layers is None:
         layers = list(range(L))
-    layerwise_keep_plan = inter_layer_planner(
-        intermediate_scores,
-        p_target=prune_ratio,
-        method=inter_layer_method,
-        L=L,
-        loss_based_importance_kwargs=loss_based_kwargs,
-        tol=0.1,
-        verbose=verbose,
-    )
-    loss_based_kwargs["layerwise_keep_plan"] = layerwise_keep_plan
-    loss_based_kwargs["layers"] = layers
+    
 
     return (
         intermediate_scores,
@@ -262,4 +253,5 @@ def prepare_scores(
         E,
         I,
         loss_based_kwargs,
+        layers,
     )

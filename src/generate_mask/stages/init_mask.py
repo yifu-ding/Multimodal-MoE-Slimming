@@ -1,19 +1,32 @@
 import torch
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
-from src.generate_mask.planners import intra_layer_planner
+from src.generate_mask.planners import inter_layer_planner, intra_layer_planner
 from src.base.shared_utils import _print
 
-def init_mask_for_I(
+def init_mask(
     intermediate_scores: torch.Tensor,  # [L, E, I]
     expertwise_scores: Optional[torch.Tensor] = None,  # [L, E] or None
-    layerwise_keep_plan: Optional[torch.Tensor] = None,  # [L] or None
+    prune_ratio: float = 0.0,
+    inter_layer_method: str = "uniform",
+    loss_based_kwargs: Optional[Dict[str, Any]] = None,
     intra_layer_method: str = "uniform",
     L: int = None,
     E: int = None,
     I: int = None,
     verbose: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Dict[str, torch.Tensor]:
+    loss_based_kwargs = dict(loss_based_kwargs or {})
+
+    layerwise_keep_plan = inter_layer_planner(
+        intermediate_scores,
+        p_target=prune_ratio,
+        method=inter_layer_method,
+        L=L,
+        loss_based_importance_kwargs=loss_based_kwargs,
+        tol=0.1,
+        verbose=verbose,
+    )
    
     # 如果没有提供 expertwise_scores，使用均匀权重
     if expertwise_scores is not None:
@@ -50,4 +63,5 @@ def init_mask_for_I(
     return {
         "intermediate_masks": intermediate_masks,
         "K_E_inter": K_E,
+        "layerwise_keep_plan": layerwise_keep_plan,
     }

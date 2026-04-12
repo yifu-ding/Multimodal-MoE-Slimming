@@ -1,11 +1,11 @@
 from .prepare_scores import prepare_scores, load_attention_head_scores, load_modality_channel_scores
-from .init_mask_for_I import init_mask_for_I
+from .init_mask import init_mask
 from .adjust_entry import adjust_masks
 
 __all__ = [
     "prepare_scores",
     "load_attention_head_scores",
     "load_modality_channel_scores",
-    "init_mask_for_I",
+    "init_mask",
     "adjust_masks",
 ]
