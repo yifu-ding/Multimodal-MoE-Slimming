@@ -1,13 +1,5 @@
 import torch
 import torch.nn as nn
-import contextlib
-import types
-from typing import Optional
-
-from src.base.shared_utils import angle_loss
-
-from .utils import *
-
 
 def is_fused_expert_container(experts: nn.Module) -> bool:
     return (
@@ -25,101 +17,6 @@ def get_fused_saved_tensor(experts: nn.Module, name: str, expert_idx: int):
     if value.ndim == 0 or value.shape[0] <= expert_idx:
         return None
     return value[expert_idx]
-
-
-def weight_rms(weight: torch.Tensor, channel_dim: int = 0) -> torch.Tensor:
-    # weight 形状 [..., I, ...], 在除 channel_dim 以外的维度上做 L2 norm
-    x = weight.detach()
-    reduce_dims = [d for d in range(x.ndim) if d != channel_dim]
-    x2 = x.pow(2).sum(dim=reduce_dims)
-    return x2.sqrt()
-
-# 通道 activation, Wanda / MoE-Pruner 中的 ‖X_j‖ (L2 范數)
-def channel_rms(act: torch.Tensor) -> torch.Tensor:
-    # act 形状 [..., I], 先在樣本維度上做 L2 norm
-    x = act.detach()
-    dims = tuple(range(x.dim() - 1))        # 除最後一維外都是樣本維度
-    x2 = x.pow(2).sum(dim=dims)             # [I], sum_t X_{t,j}^2
-    return x2.sqrt()  
-
-def wa_score(weight: torch.Tensor, activation: torch.Tensor, sum_dim=0) -> torch.Tensor:
-    return (weight.abs() * activation.unsqueeze(0)).sum(dim=sum_dim)  # [channels]
-
-
-def snip_score(
-    weight: torch.Tensor,
-    grad: torch.Tensor,
-    channel_dim: int = 0,
-) -> torch.Tensor:
-    score = (weight * grad).abs()
-    reduce_dims = [d for d in range(score.ndim) if d != channel_dim]
-    return score.sum(dim=reduce_dims)
-
-
-def token_contrib_old(g: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-    dims = tuple(range(z.dim() - 1))  # 平均 batch, seq 维度
-    token_contrib = (g * z).sum(dim=dims) / z.size(-1)  # [S, I] -> [I]
-    # Q_e = token_contrib.mean()
-    return token_contrib
-
-def token_contrib(
-    g: torch.Tensor,
-    z: torch.Tensor,
-    trim_head: float = 0.01,  # clip 掉绝对值最大的 top p%
-    trim_tail: float = 0.00,  # 现在不再用,保留接口以兼容
-) -> torch.Tensor:
-    """
-    g, z: [..., I]
-    返回: [I], 每个 channel 的 clipped mean 贡献
-
-    做的事情:
-    - c = g * z
-    - 按绝对值算每个 channel 的 (1 - trim_head) 分位数 q_high
-    - 对每个 channel 做带符号 clip 到 [-q_high, q_high]
-    - 然后对 token 维度取均值
-    """
-    assert g.shape == z.shape, "g 和 z 的形状必须一致"
-    I = z.size(-1)
-    orig_dtype = z.dtype
-
-    # 所有非最后一维都看作 token 维度, 展平
-    gz = g * z                               # [..., I]
-    gz_flat = gz.view(-1, I).to(torch.float32)  # [N_tokens, I], 用 float32 以支持 quantile
-
-    N = gz_flat.size(0)
-    # 样本太少或不开启 clip, 退化为普通均值
-    if N <= 2 or trim_head <= 0.0:
-        return gz_flat.mean(dim=0).to(orig_dtype)  # [I]
-
-    # 限制一下比例, 避免奇怪超参
-    trim_head = float(max(0.0, min(trim_head, 0.49)))
-
-    abs_gz = gz_flat.abs()  # [N_tokens, I]
-
-    # 每个 channel 的 (1 - trim_head) 分位数, 例如 trim_head=0.01 -> 99% 分位
-    q_high = torch.quantile(
-        abs_gz, 1.0 - trim_head, dim=0, keepdim=True
-    )  # [1, I]
-
-    # 防止某些 channel 全是 0, 分位数为 0 导致全截成 0
-    # 加一个极小下界
-    q_high = torch.clamp(q_high, min=1e-25)
-
-    # 带符号 clip 到 [-q_high, q_high]
-    clipped = torch.clamp(gz_flat, min=-q_high, max=q_high)  # [N_tokens, I]
-
-    # 对 token 维度取均值
-    contrib_mean = clipped.mean(dim=0)  # [I], float32
-
-    return contrib_mean.to(orig_dtype)
-
-
-# 通道 saliency, 使用 act * grad
-def channel_saliency(act: torch.Tensor, grad: torch.Tensor) -> torch.Tensor:
-    # act, grad 形状类似 [..., I], 最后一维是通道
-    s = (act * grad).abs().detach()
-    dims = tuple[int, ...](range(s.dim() - 1))  # 平均 batch, seq 维度
-    return s.mean(dim=dims)    
 
 
 def safe_add_with_ema(target, ema, value, key=None):
@@ -141,229 +38,103 @@ def safe_add_with_ema(target, ema, value, key=None):
     assert isinstance(target, nn.Module), f"target must be nn.Module, got {type(target)}"
     old = getattr(target, key, None)
     setattr(target, key, ema_update(old, value))
-
-
-
-def compute_token_contrib_I(down_input: torch.Tensor = None, 
-                            down_grad: torch.Tensor = None, 
-                            up_output: torch.Tensor = None,
-                            up_out_grad: torch.Tensor = None, 
-                            gate_output: torch.Tensor = None,
-                            gate_grad: torch.Tensor = None):
-    down_token_contrib = token_contrib(down_grad, down_input)   # [I]
-    up_token_contrib = token_contrib(up_out_grad, up_output)   # [I]
-    gate_token_contrib = token_contrib(gate_grad, gate_output) # [I]
-    token_contrib_mean = (down_token_contrib + up_token_contrib + gate_token_contrib) / 3.0  # [I]
-    return token_contrib_mean
-
-def compute_grad_I(down_grad: torch.Tensor = None, 
-                    up_out_grad: torch.Tensor = None, 
-                    gate_grad: torch.Tensor = None):
-
-    down_grad = channel_rms(down_grad)
-    up_out_grad = channel_rms(up_out_grad)
-    gate_grad = channel_rms(gate_grad)
-    grad_mean = (down_grad + up_out_grad + gate_grad) / 3.0
-    return grad_mean, down_grad, up_out_grad, gate_grad
         
-def compute_saliency_I(down_input: torch.Tensor = None, 
-                        down_grad: torch.Tensor = None,
-                        up_output: torch.Tensor = None, 
-                        up_out_grad: torch.Tensor = None,
-                        gate_output: torch.Tensor = None,
-                        gate_grad: torch.Tensor = None):
-
-    # 1) 三个 proj 的通道 saliency
-    down_sal = channel_saliency(down_input, down_grad)
-    up_sal   = channel_saliency(up_output, up_out_grad)
-    gate_sal = channel_saliency(gate_output, gate_grad)
-
-    # 三者通道数应该一致
-    assert down_sal.shape == up_sal.shape == gate_sal.shape
-    sal_mean = (down_sal + up_sal + gate_sal) / 3.0  # [I]
-
-    return sal_mean
-            
-def compute_activation_I(down_input: torch.Tensor = None, 
-                          up_output: torch.Tensor = None,
-                          gate_output: torch.Tensor = None):
-    
-    down_act = channel_rms(down_input)   # down_act.shape = [S, I]
-    up_act   = channel_rms(up_output)    # up_act.shape = [S, I]
-    gate_act = channel_rms(gate_output)  # gate_act.shape = [S, I]
-
-    assert down_act.shape == up_act.shape == gate_act.shape
-    act_mean = (down_act + up_act + gate_act) / 3.0  # [I]
-
-    return act_mean, down_act
-
-def compute_wa_I(W_down: torch.Tensor = None, 
-                 W_up: torch.Tensor = None, 
-                 W_gate: torch.Tensor = None, 
-                 down_ch_act: torch.Tensor = None, 
-                 up_input: torch.Tensor = None, 
-                 gate_input: torch.Tensor = None):
-
-    # 通道维度一致
-    assert W_down.size(1) == W_up.size(0) == W_gate.size(0)   # [H, I], [I, H], [I, H]. 如果 load_in_4bit 的话不能这么算 wa_score, 目前不支持量化 model
-
-    up_input = channel_rms(up_input)      # up_input.shape = [S, H]
-    gate_input = channel_rms(gate_input)  # gate_input.shape = [S, H]
-    wa_down = wa_score(W_down, down_ch_act, sum_dim=0)     # [H, I] * [1, I] -> [H, I] -> [I]
-    wa_up   = wa_score(W_up, up_input, sum_dim=1)       # [I, H] * [1, H] -> [I, H] -> [I]
-    wa_gate = wa_score(W_gate, gate_input, sum_dim=1)   # [I, H] * [1, H] -> [I, H] -> [I]
-
-    wa_mean = (wa_down + wa_up + wa_gate) / 3.0  # [I]
-
-    return wa_mean
-
-
-def compute_wg_I(W_down: torch.Tensor = None, 
-                 W_up: torch.Tensor = None, 
-                 W_gate: torch.Tensor = None, 
-                 W_down_grad: torch.Tensor = None, 
-                 W_up_grad: torch.Tensor = None, 
-                 W_gate_grad: torch.Tensor = None, 
-                 ):
-
-    # 通道维度一致
-    assert W_down.size(1) == W_up.size(0) == W_gate.size(0)   # [H, I], [I, H], [I, H]. 如果 load_in_4bit 的话不能这么算 wa_score, 目前不支持量化 model
-    if W_down_grad is None or W_up_grad is None or W_gate_grad is None:
-        return torch.zeros(W_down.size(1), dtype=torch.float32, device=W_down.device)
-
-    W_down_grad = W_down_grad.detach()
-    W_up_grad = W_up_grad.detach()
-    W_gate_grad = W_gate_grad.detach()
-    
-    # 对齐通道维度:
-    # - W_down: 输入通道在 dim=1, 输出通道在 dim=0
-    # - W_up / W_gate: 输入通道在 dim=0
-    snip_score_down = snip_score(W_down, W_down_grad, channel_dim=1)  # [I]
-    snip_score_up   = snip_score(W_up, W_up_grad, channel_dim=0)      # [I]
-    snip_score_gate = snip_score(W_gate, W_gate_grad, channel_dim=0)  # [I]
-    snip_score_mean = (snip_score_down + snip_score_up + snip_score_gate) / 3.0  # [I]
-
-    return snip_score_mean
-
-def compute_grad_H(down_out_grad: torch.Tensor = None, 
-                   up_in_grad: torch.Tensor = None,     # shape [S, H]
-                   gate_in_grad: torch.Tensor = None,   # shape [S, H]
-                   ) -> torch.Tensor:
-   
-    down_grad = channel_rms(down_out_grad)
-    up_grad = channel_rms(up_in_grad)
-    gate_grad = channel_rms(gate_in_grad)
-    grad_mean = (down_grad + up_grad + gate_grad) / 3.0
-
-    return grad_mean
-
-def compute_saliency_H(down_output: torch.Tensor = None, 
-                       down_out_grad: torch.Tensor = None, 
-                       up_input: torch.Tensor = None, 
-                       up_in_grad: torch.Tensor = None, 
-                       gate_input: torch.Tensor = None, 
-                       gate_in_grad: torch.Tensor = None):   # shape [S, H] -> [H]
-    
-    down_sal = channel_saliency(down_output, down_out_grad)
-    up_sal   = channel_saliency(up_input, up_in_grad)
-    gate_sal = channel_saliency(gate_input, gate_in_grad)
-
-    assert down_sal.shape == up_sal.shape == gate_sal.shape
-    sal_mean = (down_sal + up_sal + gate_sal) / 3.0  # [I]
-
-    return sal_mean
-
-def compute_activation_H(down_output: torch.Tensor = None, 
-                         up_input: torch.Tensor = None,
-                         gate_input: torch.Tensor = None):
-    
-    # 通道 activation, Wanda / MoE-Pruner 中的 ‖X_j‖ (L2 范數)
-    down_act = channel_rms(down_output)   # shape [S, H] -> [H]
-    up_act   = channel_rms(up_input)    # shape [S, H] -> [H]
-    gate_act = channel_rms(gate_input)  # shape [S, H] -> [H]
-
-    assert down_act.shape == up_act.shape == gate_act.shape
-    act_mean = (down_act + up_act + gate_act) / 3.0  # [H]
-
-    return act_mean
-
-def compute_wa_H(down_input: torch.Tensor = None, 
-                 up_input: torch.Tensor = None,     # shape [S, H]
-                 gate_input: torch.Tensor = None,   # shape [S, H]
-                 W_down: torch.Tensor = None,   # [H, I]
-                 W_up: torch.Tensor = None,     # [I, H]
-                 W_gate: torch.Tensor = None):   # [I, H]
-    
-    down_input = channel_rms(down_input)   # shape [S, I] -> [I]
-    up_input   = channel_rms(up_input)    # shape [S, H] -> [H]
-    gate_input = channel_rms(gate_input)  # shape [S, H] -> [H]
-
-    wa_down = wa_score(W_down, down_input, sum_dim=1)     # [H, I] * [1, I] -> [H, I] -> [H]
-    wa_up   = wa_score(W_up, up_input, sum_dim=0)       # [I, H] * [1, H] -> [I, H] -> [H]
-    wa_gate = wa_score(W_gate, gate_input, sum_dim=0)   # [I, H] * [1, H] -> [I, H] -> [H]
-    wa_mean = (wa_down + wa_up + wa_gate) / 3.0  # [H]
-
-    return wa_mean
-        
-        
-def add_H_scores_with_ema(cnt_mlp, 
-                        ema: float = 0.9, 
-                        H_grad: torch.Tensor = None,
-                        H_saliency: torch.Tensor = None, 
-                        H_activation: torch.Tensor = None, 
-                        H_wa: torch.Tensor = None,
-                        ):
-    
-    safe_add_with_ema(cnt_mlp, ema, H_grad, "H_grad")
-    safe_add_with_ema(cnt_mlp, ema, H_saliency, "H_saliency")
-    safe_add_with_ema(cnt_mlp, ema, H_activation, "H_activation")
-    safe_add_with_ema(cnt_mlp, ema, H_wa, "H_wa")
-
-
-def masked_mean_bs(x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
-    """
-    x: [B, S, H]
-    attn_mask: [B, S] (1 for valid token, 0 for pad)
-    return: [H]
-    """
-    # 转为 float mask，搬到同一 device
-    mask = attn_mask.to(x.device).float()  # [B, S]
-    # 扩展到 [B, S, 1]，用于逐 token 屏蔽
-    mask = mask[:, :, None]                # [B, S, 1]
-    # 屏蔽无效 token
-    x_masked = x * mask                    # [B, S, H]
-    # 有效 token 总数 (对所有 B, S 求和)
-    denom = mask.sum().clamp_min(1.0)      # 标量，防止除零
-    # 等价于在 B, S 上做 mean
-    return x_masked.sum(dim=(0, 1)) / denom  # [H]
-
 
 def unwrap_output(output):
     return output[0] if isinstance(output, (tuple, list)) else output
 
 
-def resolve_activation_fn(expert: nn.Module):
-    for attr in ("act_fn", "activation_fn"):
-        fn = getattr(expert, attr, None)
-        if fn is not None:
-            return fn
-    return torch.nn.functional.silu
+def get_saved_tensors(experts=None, expert_idx=None, is_fused=False, expert=None, 
+                       down_proj_t=None, up_proj=None, gate_proj=None, down_grad_t=None, 
+                       up_grad_w=None, gate_grad_w=None):
+    if is_fused:
+        activation_owner = experts
+        down_input = get_fused_saved_tensor(experts, "saved_down_input", expert_idx)
+        down_output = get_fused_saved_tensor(experts, "saved_down_output", expert_idx)
+        down_grad = get_fused_saved_tensor(experts, "saved_down_grad", expert_idx)
+        down_out_grad = get_fused_saved_tensor(experts, "saved_down_out_grad", expert_idx)
+        up_input = get_fused_saved_tensor(experts, "saved_up_input", expert_idx)
+        up_output = get_fused_saved_tensor(experts, "saved_up_output", expert_idx)
+        up_in_grad = get_fused_saved_tensor(experts, "saved_up_in_grad", expert_idx)
+        up_out_grad = get_fused_saved_tensor(experts, "saved_up_out_grad", expert_idx)
+        gate_input = get_fused_saved_tensor(experts, "saved_gate_input", expert_idx)
+        gate_output = get_fused_saved_tensor(experts, "saved_gate_output", expert_idx)
+        gate_in_grad = get_fused_saved_tensor(experts, "saved_gate_in_grad", expert_idx)
+        gate_grad = get_fused_saved_tensor(experts, "saved_gate_grad", expert_idx)
+        text_mask = get_fused_saved_tensor(experts, "saved_text_mask", expert_idx)
+        visual_mask = get_fused_saved_tensor(experts, "saved_visual_mask", expert_idx)
+        router_weights = get_fused_saved_tensor(experts, "saved_router_weights", expert_idx)
+
+        W_down = down_proj_t[expert_idx]
+        W_up = up_proj[expert_idx]
+        W_gate = gate_proj[expert_idx]
+        W_down_grad = None if down_grad_t is None else down_grad_t[expert_idx]
+        W_up_grad = None if up_grad_w is None else up_grad_w[expert_idx]
+        W_gate_grad = None if gate_grad_w is None else gate_grad_w[expert_idx]
+    else:
+        activation_owner = expert
+        # 取出并清空 hook 保存的张量
+        down_input    = getattr(expert.down_proj, "saved_input", None)
+        down_output   = getattr(expert.down_proj, "saved_output", None)
+        down_grad     = getattr(expert.down_proj, "saved_grad_in", None)
+        down_out_grad = getattr(expert.down_proj, "saved_grad_out", None)
+        expert.down_proj.saved_input    = None
+        expert.down_proj.saved_output   = None
+        expert.down_proj.saved_grad_in  = None
+        expert.down_proj.saved_grad_out = None
+
+        up_input    = getattr(expert.up_proj, "saved_input", None)
+        up_output   = getattr(expert.up_proj, "saved_output", None)
+        up_in_grad  = getattr(expert.up_proj, "saved_grad_in", None)
+        up_out_grad = getattr(expert.up_proj, "saved_grad_out", None)
+        expert.up_proj.saved_input    = None
+        expert.up_proj.saved_output   = None
+        expert.up_proj.saved_grad_in  = None
+        expert.up_proj.saved_grad_out = None
+
+        gate_input      = getattr(expert.gate_proj, "saved_input", None)
+        gate_output     = getattr(expert.gate_proj, "saved_output", None)
+        gate_in_grad    = getattr(expert.gate_proj, "saved_grad_in", None)
+        gate_grad       = getattr(expert.gate_proj, "saved_grad_out", None)
+        expert.gate_proj.saved_input    = None
+        expert.gate_proj.saved_output   = None
+        expert.gate_proj.saved_grad_in  = None
+        expert.gate_proj.saved_grad_out = None
+        text_mask = getattr(expert, "saved_text_mask", None)
+        visual_mask = getattr(expert, "saved_visual_mask", None)
+        router_weights = getattr(expert, "saved_router_weights", None)
+        expert.saved_text_mask = None
+        expert.saved_visual_mask = None
+        expert.saved_router_weights = None
+
+        W_down, W_up, W_gate = expert.down_proj.weight, expert.up_proj.weight, expert.gate_proj.weight
+        W_down_grad = W_down.grad
+        W_up_grad = W_up.grad
+        W_gate_grad = W_gate.grad
+    
+    return activation_owner, down_input, down_output, down_grad, \
+        down_out_grad, up_input, up_output, up_in_grad, up_out_grad, \
+        gate_input, gate_output, gate_in_grad, gate_grad, text_mask, \
+        visual_mask, router_weights, W_down, W_up, W_gate, W_down_grad, W_up_grad, W_gate_grad
 
 
-def compute_gateup_act(
-    expert: nn.Module,
-    gate_output: torch.Tensor,
-    up_output: torch.Tensor,
-    token_mask: torch.Tensor | None = None,
-):
-    if gate_output is None or up_output is None:
-        return None
-    activation = resolve_activation_fn(expert)(gate_output.detach()) * up_output.detach()
-    if token_mask is not None:
-        token_mask = token_mask.to(device=activation.device).view(-1).bool()
-        if token_mask.numel() != activation.shape[0] or not bool(token_mask.any()):
-            return None
-        activation = activation[token_mask]
-    dims = tuple(range(activation.dim() - 1))
-    return activation.abs().to(torch.float32).mean(dim=dims)
-
+def clear_fused_saved_tensors(experts: nn.Module) -> None:
+    for name in (
+        "saved_down_input",
+        "saved_down_output",
+        "saved_down_grad",
+        "saved_down_out_grad",
+        "saved_up_input",
+        "saved_up_output",
+        "saved_up_in_grad",
+        "saved_up_out_grad",
+        "saved_gate_input",
+        "saved_gate_output",
+        "saved_gate_in_grad",
+        "saved_gate_grad",
+        "saved_text_mask",
+        "saved_visual_mask",
+        "saved_router_weights",
+    ):
+        if hasattr(experts, name):
+            setattr(experts, name, None)
