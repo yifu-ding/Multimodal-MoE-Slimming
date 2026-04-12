@@ -56,6 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--subset_seed", type=int, default=None)
     p.add_argument("--max_new_tokens", type=int, default=32)
     p.add_argument("--batch_size", type=int, default=1)
+    p.add_argument("--smooth_fn", type=str, default="sqrt")
     return p
 
 
@@ -68,7 +69,7 @@ def main() -> None:
     if args.thresholds_path is not None and args.modality_aware:
         # 读取 threshold_path 的 pt 文件中存储的intra_expert_metric并覆盖 args.intra_expert_metric
         thresh = torch.load(args.thresholds_path, map_location="cpu", weights_only=False)
-        args.intra_expert_metric = thresh["metadata"].get("intra_expert_metric", "channel_second_order")
+        args.intra_expert_metric = thresh["metadata"].get("intra_expert_metric", "down_second_order")
         print(f"[Run] Overridden from thresholds.pt: intra_expert_metric={args.intra_expert_metric}")
     
     mask_result = build_masks_pipeline(
@@ -88,6 +89,7 @@ def main() -> None:
             "modality_aware": args.modality_aware,
             "prune_hidden": False,
             "prune_gqa": False,
+            "smooth_fn": args.smooth_fn,
         },
         device="cpu",
         verbose=True,

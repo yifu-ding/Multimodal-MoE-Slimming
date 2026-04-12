@@ -49,7 +49,6 @@ def generate_masks(
     ) = prepare_scores(
         scores_dir=scores_dir,
         mask_method_kwargs=mask_method_kwargs,
-        prune_ratio=prune_ratio,
         smooth_fn=smooth_fn,
         modality_aware=modality_aware, 
         device=device,

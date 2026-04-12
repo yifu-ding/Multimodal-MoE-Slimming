@@ -9,6 +9,12 @@ set -euo pipefail
 # Activation scoring on 128 GQA samples:
 #   CUDA_VISIBLE_DEVICES=0 bash scripts/run_collect_scores.sh
 #
+# Activation scoring on 128 COCO2017-Capval samples:
+#   DATASET=coco CUDA_VISIBLE_DEVICES=0 bash scripts/run_collect_scores.sh
+#
+# Activation scoring on 128 VMMMU samples:
+#   DATASET=VMMMU CUDA_VISIBLE_DEVICES=0 bash scripts/run_collect_scores.sh
+#
 # Activation scoring with text/visual split on 128 GQA samples:
 #   MODALITY_AWARE=1 CUDA_VISIBLE_DEVICES=0 bash scripts/run_collect_scores.sh
 #
@@ -24,15 +30,34 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 DATASET="${DATASET:-gqa}"
-NUM_SAMPLES="${NUM_SAMPLES:-128}"
+NUM_SAMPLES="${NUM_SAMPLES:-16}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 START_IDX="${START_IDX:-0}"
 SUBSET_SEED="${SUBSET_SEED:-42}"
 
 EMA="${EMA:-0.9}"
 
-# OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/kimi_gqa-second_order}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/kimi_gqa-second_order-l2}"
+case "${DATASET,,}" in
+    gqa)
+        DATASET="gqa"
+        DATASET_TAG="gqa"
+        ;;
+    coco)
+        DATASET="coco"
+        DATASET_TAG="coco"
+        ;;
+    vmmmu|video_mmmu)
+        DATASET="video_mmmu"
+        DATASET_TAG="video_mmmu"
+        ;;
+    *)
+        echo "Unsupported DATASET=${DATASET}. Supported values: gqa, coco, VMMMU (video_mmmu)." >&2
+        exit 1
+        ;;
+esac
+
+# OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/kimi_${DATASET_TAG}-second_order}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/kimi_${DATASET_TAG}-$(date +%m%d-%H%M)}"
 
 EXTRA_ARGS=("$@")
 

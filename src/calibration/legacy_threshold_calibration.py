@@ -727,7 +727,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="Path to scores.pt with modality-split channel scores.")
     p.add_argument("--intra_expert_metric", type=str, default="activation",
                     help="Base metric name in expert_scores (fields: {metric}_text, {metric}_visual).",
-                    choices=["activation", "channel_second_order"],
+                    choices=["activation", "down_second_order"],
                     )
     p.add_argument("--output_dir", type=str, required=True)
     p.add_argument("--dataset", type=str, default="gqa", choices=["gqa", "coco"])

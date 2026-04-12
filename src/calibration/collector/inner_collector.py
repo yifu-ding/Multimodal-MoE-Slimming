@@ -79,7 +79,13 @@ def loop_1_channelwise_scores(
             grad_I, down_grad_ch, up_out_grad_ch, gate_grad_ch = compute_grad_I(
                 down_grad, up_out_grad, gate_grad
             )
-            metrics["grad"] = grad_I.to(torch.float32)
+            metrics["3proj_grad"] = grad_I.to(torch.float32)
+            grad_text = compute_grad_I_masked(down_grad, up_out_grad, gate_grad, text_mask)
+            if grad_text is not None:
+                metrics["3proj_grad_text"] = grad_text.to(torch.float32)
+            grad_visual = compute_grad_I_masked(down_grad, up_out_grad, gate_grad, visual_mask)
+            if grad_visual is not None:
+                metrics["3proj_grad_visual"] = grad_visual.to(torch.float32)
         else:
             down_grad_ch = None
             up_out_grad_ch = None
@@ -90,45 +96,121 @@ def loop_1_channelwise_scores(
         _num_ch = W_down.size(1)
         _ch_dev = W_down.device
 
+        if down_input is not None:
+            metrics["down_second_order"] = compute_channel_hessian_diag(
+                W_down, down_input, None
+            )
+        else:
+            metrics["down_second_order"] = torch.zeros(
+                _num_ch, dtype=torch.float32, device=_ch_dev
+            )
+
+        if down_input is not None and up_output is not None and gate_output is not None:
+            metrics["3proj_second_order"] = compute_3linear_hessian_diag(
+                W_down, W_up, W_gate, down_input, up_output, gate_output, None
+            )
+        else:
+            metrics["3proj_second_order"] = torch.zeros(
+                _num_ch, dtype=torch.float32, device=_ch_dev
+            )
+
         if _want_text:
             if down_input is not None and text_mask is not None and isinstance(text_mask, torch.Tensor) and bool(text_mask.any()):
-                metrics["channel_second_order_text"] = compute_channel_hessian_diag(W_down, down_input, text_mask)
+                metrics["down_second_order_text"] = compute_channel_hessian_diag(W_down, down_input, text_mask)
+                if up_output is not None and gate_output is not None:
+                    metrics["3proj_second_order_text"] = compute_3linear_hessian_diag(
+                        W_down, W_up, W_gate, down_input, up_output, gate_output, text_mask
+                    )
+                else:
+                    metrics["3proj_second_order_text"] = torch.zeros(_num_ch, dtype=torch.float32, device=_ch_dev)
             else:
-                metrics["channel_second_order_text"] = torch.zeros(_num_ch, dtype=torch.float32, device=_ch_dev)
+                metrics["down_second_order_text"] = torch.zeros(_num_ch, dtype=torch.float32, device=_ch_dev)
+                metrics["3proj_second_order_text"] = torch.zeros(_num_ch, dtype=torch.float32, device=_ch_dev)
 
         if _want_visual:
             if down_input is not None and visual_mask is not None and isinstance(visual_mask, torch.Tensor) and bool(visual_mask.any()):
-                metrics["channel_second_order_visual"] = compute_channel_hessian_diag(W_down, down_input, visual_mask)
+                metrics["down_second_order_visual"] = compute_channel_hessian_diag(W_down, down_input, visual_mask)
+                if up_output is not None and gate_output is not None:
+                    metrics["3proj_second_order_visual"] = compute_3linear_hessian_diag(
+                        W_down, W_up, W_gate, down_input, up_output, gate_output, visual_mask
+                    )
+                else:
+                    metrics["3proj_second_order_visual"] = torch.zeros(_num_ch, dtype=torch.float32, device=_ch_dev)
             else:
-                metrics["channel_second_order_visual"] = torch.zeros(_num_ch, dtype=torch.float32, device=_ch_dev)
+                metrics["down_second_order_visual"] = torch.zeros(_num_ch, dtype=torch.float32, device=_ch_dev)
+                metrics["3proj_second_order_visual"] = torch.zeros(_num_ch, dtype=torch.float32, device=_ch_dev)
 
         if down_input is None or up_output is None or gate_output is None:
             return metrics
 
+        # gate*up activation
         gateup_act = compute_gateup_act(activation_owner, gate_output, up_output)
         if gateup_act is not None:
             metrics["gateup_act"] = gateup_act.to(torch.float32)
-
+        # gate*up activation
         text_act = compute_gateup_act(
             activation_owner, gate_output, up_output, token_mask=text_mask
         )
         if text_act is not None:
-            metrics["activation_text"] = text_act.to(torch.float32)
-
+            metrics["gateup_text"] = text_act.to(torch.float32)
+        # gate*up activation
         visual_act = compute_gateup_act(
             activation_owner, gate_output, up_output, token_mask=visual_mask
         )
         if visual_act is not None:
-            metrics["activation_visual"] = visual_act.to(torch.float32)
-
-        act_mean, _ = compute_activation_I(down_input, up_output, gate_output)
-        metrics["activation"] = act_mean.to(torch.float32)
+            metrics["gateup_visual"] = visual_act.to(torch.float32)
+        # three proj activation
+        act_mean, down_act = compute_activation_I(down_input, up_output, gate_output)
+        metrics["3proj_act"] = act_mean.to(torch.float32)
+        activation_text = compute_activation_I_masked(
+            down_input, up_output, gate_output, token_mask=text_mask
+        )
+        if activation_text is not None:
+            metrics["3proj_act_text"] = activation_text.to(torch.float32)
+        activation_visual = compute_activation_I_masked(
+            down_input, up_output, gate_output, token_mask=visual_mask
+        )
+        if activation_visual is not None:
+            metrics["3proj_act_visual"] = activation_visual.to(torch.float32)
+        if up_input is not None and gate_input is not None:
+            wa_I = compute_wa_I(
+                W_down=W_down,
+                W_up=W_up,
+                W_gate=W_gate,
+                down_ch_act=down_act,
+                up_input=up_input,
+                gate_input=gate_input,
+            )
+            metrics["wa"] = wa_I.to(torch.float32)
+            wa_text = compute_wa_I_masked(
+                W_down=W_down,
+                W_up=W_up,
+                W_gate=W_gate,
+                down_input=down_input,
+                up_input=up_input,
+                gate_input=gate_input,
+                token_mask=text_mask,
+            )
+            if wa_text is not None:
+                metrics["wa_text"] = wa_text.to(torch.float32)
+            wa_visual = compute_wa_I_masked(
+                W_down=W_down,
+                W_up=W_up,
+                W_gate=W_gate,
+                down_input=down_input,
+                up_input=up_input,
+                gate_input=gate_input,
+                token_mask=visual_mask,
+            )
+            if wa_visual is not None:
+                metrics["wa_visual"] = wa_visual.to(torch.float32)
 
         if (
             down_grad_ch is not None
             and up_out_grad_ch is not None
             and gate_grad_ch is not None
-        ):
+        ):  
+            # this is down proj saliency
             saliency_I = compute_saliency_I(
                 down_input,
                 down_grad_ch,
@@ -137,7 +219,47 @@ def loop_1_channelwise_scores(
                 gate_output,
                 gate_grad_ch,
             )
-            metrics["saliency"] = saliency_I.to(torch.float32)
+            metrics["down_saliency"] = saliency_I.to(torch.float32)
+            saliency_3proj = compute_3proj_saliency_I(
+                down_input,
+                down_grad_ch,
+                up_output,
+                up_out_grad_ch,
+                gate_output,
+                gate_grad_ch,
+            )
+            metrics["3proj_saliency"] = saliency_3proj.to(torch.float32)
+
+            # down_proj only, per-modality（与 activation_text / activation_visual 相同 token_mask 语义）
+            # this is down proj saliency, per-modality
+            sal_text = channel_saliency_masked(down_input, down_grad, text_mask)
+            if sal_text is not None:
+                metrics["down_saliency_text"] = sal_text.to(torch.float32)
+            sal_3proj_text = compute_3proj_saliency_I_masked(
+                down_input,
+                down_grad,
+                up_output,
+                up_out_grad,
+                gate_output,
+                gate_grad,
+                text_mask,
+            )
+            if sal_3proj_text is not None:
+                metrics["3proj_saliency_text"] = sal_3proj_text.to(torch.float32)
+            sal_visual = channel_saliency_masked(down_input, down_grad, visual_mask)
+            if sal_visual is not None:
+                metrics["down_saliency_visual"] = sal_visual.to(torch.float32)
+            sal_3proj_visual = compute_3proj_saliency_I_masked(
+                down_input,
+                down_grad,
+                up_output,
+                up_out_grad,
+                gate_output,
+                gate_grad,
+                visual_mask,
+            )
+            if sal_3proj_visual is not None:
+                metrics["3proj_saliency_visual"] = sal_3proj_visual.to(torch.float32)
 
         if down_output is None or attn_mask is None:
             return metrics
@@ -157,7 +279,7 @@ def loop_1_channelwise_scores(
         # metrics["expert_modality_affinity"] = (v_count - t_count) / (v_count + t_count + 1e-8)
         if down_out_grad is not None:
             first_attr_usage = token_contrib(down_out_grad, down_output).sum() * usage
-            metrics["first_attr_usage"] = float(first_attr_usage.item())
+            metrics["first_attr"] = float(first_attr_usage.item())
 
         return metrics
 
@@ -251,7 +373,7 @@ def loop_2_expertwise_scores(
         if not record["has_activation"]:
             if is_fused:
                 device = experts.gate_up_proj.device
-                fused_metric_stacks.setdefault("second_exact_attr", []).append(
+                fused_metric_stacks.setdefault("second_attr", []).append(
                     torch.zeros((), dtype=torch.float32, device=device)
                 )
             continue
@@ -267,11 +389,11 @@ def loop_2_expertwise_scores(
         )
         if second_exact_attr is not None:
             if is_fused:
-                fused_metric_stacks.setdefault("second_exact_attr", []).append(
+                fused_metric_stacks.setdefault("second_attr", []).append(
                     second_exact_attr.detach().to(torch.float32)
                 )
             else:
-                safe_add_with_ema(expert, ema, second_exact_attr, "second_exact_attr")
+                safe_add_with_ema(expert, ema, second_exact_attr, "second_attr")
 
         # true_ablate = compute_true_ablate_attr(
         #     cnt_block=cnt_block,

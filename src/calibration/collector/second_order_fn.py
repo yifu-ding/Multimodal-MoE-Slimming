@@ -405,7 +405,7 @@ def compute_true_ablate_attr(
     return (masked_loss - base_loss).detach().float().clamp_min(0.0)
         
         
-def compute_channel_second_order(
+def compute_down_second_order(
     cnt_block: nn.Module,
     expert: nn.Module,
     _kwargs: dict,

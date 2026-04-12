@@ -47,8 +47,8 @@ PENALTY_LAMBDA="${PENALTY_LAMBDA:-100.0}"
 TAU_START="${TAU_START:-0.1}"
 TAU_END="${TAU_END:-0.01}"
 LOSS_FN="${LOSS_FN:-rel_l2}"
-# INTRA_EXPERT_METRIC 只有两个选项： activation 和 channel_second_order
-INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-channel_second_order}"
+# INTRA_EXPERT_METRIC 只有两个选项： activation 和 down_second_order
+INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-down_second_order}"
 
 # Set to 1 to disable temperature annealing
 NO_ANNEAL="${NO_ANNEAL:-0}"

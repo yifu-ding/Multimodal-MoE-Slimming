@@ -24,6 +24,7 @@ from observations.common import (
     discover_layer_structure,
     ensure_dir,
     load_model_bundle,
+    normalize_dataset_name,
     resolve_model_name_or_path,
 )
 from src.calibration.collector.utils import (
@@ -43,27 +44,50 @@ from src.calibration.block_forward import block_forward
 
 
 CHANNEL_METRICS = (
-    "activation",
+    # gate*up activation
     "gateup_act",
-    "activation_text",
-    "activation_visual",
-    "channel_second_order_text",
-    "channel_second_order_visual",
-    "saliency",
+    "gateup_text",
+    "gateup_visual",
+    # three proj activation
+    "3proj_act",
+    "3proj_act_text",
+    "3proj_act_visual",
+    # down proj second order
+    "down_second_order",
+    "down_second_order_text",
+    "down_second_order_visual",
+    # three proj second order
+    "3proj_second_order",
+    "3proj_second_order_text",
+    "3proj_second_order_visual",
+    # down proj saliency
+    "down_saliency",
+    "down_saliency_text",
+    "down_saliency_visual",
+    # three proj saliency
+    "3proj_saliency",
+    "3proj_saliency_text",
+    "3proj_saliency_visual",
+    # wa
     "wa",
-    "grad",
-    "token_contrib",
+    "wa_text",
+    "wa_visual",
+    # three proj grad
+    "3proj_grad",
+    "3proj_grad_text",
+    "3proj_grad_visual",
+    # others - legacy metrics
     "wg",
     "weight",
 )
 EXPERT_METRICS = (
-    "first_attr_usage",
+    "first_attr",
     "usage",
     "usage_text",
     "usage_visual",
-    "second_exact_attr",
+    "second_attr",
     "true_ablate",
-    "expert_modality_affinity",
+    # "expert_modality_affinity",
 )
 
 class ModalityActivationAccumulator:
@@ -130,9 +154,10 @@ class RichScoreAccumulator:
         self.layers = sorted(layer_to_num_experts.keys())
         self.modality_aware = modality_aware
 
-        self.expert_scores: Dict[str, Dict[int, torch.Tensor]] = {}
+        self.channel_metrics: Dict[str, Dict[int, torch.Tensor]] = {}
         for metric in CHANNEL_METRICS:
-            self.expert_scores[metric] = {}
+            self.channel_metrics[metric] = {}
+        self.expert_scores: Dict[str, Dict[int, torch.Tensor]] = {}
         for metric in EXPERT_METRICS:
             self.expert_scores[metric] = {}
 
@@ -149,7 +174,7 @@ class RichScoreAccumulator:
             e = layer_to_num_experts[layer_idx]
             i = layer_to_num_channels[layer_idx]
             for metric in CHANNEL_METRICS:
-                self.expert_scores[metric][layer_idx] = torch.zeros(e, i, dtype=torch.float32)
+                self.channel_metrics[metric][layer_idx] = torch.zeros(e, i, dtype=torch.float32)
             for metric in EXPERT_METRICS:
                 self.expert_scores[metric][layer_idx] = torch.zeros(e, dtype=torch.float32)
             self.gate_scores["usage"][layer_idx] = torch.zeros(e, dtype=torch.float32)
@@ -170,7 +195,7 @@ class RichScoreAccumulator:
             for metric in CHANNEL_METRICS:
                 value = getattr(expert_container, metric, None)
                 if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[0] == num_experts:
-                    self.expert_scores[metric][layer_idx] = value.detach().cpu().float()
+                    self.channel_metrics[metric][layer_idx] = value.detach().cpu().float()
             for metric in EXPERT_METRICS:
                 value = getattr(expert_container, metric, None)
                 if isinstance(value, torch.Tensor) and value.ndim >= 1 and value.shape[0] == num_experts:
@@ -190,7 +215,7 @@ class RichScoreAccumulator:
                 value = getattr(expert, metric, None)
                 if value is None:
                     continue
-                self.expert_scores[metric][layer_idx][eid] = value.detach().cpu().float()
+                self.channel_metrics[metric][layer_idx][eid] = value.detach().cpu().float()
             for metric in EXPERT_METRICS:
                 value = getattr(expert, metric, None)
                 if value is None:
@@ -223,13 +248,13 @@ class RichScoreAccumulator:
             self.modality_scores.finalize()
 
     def build_scores_payload(self, args) -> dict:
+        channel_scores = {
+            metric: _to_nested_expert_dict(self.channel_metrics[metric], scalar=False)
+            for metric in CHANNEL_METRICS
+        }
         expert_scores = {
-            metric: (
-                _to_nested_expert_dict(self.expert_scores[metric], scalar=False)
-                if metric in CHANNEL_METRICS
-                else _to_nested_expert_dict(self.expert_scores[metric], scalar=True)
-            )
-            for metric in tuple(CHANNEL_METRICS) + tuple(EXPERT_METRICS)
+            metric: _to_nested_expert_dict(self.expert_scores[metric], scalar=True)
+            for metric in EXPERT_METRICS
         }
         ema_matrix = {}
         for layer_idx in self.layers:
@@ -252,6 +277,7 @@ class RichScoreAccumulator:
             "layer_to_num_channels": self.layer_to_num_channels,
             "available_channel_metrics": list(CHANNEL_METRICS),
             "available_expert_metrics": list(EXPERT_METRICS),
+            "channel_scores": channel_scores,
             "expert_scores": expert_scores,
             "gate_scores": {
                 "usage": _to_nested_expert_dict(self.gate_scores["usage"], scalar=True),
@@ -261,11 +287,6 @@ class RichScoreAccumulator:
             },
             "ema_matrix": _to_nested_expert_dict(ema_matrix, scalar=True),
             "layerwise_loss": dict(self.layerwise_loss),
-            # Backward-compatible aliases
-            "scores": _tensor_map_to_nested_dict(self.expert_scores["activation"]),
-            "first_attr_usage": _scalar_map_to_nested_dict(
-                self.expert_scores["first_attr_usage"]
-            ),
             "expert_usage": _scalar_map_to_nested_dict(self.gate_scores["usage"]),
             "expert_router": _scalar_map_to_nested_dict(self.gate_scores["router"]),
         }
@@ -382,7 +403,7 @@ def collect_weight_scores(model, config, accumulator: RichScoreAccumulator) -> N
             u = expert.up_proj.weight
             d = expert.down_proj.weight
             score = (weight_rms(d, channel_dim=1) + weight_rms(u, channel_dim=0) + weight_rms(g, channel_dim=0)) / 3.0
-            accumulator.expert_scores["weight"][layer_idx][eid] = score.detach().cpu().float()
+            accumulator.channel_metrics["weight"][layer_idx][eid] = score.detach().cpu().float()
             accumulator.hit_counts[layer_idx][eid] = 1
 
 
@@ -400,7 +421,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--model_name_or_path", type=str, required=True)
     p.add_argument("--output_dir", type=str, required=True)
-    p.add_argument("--dataset", type=str, default="gqa", choices=["gqa", "coco"])
+    p.add_argument("--dataset", type=str, default="gqa")
     p.add_argument("--num_samples", type=int, default=128)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--start_idx", type=int, default=0)
@@ -412,12 +433,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def run_collection(args) -> None:
+    args.dataset = normalize_dataset_name(args.dataset)
+    supported_datasets = {"gqa", "coco", "video_mmmu"}
+    if args.dataset not in supported_datasets:
+        raise ValueError(
+            f"Unsupported dataset: {args.dataset}. "
+            f"Supported datasets: {sorted(supported_datasets)}"
+        )
+
     ensure_dir(args.output_dir)
     out_path = os.path.join(args.output_dir, "scores.pt")
     if os.path.exists(out_path) and not args.force:
         print(
             f"[calibration] Found existing scores at {out_path}. "
-            "Pass --force to overwrite."
+            "Pass --force or -f to force overwrite."
         )
         return
 
@@ -457,19 +486,6 @@ def run_collection(args) -> None:
         shuffle=False,
         collate_fn=custom_collate_fn,
     )
-
-    # if args.modality_aware and accumulator.modality_scores is not None:
-    #     print("[calibration] Collecting modality-split activation scores...")
-    #     hook_states = attach_kimi_modality_hooks(model, config, accumulator.modality_scores, args.ema)
-    #     try:
-    #         model.eval()
-    #         with torch.no_grad():
-    #             for batch in tqdm(loader, desc="Collecting modality activations", unit="batch"):
-    #                 inputs = prepare_inputs(bundle, batch, args.dataset)
-    #                 inputs = move_inputs_to_model_device(model, inputs)
-    #                 model(**inputs, use_cache=False, return_dict=True)
-    #     finally:
-    #         restore_kimi_modality_hooks(hook_states)
 
     print("[calibration] Collecting block-reconstruction scores with attn_mlp collector...")
     for layer_idx in accumulator.layers:

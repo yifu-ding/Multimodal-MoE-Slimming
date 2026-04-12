@@ -222,7 +222,16 @@ def resolve_model_name_or_path(model_name_or_path: str) -> str:
     return model_name_or_path
 
 
+def normalize_dataset_name(dataset_name: str) -> str:
+    normalized = dataset_name.strip().lower()
+    aliases = {
+        "vmmmu": "video_mmmu",
+    }
+    return aliases.get(normalized, normalized)
+
+
 def build_dataset(dataset_name: str, model_family: str):
+    dataset_name = normalize_dataset_name(dataset_name)
     if dataset_name == "gqa":
         return TransformedListDataset(load_gqa_instruction_rows(), gqa_transform)
     if dataset_name == "coco":

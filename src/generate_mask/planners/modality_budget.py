@@ -82,8 +82,8 @@ def build_modality_budget_masks(
                 norm_vis_ema = (affinity + 1.0) / 2.0
             norm_text_ema = 1.0 - norm_vis_ema
 
-            # target_budget = text_K_E[lid, eid] * norm_text_ema + visual_K_E[lid, eid] * norm_vis_ema
-            target_budget = (text_K_E[lid, eid] + visual_K_E[lid, eid]) / 2.0
+            target_budget = text_K_E[lid, eid] * norm_text_ema + visual_K_E[lid, eid] * norm_vis_ema
+            # target_budget = (text_K_E[lid, eid] + visual_K_E[lid, eid]) / 2.0
 
             visual_only_idx = torch.nonzero(visual_only_mask, as_tuple=False).flatten()
             text_only_idx = torch.nonzero(text_only_mask, as_tuple=False).flatten()

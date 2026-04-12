@@ -20,7 +20,8 @@ export PYTHONPATH="${PREFIX}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
-SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa-second_order-rell2/scores.pt}"
+# SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa-second_order-rell2/scores.pt}"
+SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa-0412-2015/scores.pt}"
 
 PRUNE_RATIO="${PRUNE_RATIO:-0.50}"
 # INTER_METHOD options (inter-layer planner):
@@ -32,28 +33,34 @@ PRUNE_RATIO="${PRUNE_RATIO:-0.50}"
 #   loss_coverage
 #   raw_loss_coverage
 INTER_METHOD="${INTER_METHOD:-uniform}"
-# INTRA_METHOD options (intra-layer planner):
+# INTRA_METHOD options (intra-layer planner, 基于 EXPERT_METRICS):
 #   uniform
-#   channel_ranking
-#   loss
-#   global
-#   usage
-#   router
-#   attr_coverage
-#   second_attr_coverage
-#   true_ablate
-#   true_ablate_coverage
-#   loss_coverage  # 没有计算逐个expert loss的话就不支持这个参数
+#   usage              # gate_scores.usage
 #   usage_coverage
+#   router             # gate_scores.router
 #   router_coverage
+#   attr_coverage      # expert_scores.first_attr
+#   second_attr_coverage  # expert_scores.second_attr
+#   true_ablate        # expert_scores.true_ablate
+#   true_ablate_coverage
 INTRA_METHOD="${INTRA_METHOD:-second_attr_coverage}"
-# INTRA_EXPERT_METRIC options (must exist in scores payload expert_scores):
-#   activation, wa, grad, gateup_act, activation_text, activation_visual, saliency, token_contrib, wg, weight
-INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-activation}"
+# INTRA_EXPERT_METRIC options (must exist in scores payload channel_scores):
+# 每个 metric 都有 _text / _visual 后缀版本，开双模态时用 xxx_text + xxx_visual
+#   gateup_act, gateup_text, gateup_visual
+#   3proj_act, 3proj_act_text, 3proj_act_visual
+#   down_second_order, down_second_order_text, down_second_order_visual
+#   3proj_second_order, 3proj_second_order_text, 3proj_second_order_visual
+#   down_saliency, down_saliency_text, down_saliency_visual
+#   3proj_saliency, 3proj_saliency_text, 3proj_saliency_visual
+#   wa, wa_text, wa_visual
+#   3proj_grad, 3proj_grad_text, 3proj_grad_visual
+#   wg, weight
+INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-3proj_second_order}"
+SMOOTH_FN="${SMOOTH_FN:-fourth_root}"  # sqrt, cbrt, fourth_root, log, ...
 ALIGN_INTER="${ALIGN_INTER:-0}"
 MIN_PER_EXPERT="${MIN_PER_EXPERT:-128}"
 
-MODALITY_AWARE="${MODALITY_AWARE:-1}"  # 是否开启双模态
+MODALITY_AWARE="${MODALITY_AWARE:-0}"  # 是否开启双模态
 # THRESHOLDS_PATH="${THRESHOLDS_PATH:-${PREFIX}/storage/prune/thresholds/kimi_gqa/thresholds.pt}"
 THRESHOLDS_PATH="${THRESHOLDS_PATH:-}" 
 
@@ -77,6 +84,7 @@ CMD=(
     --inter_method "${INTER_METHOD}"
     --intra_method "${INTRA_METHOD}"
     --intra_expert_metric "${INTRA_EXPERT_METRIC}"
+    --smooth_fn "${SMOOTH_FN}"
     --align_inter "${ALIGN_INTER}"
     --min_per_expert "${MIN_PER_EXPERT}"
     --num_samples "${NUM_SAMPLES}"
@@ -111,6 +119,7 @@ echo "Inter       : ${INTER_METHOD}"
 echo "Intra       : ${INTRA_METHOD}"
 echo "Metric      : ${INTRA_EXPERT_METRIC}"
 echo "Modality    : $([[ "${MODALITY_AWARE}" == "1" ]] && echo "text+visual" || echo "disabled")"
+echo "Smooth fn   : ${SMOOTH_FN}"
 echo "Eval output : ${OUTPUT_DIR}"
 echo "Samples     : ${NUM_SAMPLES} (0=full)"
 echo "GPU         : ${CUDA_VISIBLE_DEVICES}"
