@@ -42,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--model_path", type=str, required=True)
     p.add_argument("--scores_path", type=str, required=True)
+    p.add_argument("--thresholds_path", type=str, default=None)
     p.add_argument("--output_dir", type=str, required=True)
     p.add_argument("--prune_ratio", type=float, default=0.30)
     p.add_argument("--inter_method", type=str, default="uniform")
@@ -63,10 +64,18 @@ def main() -> None:
     os.makedirs(args.output_dir, exist_ok=True)
 
     print(f"[Run] Loading scores from: {args.scores_path}")
+    
+    if args.thresholds_path is not None and args.modality_aware:
+        # 读取 threshold_path 的 pt 文件中存储的intra_expert_metric并覆盖 args.intra_expert_metric
+        thresh = torch.load(args.thresholds_path, map_location="cpu", weights_only=False)
+        args.intra_expert_metric = thresh["metadata"].get("intra_expert_metric", "channel_second_order")
+        print(f"[Run] Overridden from thresholds.pt: intra_expert_metric={args.intra_expert_metric}")
+    
     mask_result = build_masks_pipeline(
         scores_dir=args.scores_path,
         prune_kwargs={
             "prune_ratio": args.prune_ratio,
+            "thresholds_path": args.thresholds_path,
             "mask_method_kwargs": {
                 "inter_layer_method": args.inter_method,
                 "intra_layer_method": args.intra_method,

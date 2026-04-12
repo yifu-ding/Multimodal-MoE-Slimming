@@ -60,6 +60,17 @@ __all__ = [
 DEFAULT_PRUNING_RATIOS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
 
 
+def _fmt_tensor_decimals(t: torch.Tensor, ndigits: int = 4) -> str:
+    """Pretty-print tensor as nested lists with uniform float formatting."""
+
+    def _rec(x: Any) -> str:
+        if isinstance(x, list):
+            return "[" + ", ".join(_rec(v) for v in x) + "]"
+        return f"{float(x):.{ndigits}f}"
+
+    return _rec(t.detach().cpu().float().tolist())
+
+
 # ---------------------------------------------------------------------------
 # Soft-mask helpers
 # ---------------------------------------------------------------------------
@@ -268,6 +279,14 @@ def threshold_calibration_forward(
     text_thresh, visual_thresh = init_thresholds(
         text_score_dev, visual_score_dev, pruning_ratios, block_device
     )
+    print(
+        f"[threshold_cal] Layer {layer_idx} init\n"
+        f"  keep_ratio(target)={[1-x for x in pruning_ratios]}\n"
+        f"  text_thresh={_fmt_tensor_decimals(text_thresh[0])}\n"
+        f"  visual_thresh={_fmt_tensor_decimals(visual_thresh[0])}",
+        flush=True,
+    )
+
     optimizer = torch.optim.Adam([text_thresh, visual_thresh], lr=lr)
 
     teacher_state: Dict[str, Any] = {}
@@ -286,7 +305,7 @@ def threshold_calibration_forward(
     try:
         for epoch in range(num_epochs):
             if anneal and num_epochs > 1:
-                tau = tau_start + (tau_end - tau_start) * epoch / (num_epochs - 1)
+                tau = tau_start * (tau_end / tau_start) ** (epoch / (num_epochs - 1))
             else:
                 tau = tau_start
 
@@ -374,16 +393,75 @@ def threshold_calibration_forward(
                 ep_steps += 1
                 total_step_count += 1
 
+
+            ###############################################################
+            # 换 hard mask 来验证，而不是 annealing 的 soft mask             #
+            ###############################################################
+            
+            # -- hard-mask validation (no grad, detached) --
+            hard_loss_accum = torch.zeros(R, dtype=torch.float32)
+            hard_keep_accum = torch.zeros(R, dtype=torch.float32)
+            hard_steps = 0
+            with torch.no_grad():
+                for batch in tqdm(
+                    dataloader, desc=f"ThreshCal L{layer_idx} ep{epoch} hard-eval", leave=False
+                ):
+                    teacher_state.clear()
+                    val_inputs = prepare_inputs(bundle, batch, dataset_name)
+                    val_inputs = move_inputs_to_model_device(model, val_inputs)
+                    val_attn = val_inputs["attention_mask"].to(block_device)
+                    model(**val_inputs, use_cache=False, return_dict=True)
+                    if not teacher_state:
+                        continue
+                    val_in_args = _move_to_device_dtype(
+                        teacher_state["in_args"], block_device, dtype
+                    )
+                    val_in_kwargs = _move_to_device_dtype(
+                        teacher_state["in_kwargs"], block_device, dtype
+                    )
+                    val_target = unwrap_output(teacher_state["output"])
+                    val_target = _move_to_device_dtype(val_target, block_device, dtype)
+
+                    for k in range(R):
+                        hm = (
+                            (text_score_dev >= text_thresh[:, k : k + 1])
+                            | (visual_score_dev >= visual_thresh[:, k : k + 1])
+                        ).float()
+                        copied_block.mlp._current_soft_mask = hm
+                        with torch.autocast(
+                            device_type=device_type,
+                            dtype=dtype,
+                            enabled=autocast_enabled,
+                        ):
+                            hpred = unwrap_output(
+                                copied_block(*val_in_args, **val_in_kwargs)
+                            )
+                            hloss, _ = compute_block_loss(
+                                pred=hpred,
+                                teacher_target=val_target,
+                                attn_mask=val_attn,
+                                loss_fn=loss_fn,
+                            )
+                        hard_loss_accum[k] += float(hloss.item())
+                        hard_keep_accum[k] += float(hm.mean().item())
+                    hard_steps += 1
+
             if verbose:
-                avg_loss = ep_loss / max(ep_steps, 1)  # [R]
-                avg_keep = ep_keep / max(ep_steps, 1)  # [R]
-                ratio_strs = "  ".join(
-                    f"r{pruning_ratios[k]:.1f}:loss={avg_loss[k]:.4f},keep={avg_keep[k]:.4f}"
-                    for k in range(R)
-                )
+                avg_loss = ep_loss / max(ep_steps, 1)
+                avg_keep = ep_keep / max(ep_steps, 1)
+                avg_hard_loss = hard_loss_accum / max(hard_steps, 1)
+                avg_hard_keep = hard_keep_accum / max(hard_steps, 1)
+                headers = [f"r{r:.1f}" for r in pruning_ratios]
+                print(f"[ThreshCal] L{layer_idx} epoch={epoch} tau={tau:.4f}")
+                print(" ratio  " + "  ".join(f"{h:>8}" for h in headers))
+                print("  keep  " + "  ".join(f"{float(v):>8.4f}" for v in avg_keep))
+                print("  loss  " + "  ".join(f"{float(v):>8.4f}" for v in avg_loss))
+                print(" hkeep  " + "  ".join(f"{float(v):>8.4f}" for v in avg_hard_keep))
+                print(" hloss  " + "  ".join(f"{float(v):>8.4f}" for v in avg_hard_loss))
                 print(
-                    f"[ThreshCal] L{layer_idx} epoch={epoch} tau={tau:.4f}  "
-                    f"{ratio_strs}",
+                    f"[threshold_cal] Layer {layer_idx} epoch end\n"
+                    f"  text_thresh={_fmt_tensor_decimals(text_thresh[0])}\n"
+                    f"  visual_thresh={_fmt_tensor_decimals(visual_thresh[0])}",
                     flush=True,
                 )
 
@@ -417,8 +495,15 @@ def threshold_calibration_forward(
 # Full calibration across all layers
 # ---------------------------------------------------------------------------
 
-def _load_modality_scores(scores_path: str, device: str = "cpu"):
-    """Load ``activation_text`` and ``activation_visual`` from a scores payload.
+def _load_modality_scores(
+    scores_path: str,
+    device: str = "cpu",
+    intra_expert_metric: str = "activation",
+):
+    """Load per-modality channel scores from a scores payload.
+
+    The field names are ``{intra_expert_metric}_text`` and
+    ``{intra_expert_metric}_visual`` inside ``expert_scores``.
 
     Returns:
         text_scores  {layer_idx: Tensor[E, I]}
@@ -437,12 +522,16 @@ def _load_modality_scores(scores_path: str, device: str = "cpu"):
             )
         return out
 
-    text_nested = es.get("activation_text")
-    visual_nested = es.get("activation_visual")
+    text_key = f"{intra_expert_metric}_text"
+    visual_key = f"{intra_expert_metric}_visual"
+    text_nested = es.get(text_key)
+    visual_nested = es.get(visual_key)
     if text_nested is None or visual_nested is None:
+        available = sorted(es.keys())
         raise ValueError(
-            "scores.pt must contain expert_scores.activation_text and "
-            "expert_scores.activation_visual."
+            f"scores.pt must contain expert_scores.{text_key} and "
+            f"expert_scores.{visual_key}. "
+            f"Available keys: {available}"
         )
     text_scores = _to_layer_tensors(text_nested)
     visual_scores = _to_layer_tensors(visual_nested)
@@ -464,7 +553,8 @@ def run_threshold_calibration(args) -> None:
     pruning_ratios = [float(x) for x in args.pruning_ratios.split(",")]
 
     text_scores, visual_scores, layers = _load_modality_scores(
-        args.scores_path, device="cpu"
+        args.scores_path, device="cpu",
+        intra_expert_metric=args.intra_expert_metric,
     )
 
     bundle = load_model_bundle(args.model_name_or_path)
@@ -524,8 +614,10 @@ def run_threshold_calibration(args) -> None:
         result_keep[layer_idx] = layer_result["actual_keep_ratio"]
 
         print(
-            f"[threshold_cal] Layer {layer_idx} done. "
-            f"keep_ratio={layer_result['actual_keep_ratio'].tolist()}",
+            f"[threshold_cal] Layer {layer_idx} done\n"
+            f"  keep_ratio={_fmt_tensor_decimals(layer_result['actual_keep_ratio'])}\n"
+            f"  text_thresh={_fmt_tensor_decimals(layer_result['text_thresh'][0])}\n"
+            f"  visual_thresh={_fmt_tensor_decimals(layer_result['visual_thresh'][0])}",
             flush=True,
         )
 
@@ -569,9 +661,11 @@ def _save_thresholds(
             "dataset": args.dataset,
             "num_samples": args.num_samples,
             "loss_fn": args.loss_fn,
+            "intra_expert_metric": args.intra_expert_metric,
         },
     }
     torch.save(payload, path)
+    print(f"[threshold_cal] Saved to {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +677,7 @@ def generate_mask_from_thresholds(
     scores_path: str,
     target_ratio: float,
     device: str = "cpu",
+    intra_expert_metric: str = "activation",
 ) -> Dict[str, Any]:
     """Build binary pruning masks from a calibrated ``thresholds.pt``.
 
@@ -593,7 +688,9 @@ def generate_mask_from_thresholds(
     ratios = thresh["pruning_ratios"]
     k = int((ratios - target_ratio).abs().argmin().item())
 
-    text_scores, visual_scores, layers = _load_modality_scores(scores_path, device)
+    text_scores, visual_scores, layers = _load_modality_scores(
+        scores_path, device, intra_expert_metric=intra_expert_metric
+    )
 
     L = len(layers)
     first_layer = layers[0]
@@ -627,7 +724,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--model_name_or_path", type=str, required=True)
     p.add_argument("--scores_path", type=str, required=True,
-                    help="Path to scores.pt with activation_text/visual.")
+                    help="Path to scores.pt with modality-split channel scores.")
+    p.add_argument("--intra_expert_metric", type=str, default="activation",
+                    help="Base metric name in expert_scores (fields: {metric}_text, {metric}_visual).",
+                    choices=["activation", "channel_second_order"],
+                    )
     p.add_argument("--output_dir", type=str, required=True)
     p.add_argument("--dataset", type=str, default="gqa", choices=["gqa", "coco"])
     p.add_argument("--num_samples", type=int, default=128)

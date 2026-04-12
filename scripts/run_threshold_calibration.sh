@@ -28,12 +28,12 @@ MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/debug/scores.pt}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/thresholds/kimi_gqa}"
 
-NUM_SAMPLES="${NUM_SAMPLES:-16}"
+NUM_SAMPLES="${NUM_SAMPLES:-128}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 DATASET="${DATASET:-gqa}"
 
 PRUNING_RATIOS="${PRUNING_RATIOS:-0.1,0.2,0.3,0.4,0.5,0.6,0.7}"
-NUM_EPOCHS="${NUM_EPOCHS:-3}"
+NUM_EPOCHS="${NUM_EPOCHS:-5}"
 LR="${LR:-0.01}"
 # PENALTY_LAMBDA 是剪枝率约束项的惩罚系数 λ，控制 loss 中两项的相对权重：
 # loss = loss_recon + λ · (keep_ratio - target_keep)²
@@ -47,6 +47,8 @@ PENALTY_LAMBDA="${PENALTY_LAMBDA:-100.0}"
 TAU_START="${TAU_START:-0.1}"
 TAU_END="${TAU_END:-0.01}"
 LOSS_FN="${LOSS_FN:-rel_l2}"
+# INTRA_EXPERT_METRIC 只有两个选项： activation 和 channel_second_order
+INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-channel_second_order}"
 
 # Set to 1 to disable temperature annealing
 NO_ANNEAL="${NO_ANNEAL:-0}"
@@ -66,6 +68,7 @@ CMD=(
     --tau_start "${TAU_START}"
     --tau_end "${TAU_END}"
     --loss_fn "${LOSS_FN}"
+    --intra_expert_metric "${INTRA_EXPERT_METRIC}"
     --force
 )
 
@@ -84,8 +87,9 @@ echo "Pruning ratios : ${PRUNING_RATIOS}"
 echo "Epochs         : ${NUM_EPOCHS}"
 echo "LR             : ${LR}"
 echo "Lambda         : ${PENALTY_LAMBDA}"
-echo "Tau            : ${TAU_START} → ${TAU_END}"
+echo "Tau            : ${TAU_START} → ${TAU_END} (cosine annealing)"
 echo "Loss fn        : ${LOSS_FN}"
+echo "Metric         : ${INTRA_EXPERT_METRIC}"
 echo "Samples        : ${NUM_SAMPLES}"
 echo "GPU            : ${CUDA_VISIBLE_DEVICES}"
 echo "Log file       : ${LOG_FILE}"

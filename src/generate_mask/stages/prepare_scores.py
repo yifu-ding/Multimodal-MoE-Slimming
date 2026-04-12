@@ -181,23 +181,15 @@ def load_modality_channel_scores(
 ):
     expert_scores, _, aux, payload = load_channel_scores(scores_dir, device=device, verbose=False)
     gate_scores = aux.get("gate_scores", {})
-    if intra_expert_metric == "second_order":
-        text_scores = expert_scores.get("channel_second_order_text", None)
-        visual_scores = expert_scores.get("channel_second_order_visual", None)
-        if text_scores is None or visual_scores is None:
-            raise ValueError(
-                "Requested modality-aware second_order masks, but "
-                "`channel_second_order_text/visual` were not found in scores payload."
-            )
-    else:
-        text_scores = expert_scores.get("activation_text", None)
-        visual_scores = expert_scores.get("activation_visual", None)
-        if text_scores is None or visual_scores is None:
-            if payload is not None and payload.get("modality_channel_scores") is not None:
-                text_scores = _nested_scores_to_layer_tensors(payload["modality_channel_scores"]["text"])
-                visual_scores = _nested_scores_to_layer_tensors(payload["modality_channel_scores"]["visual"])
-            else:
-                raise ValueError(f"modality-split scores are required, but not found in {scores_dir}")
+
+    text_scores = expert_scores.get(f"{intra_expert_metric}_text", None)
+    visual_scores = expert_scores.get(f"{intra_expert_metric}_visual", None)
+    if text_scores is None or visual_scores is None:
+        if payload is not None and payload.get("modality_channel_scores") is not None:
+            text_scores = _nested_scores_to_layer_tensors(payload["modality_channel_scores"]["text"])
+            visual_scores = _nested_scores_to_layer_tensors(payload["modality_channel_scores"]["visual"])
+        else:
+            raise ValueError(f"modality-split scores are required, but not found in {scores_dir}")
 
     ema_nested = payload.get("ema_matrix") if payload is not None else None
     if ema_nested is None:
@@ -231,6 +223,7 @@ def prepare_scores(
     mask_method_kwargs: Dict[str, Any],
     prune_ratio: float,
     smooth_fn: str = "sqrt",
+    modality_aware: bool = False,
     device: str = "cpu",
     verbose: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, int, int, int, Dict[str, Any], list]:
@@ -242,20 +235,17 @@ def prepare_scores(
     ####################################
     
     intra_expert_metric = mask_method_kwargs.get("intra_expert_metric", "activation")
-    if intra_expert_metric == "second_order":
-        text_scores = expert_scores.get("channel_second_order_text")
-        visual_scores = expert_scores.get("channel_second_order_visual")
-        if text_scores is None or visual_scores is None:
-            raise KeyError(
-                "Requested intra_expert_metric=second_order, but "
-                "`channel_second_order_text/visual` are missing from scores payload."
-            )
+    if modality_aware:
+        modality_scores = load_modality_channel_scores(scores_dir, device, intra_expert_metric)
+        text_scores = modality_scores["text"]
+        visual_scores = modality_scores["visual"]
         intermediate_scores = (
             dict_to_tensor(text_scores).to(device=device, dtype=torch.float32)
             + dict_to_tensor(visual_scores).to(device=device, dtype=torch.float32)
         ) / 2.0
-        
         _print("[prepare_scores] intermediate_scores is mean of text and visual scores")
+        L, E, I = intermediate_scores.shape
+        intermediate_scores = (intermediate_scores, modality_scores)
     else:
         if intra_expert_metric not in expert_scores:
             raise KeyError(
@@ -263,7 +253,7 @@ def prepare_scores(
                 f"available={sorted(expert_scores.keys())}"
             )
         intermediate_scores = dict_to_tensor(expert_scores[intra_expert_metric]).to(device=device, dtype=torch.float32)
-    L, E, I = intermediate_scores.shape
+        L, E, I = intermediate_scores.shape
 
     ####################################
     # source of expert-level scores    # 

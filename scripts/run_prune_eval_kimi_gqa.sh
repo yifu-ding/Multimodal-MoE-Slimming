@@ -20,7 +20,7 @@ export PYTHONPATH="${PREFIX}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
-SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa-second_order/scores.pt}"
+SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/debug/scores.pt}"
 
 PRUNE_RATIO="${PRUNE_RATIO:-0.50}"
 # INTER_METHOD options (inter-layer planner):
@@ -31,7 +31,7 @@ PRUNE_RATIO="${PRUNE_RATIO:-0.50}"
 #   loss_smooth_<N>      # e.g. loss_smooth_1, loss_smooth_2
 #   loss_coverage
 #   raw_loss_coverage
-INTER_METHOD="${INTER_METHOD:-loss_smooth_1}"
+INTER_METHOD="${INTER_METHOD:-uniform}"
 # INTRA_METHOD options (intra-layer planner):
 #   uniform
 #   channel_ranking
@@ -49,11 +49,13 @@ INTER_METHOD="${INTER_METHOD:-loss_smooth_1}"
 INTRA_METHOD="${INTRA_METHOD:-second_attr_coverage}"
 # INTRA_EXPERT_METRIC options (must exist in scores payload expert_scores):
 #   activation, wa, grad, gateup_act, activation_text, activation_visual, saliency, token_contrib, wg, weight
-INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-activation}"
+INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-channel_second_order}"  # threshold 的话直接读 pt 里存储的值，不需要传入，会覆盖
 ALIGN_INTER="${ALIGN_INTER:-0}"
 MIN_PER_EXPERT="${MIN_PER_EXPERT:-128}"
 
 MODALITY_AWARE="${MODALITY_AWARE:-1}"  # 是否开启双模态
+# THRESHOLDS_PATH="${THRESHOLDS_PATH:-${PREFIX}/storage/prune/thresholds/kimi_gqa/thresholds.pt}"
+THRESHOLDS_PATH="${THRESHOLDS_PATH:-}" 
 
 NUM_SAMPLES="${NUM_SAMPLES:-500}"  # 样本数
 START_IDX="${START_IDX:-0}"
@@ -91,6 +93,10 @@ if [[ -n "${SUBSET_SEED}" ]]; then
     CMD+=(--subset_seed "${SUBSET_SEED}")
 fi
 
+if [[ -n "${THRESHOLDS_PATH}" ]]; then
+    CMD+=(--thresholds_path "${THRESHOLDS_PATH}")
+fi
+
 CMD+=("${EXTRA_ARGS[@]}")
 
 mkdir -p "${OUTPUT_DIR}"
@@ -99,6 +105,7 @@ LOG_FILE="${OUTPUT_DIR}/stdout_${TIMESTAMP}.log"
 {
 echo "Model       : ${MODEL_PATH}"
 echo "Scores      : ${SCORES_PATH}"
+echo "Thresholds  : $([[ -n "${THRESHOLDS_PATH}" ]] && echo "${THRESHOLDS_PATH}" || echo "disabled")"
 echo "Prune ratio : ${PRUNE_RATIO}"
 echo "Inter       : ${INTER_METHOD}"
 echo "Intra       : ${INTRA_METHOD}"
