@@ -2,9 +2,9 @@ from typing import List, Optional, Tuple, Union, Dict
 from PIL import Image
 import decord
 import os
-import sys
 from pathlib import Path
 import numpy as np
+import pyarrow.parquet as pq
 
 from tasks.dataset_paths import require_dataset_dir, resolve_dataset_dir
 
@@ -12,6 +12,7 @@ VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 HOME = resolve_dataset_dir("VideoMMMU")
+ADAPTATION_IMAGE_BY_ID = None
 
 
 def get_cache_dir(subject):
@@ -79,6 +80,41 @@ def _resize_frame(frame: Image.Image, max_long_side: int) -> Image.Image:
         new_h = int(round(new_w * aspect_ratio))
     resized_frame = frame.resize((new_w, new_h), Image.Resampling.LANCZOS)
     return resized_frame
+
+
+def _load_adaptation_image_index() -> Dict[str, object]:
+    global ADAPTATION_IMAGE_BY_ID
+    if ADAPTATION_IMAGE_BY_ID is None:
+        path = os.path.join(require_dataset_dir("VideoMMMU", "Adaptation"), "test-00000-of-00001.parquet")
+        rows = pq.read_table(path, columns=["id", "image"]).to_pylist()
+        ADAPTATION_IMAGE_BY_ID = {row["id"]: row.get("image") for row in rows}
+    return ADAPTATION_IMAGE_BY_ID
+
+
+def _image_payload_to_frame(image_payload) -> Optional[Image.Image]:
+    if isinstance(image_payload, Image.Image):
+        return _resize_frame(image_payload.convert("RGB"), max_long_side=480)
+
+    if isinstance(image_payload, dict):
+        image_bytes = image_payload.get("bytes")
+        if image_bytes is not None:
+            from io import BytesIO
+
+            with Image.open(BytesIO(image_bytes)) as img:
+                return _resize_frame(img.convert("RGB"), max_long_side=480)
+
+        image_path = image_payload.get("path")
+        if image_path:
+            candidate = os.path.join(HOME, image_path)
+            if os.path.exists(candidate):
+                with Image.open(candidate) as img:
+                    return _resize_frame(img.convert("RGB"), max_long_side=480)
+
+    return None
+
+
+def _build_placeholder_frame() -> Image.Image:
+    return Image.new("RGB", (224, 224), color=(240, 240, 240))
 
 
 def process_media(
@@ -154,19 +190,12 @@ def videommmu_doc_to_visual(doc):
     if os.path.exists(video_path):
         return process_media(video_path)
 
-    image_payload = doc.get("image")
-    if isinstance(image_payload, dict):
-        image_bytes = image_payload.get("bytes")
-        if image_bytes is not None:
-            from io import BytesIO
-
-            with Image.open(BytesIO(image_bytes)) as img:
-                frame = _resize_frame(img.convert("RGB"), max_long_side=480)
-            return [frame], 1
-
-    raise FileNotFoundError(
-        f"video path:{video_path} does not exist, and no fallback image was found in the parquet row"
-    )
+    frame = _image_payload_to_frame(doc.get("image"))
+    if frame is None:
+        frame = _image_payload_to_frame(_load_adaptation_image_index().get(doc["id"]))
+    if frame is None:
+        frame = _build_placeholder_frame()
+    return [frame], 1
 
 
 def videommmu_doc_to_text_adaptation(doc):

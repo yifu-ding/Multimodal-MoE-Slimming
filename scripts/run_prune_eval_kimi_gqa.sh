@@ -20,8 +20,14 @@ export PYTHONPATH="${PREFIX}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
+# 这两个 scores 保留路径位置
 # SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa-second_order-rell2/scores.pt}"
-SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa-0412-2015/scores.pt}"
+# SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa-0412-2015/scores.pt}"
+# 这三个是新的 scores 路径位置
+# storage/prune/scores/kimi_gqa-0413-0119/scores.pt
+# storage/prune/scores/kimi_coco-0413-0119/scores.pt
+# storage/prune/scores/kimi_video_mmmu-0413-0208/scores.pt
+SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa-0413-0119/scores.pt}"
 
 PRUNE_RATIO="${PRUNE_RATIO:-0.50}"
 # INTER_METHOD options (inter-layer planner):
@@ -59,11 +65,11 @@ INTRA_METHOD="${INTRA_METHOD:-second_attr_coverage}"
 # 这两个 metric 没有双模态版本
 #   wg 
 #   weight
-MODALITY_AWARE="${MODALITY_AWARE:-0}"  # 是否开启双模态
-INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-3proj_second_order}"
+MODALITY_AWARE="${MODALITY_AWARE:-1}"  # 是否开启双模态
+INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-3proj_act}"
 
 ALIGN_INTER="${ALIGN_INTER:-0}"
-MIN_PER_EXPERT="${MIN_PER_EXPERT:-128}"
+MIN_PER_EXPERT="${MIN_PER_EXPERT:-256}"
 
 # THRESHOLDS_PATH="${THRESHOLDS_PATH:-${PREFIX}/storage/prune/thresholds/kimi_gqa/thresholds.pt}"
 THRESHOLDS_PATH="${THRESHOLDS_PATH:-}" 
