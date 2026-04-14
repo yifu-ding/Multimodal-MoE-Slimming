@@ -3,7 +3,7 @@ import copy
 import numbers
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -50,53 +50,6 @@ class LoadedScores:
     ts: float
 
 
-def _pick_winners(loaded: List[LoadedScores]) -> Tuple[Dict[int, int], List[str]]:
-    winner_idx_by_layer: Dict[int, int] = {}
-    warnings: List[str] = []
-    layer_to_candidate_idx: Dict[int, List[int]] = {}
-    for idx, item in enumerate(loaded):
-        for layer in item.layers:
-            layer_to_candidate_idx.setdefault(layer, []).append(idx)
-
-    for layer, candidate_indices in sorted(layer_to_candidate_idx.items()):
-        nonzero_indices = [
-            idx for idx in candidate_indices if not _layer_is_all_zero(loaded[idx].payload, layer)
-        ]
-
-        if nonzero_indices:
-            winner_idx = max(nonzero_indices, key=lambda i: loaded[i].ts)
-            for idx in candidate_indices:
-                if idx in nonzero_indices:
-                    continue
-                skipped = loaded[idx]
-                warnings.append(
-                    f"[merge warning] layer={layer} ignore all-zero source {skipped.path} "
-                    f"(ts={skipped.ts:.3f})"
-                )
-        else:
-            winner_idx = max(candidate_indices, key=lambda i: loaded[i].ts)
-            if len(candidate_indices) > 1:
-                winner = loaded[winner_idx]
-                warnings.append(
-                    f"[merge warning] layer={layer} all candidates are zero; fallback to newest "
-                    f"{winner.path} (ts={winner.ts:.3f})"
-                )
-
-        winner_idx_by_layer[layer] = winner_idx
-
-        if len(candidate_indices) > 1:
-            winner = loaded[winner_idx]
-            for idx in candidate_indices:
-                if idx == winner_idx:
-                    continue
-                other = loaded[idx]
-                warnings.append(
-                    f"[merge warning] layer={layer} selected {winner.path} (ts={winner.ts:.3f}), "
-                    f"ignored {other.path} (ts={other.ts:.3f})"
-                )
-    return winner_idx_by_layer, warnings
-
-
 def _get_layer_value(layer_map: Dict[Any, Any], layer: int):
     if layer in layer_map:
         return layer_map[layer]
@@ -128,37 +81,63 @@ def _value_has_nonzero(v: Any) -> bool:
         return False
 
 
-def _layer_is_all_zero(payload: dict, layer: int) -> bool:
-    layer_values: List[Any] = []
+def _merge_nonzero_candidates(candidates: List[Tuple[float, Any]]) -> Optional[Any]:
+    if not candidates:
+        return None
 
-    for layer_map in payload.get("channel_scores", {}).values():
-        val = _get_layer_value(layer_map, layer)
+    if any(isinstance(v, dict) for _, v in candidates):
+        keys = set()
+        for _, v in candidates:
+            if isinstance(v, dict):
+                keys.update(v.keys())
+        merged_dict = {}
+        for k in sorted(keys, key=lambda x: str(x)):
+            child_candidates = []
+            for ts, v in candidates:
+                if isinstance(v, dict) and k in v and v[k] is not None:
+                    child_candidates.append((ts, v[k]))
+            child = _merge_nonzero_candidates(child_candidates)
+            if child is not None:
+                merged_dict[k] = child
+        return merged_dict if merged_dict else None
+
+    for _, v in sorted(candidates, key=lambda x: x[0], reverse=True):
+        if _value_has_nonzero(v):
+            return v
+    return None
+
+
+def _merge_latest_nonzero_value(loaded: List[LoadedScores], value_getter) -> Tuple[Optional[Any], bool]:
+    """Return (merged_value, has_any_candidate_value)."""
+    candidates: List[Tuple[float, Any]] = []
+    has_any_value = False
+    for item in loaded:
+        val = value_getter(item.payload)
+        if val is None:
+            continue
+        has_any_value = True
+        candidates.append((item.ts, val))
+    return _merge_nonzero_candidates(candidates), has_any_value
+
+
+def _pick_latest_value(loaded: List[LoadedScores], value_getter) -> Optional[Any]:
+    candidates: List[Tuple[float, Any]] = []
+    for item in loaded:
+        val = value_getter(item.payload)
         if val is not None:
-            layer_values.append(val)
-
-    for layer_map in payload.get("expert_scores", {}).values():
-        val = _get_layer_value(layer_map, layer)
-        if val is not None:
-            layer_values.append(val)
-
-    val = _get_layer_value(payload.get("ema_matrix", {}), layer)
-    if val is not None:
-        layer_values.append(val)
-
-    val = _get_layer_value(payload.get("layerwise_loss", {}), layer)
-    if val is not None:
-        layer_values.append(val)
-
-    if not layer_values:
-        return True
-    return not any(_value_has_nonzero(v) for v in layer_values)
+            candidates.append((item.ts, val))
+    if not candidates:
+        return None
+    _, winner_val = max(candidates, key=lambda x: x[0])
+    return winner_val
 
 
-def _merge_payloads(loaded: List[LoadedScores], winner_idx_by_layer: Dict[int, int]) -> dict:
+def _merge_payloads(loaded: List[LoadedScores]) -> Tuple[dict, List[str]]:
     if not loaded:
         raise ValueError("No scores payloads provided.")
 
     newest = max(loaded, key=lambda x: x.ts)
+    warnings: List[str] = []
     merged = {
         "channel_scores": {},
         "expert_scores": {},
@@ -173,57 +152,105 @@ def _merge_payloads(loaded: List[LoadedScores], winner_idx_by_layer: Dict[int, i
         channel_metrics.update(item.payload.get("channel_scores", {}).keys())
         expert_metrics.update(item.payload.get("expert_scores", {}).keys())
 
+    all_layers = sorted({layer for item in loaded for layer in item.layers})
+
     for metric in sorted(channel_metrics):
-        merged["channel_scores"][metric] = {}
-        for layer, winner_idx in winner_idx_by_layer.items():
-            src = loaded[winner_idx].payload.get("channel_scores", {}).get(metric, {})
-            val = _get_layer_value(src, layer)
-            if val is not None:
-                merged["channel_scores"][metric][layer] = val
+        merged_metric: Dict[int, Any] = {}
+        for layer in all_layers:
+            val, has_any_value = _merge_latest_nonzero_value(
+                loaded,
+                lambda payload, m=metric, l=layer: _get_layer_value(
+                    payload.get("channel_scores", {}).get(m, {}), l
+                ),
+            )
+            if val is None:
+                if has_any_value:
+                    warnings.append(
+                        f"[merge warning] channel_scores.{metric}.{layer} all candidates are zero; skipped"
+                    )
+                continue
+            merged_metric[layer] = val
+        if merged_metric:
+            merged["channel_scores"][metric] = merged_metric
 
     for metric in sorted(expert_metrics):
-        merged["expert_scores"][metric] = {}
-        for layer, winner_idx in winner_idx_by_layer.items():
-            src = loaded[winner_idx].payload.get("expert_scores", {}).get(metric, {})
-            val = _get_layer_value(src, layer)
-            if val is not None:
-                merged["expert_scores"][metric][layer] = val
+        merged_metric = {}
+        for layer in all_layers:
+            val, has_any_value = _merge_latest_nonzero_value(
+                loaded,
+                lambda payload, m=metric, l=layer: _get_layer_value(
+                    payload.get("expert_scores", {}).get(m, {}), l
+                ),
+            )
+            if val is None:
+                if has_any_value:
+                    warnings.append(
+                        f"[merge warning] expert_scores.{metric}.{layer} all candidates are zero; skipped"
+                    )
+                continue
+            merged_metric[layer] = val
+        if merged_metric:
+            merged["expert_scores"][metric] = merged_metric
 
-    for layer, winner_idx in winner_idx_by_layer.items():
-        src_ema = loaded[winner_idx].payload.get("ema_matrix", {})
-        val = _get_layer_value(src_ema, layer)
+    for layer in all_layers:
+        val, has_any_value = _merge_latest_nonzero_value(
+            loaded, lambda payload, l=layer: _get_layer_value(payload.get("ema_matrix", {}), l)
+        )
         if val is not None:
             merged["ema_matrix"][layer] = val
+        elif has_any_value:
+            warnings.append(f"[merge warning] ema_matrix.{layer} all candidates are zero; skipped")
 
-        src_loss = loaded[winner_idx].payload.get("layerwise_loss", {})
-        val = _get_layer_value(src_loss, layer)
+        val, has_any_value = _merge_latest_nonzero_value(
+            loaded, lambda payload, l=layer: _get_layer_value(payload.get("layerwise_loss", {}), l)
+        )
         if val is not None:
             merged["layerwise_loss"][layer] = val
+        elif has_any_value:
+            warnings.append(f"[merge warning] layerwise_loss.{layer} all candidates are zero; skipped")
 
-    merged_layers = sorted(winner_idx_by_layer.keys())
+    merged_layers = sorted(
+        {
+            *{int(k) for metric_map in merged["channel_scores"].values() for k in metric_map.keys()},
+            *{int(k) for metric_map in merged["expert_scores"].values() for k in metric_map.keys()},
+            *{int(k) for k in merged["ema_matrix"].keys()},
+            *{int(k) for k in merged["layerwise_loss"].keys()},
+        }
+    )
     if not isinstance(merged["metadata"], dict):
         merged["metadata"] = {}
     merged["metadata"]["layers"] = merged_layers
 
     layer_to_num_experts: Dict[int, Any] = {}
     layer_to_num_channels: Dict[int, Any] = {}
-    for layer, winner_idx in winner_idx_by_layer.items():
-        src_meta = loaded[winner_idx].payload.get("metadata", {})
-        if not isinstance(src_meta, dict):
-            continue
-        src_e = _to_int_keyed_map(src_meta.get("layer_to_num_experts", {})) if src_meta.get("layer_to_num_experts") else {}
-        src_c = _to_int_keyed_map(src_meta.get("layer_to_num_channels", {})) if src_meta.get("layer_to_num_channels") else {}
-        if layer in src_e:
-            layer_to_num_experts[layer] = src_e[layer]
-        if layer in src_c:
-            layer_to_num_channels[layer] = src_c[layer]
+    for layer in merged_layers:
+        src_e_val = _pick_latest_value(
+            loaded,
+            lambda payload, l=layer: _to_int_keyed_map(
+                payload.get("metadata", {}).get("layer_to_num_experts", {})
+            ).get(l)
+            if isinstance(payload.get("metadata", {}), dict)
+            else None,
+        )
+        src_c_val = _pick_latest_value(
+            loaded,
+            lambda payload, l=layer: _to_int_keyed_map(
+                payload.get("metadata", {}).get("layer_to_num_channels", {})
+            ).get(l)
+            if isinstance(payload.get("metadata", {}), dict)
+            else None,
+        )
+        if src_e_val is not None:
+            layer_to_num_experts[layer] = src_e_val
+        if src_c_val is not None:
+            layer_to_num_channels[layer] = src_c_val
 
     if layer_to_num_experts:
         merged["metadata"]["layer_to_num_experts"] = layer_to_num_experts
     if layer_to_num_channels:
         merged["metadata"]["layer_to_num_channels"] = layer_to_num_channels
 
-    return merged
+    return merged, warnings
 
 
 def main() -> None:
@@ -243,15 +270,13 @@ def main() -> None:
         loaded.append(LoadedScores(path=path, payload=payload, layers=layers, ts=ts))
         print(f"[merge] loaded {path} layers={layers} ts={ts:.3f}")
 
-    winner_idx_by_layer, warnings = _pick_winners(loaded)
+    merged, warnings = _merge_payloads(loaded)
     for w in warnings:
         print(w)
-
-    merged = _merge_payloads(loaded, winner_idx_by_layer)
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     torch.save(merged, args.output)
     print(f"[merge] saved merged scores to: {args.output}")
-    print(f"[merge] merged layers: {sorted(winner_idx_by_layer.keys())}")
+    print(f"[merge] merged layers: {merged.get('metadata', {}).get('layers', [])}")
 
 
 if __name__ == "__main__":
