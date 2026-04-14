@@ -28,10 +28,10 @@ export PYTHONPATH="${PREFIX}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
-# MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
-MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-VL-30B-A3B-Instruct}"
+MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
+# MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-VL-30B-A3B-Instruct}"
 DATASET="${DATASET:-gqa}"
-NUM_SAMPLES="${NUM_SAMPLES:-1024}"
+NUM_SAMPLES="${NUM_SAMPLES:-512}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 START_IDX="${START_IDX:-0}"
 SUBSET_SEED="${SUBSET_SEED:-42}"
@@ -57,8 +57,25 @@ case "${DATASET,,}" in
         ;;
 esac
 
-# OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/kimi_${DATASET_TAG}-second_order}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/kimi_${DATASET_TAG}-rell2-$(date +%m%d%H%M)}"
+MODEL_TAG_RAW="${MODEL_PATH##*/}"
+MODEL_TAG="${MODEL_TAG_RAW,,}"
+case "${MODEL_TAG}" in
+    qwen3-vl-30b-a3b-instruct)
+        MODEL_TAG="qwen3-vl-30b-a3b"
+        ;;
+    kimi-vl-a3b-instruct)
+        MODEL_TAG="kimi-vl-a3b"
+        ;;
+    internvl-3.5-gpt-oss-20b-a4b-preview-hf)
+        MODEL_TAG="internvl-3.5-20b-a4b"
+        ;;
+    *)
+        MODEL_TAG="${MODEL_TAG%-instruct}"
+        ;;
+esac
+
+# OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/${MODEL_TAG}_${DATASET_TAG}-second_order}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/${MODEL_TAG}_${DATASET_TAG}-rell2-$(date +%m%d%H%M)}"
 
 EXTRA_ARGS=("$@")
 

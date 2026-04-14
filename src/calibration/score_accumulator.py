@@ -1,0 +1,116 @@
+from typing import Dict
+
+import torch
+
+from observations.common import resolve_model_name_or_path
+from src.calibration.helpers.helpers import to_nested_expert_dict
+from src.calibration.helpers.utils import is_fused_expert_container
+
+
+from src.calibration.helpers.score_namespace import CHANNEL_METRICS, EXPERT_METRICS
+
+
+class ScoreAccumulator:
+    def __init__(
+        self,
+        layer_to_num_experts: Dict[int, int],
+        layer_to_num_channels: Dict[int, int],
+    ) -> None:
+        self.layer_to_num_experts = layer_to_num_experts
+        self.layer_to_num_channels = layer_to_num_channels
+        self.layers = sorted(layer_to_num_experts.keys())
+        self.channel_metrics: Dict[str, Dict[int, torch.Tensor]] = {}
+        for metric in CHANNEL_METRICS:
+            self.channel_metrics[metric] = {}
+        self.expert_scores: Dict[str, Dict[int, torch.Tensor]] = {}
+        for metric in EXPERT_METRICS + ("usage_text", "usage_visual"):
+            self.expert_scores[metric] = {}
+
+        self.hit_counts: Dict[int, torch.Tensor] = {}
+        self.layerwise_loss: Dict[int, float] = {}
+
+        for layer_idx in self.layers:
+            e = layer_to_num_experts[layer_idx]
+            i = layer_to_num_channels[layer_idx]
+            for metric in CHANNEL_METRICS:
+                self.channel_metrics[metric][layer_idx] = torch.zeros(e, i, dtype=torch.float32)
+            for metric in EXPERT_METRICS + ("usage_text", "usage_visual"):
+                self.expert_scores[metric][layer_idx] = torch.zeros(e, dtype=torch.float32)
+            self.hit_counts[layer_idx] = torch.zeros(e, dtype=torch.int64)
+
+    def absorb_layer_scores(self, layer_idx: int, copied_block) -> None:
+        expert_container = copied_block.mlp.experts
+        if is_fused_expert_container(expert_container):
+            num_experts = self.layer_to_num_experts[layer_idx]
+            for metric in CHANNEL_METRICS:
+                value = getattr(expert_container, metric, None)
+                if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[0] == num_experts:
+                    self.channel_metrics[metric][layer_idx] = value.detach().cpu().float()
+            for metric in EXPERT_METRICS + ("usage_text", "usage_visual"):
+                value = getattr(expert_container, metric, None)
+                if isinstance(value, torch.Tensor) and value.ndim >= 1 and value.shape[0] == num_experts:
+                    self.expert_scores[metric][layer_idx] = value.detach().cpu().float().view(-1)
+                else:
+                    self.expert_scores[metric][layer_idx][eid] = float(value)
+            activation = getattr(expert_container, "activation", None)
+            if isinstance(activation, torch.Tensor) and activation.ndim >= 2 and activation.shape[0] == num_experts:
+                self.hit_counts[layer_idx] = (activation.detach().cpu().float().abs().sum(dim=1) > 0).to(torch.int64)
+            return
+
+        experts = list(expert_container)
+        for eid, expert in enumerate(experts):
+            for metric in CHANNEL_METRICS:
+                value = getattr(expert, metric, None)
+                if value is None:
+                    continue
+                self.channel_metrics[metric][layer_idx][eid] = value.detach().cpu().float()
+            for metric in EXPERT_METRICS + ("usage_text", "usage_visual"): 
+                # usage_text and usage_visual are not in EXPERT_METRICS, but they are used to compute ema_matrix
+                value = getattr(expert, metric, None)
+                if value is None:
+                    continue
+                if isinstance(value, torch.Tensor):
+                    self.expert_scores[metric][layer_idx][eid] = value.detach().cpu().float().reshape(()).item()
+                else:
+                    self.expert_scores[metric][layer_idx][eid] = float(value)
+            if getattr(expert, "activation", None) is not None:
+                self.hit_counts[layer_idx][eid] = 1
+
+    def build_scores_payload(self, args) -> dict:
+        channel_scores = {
+            metric: to_nested_expert_dict(self.channel_metrics[metric], scalar=False)
+            for metric in CHANNEL_METRICS
+        }
+        expert_scores = {
+            metric: to_nested_expert_dict(self.expert_scores[metric], scalar=True)
+            for metric in EXPERT_METRICS
+        }
+        ema_matrix = {}
+        for layer_idx in self.layers:
+            text_freq = self.expert_scores["usage_text"][layer_idx]
+            visual_freq = self.expert_scores["usage_visual"][layer_idx]
+            ema_matrix[layer_idx] = (visual_freq - text_freq).clamp(-1.0, 1.0)
+
+        payload = {
+            "channel_scores": channel_scores,
+            "expert_scores": expert_scores,
+            "ema_matrix": to_nested_expert_dict(ema_matrix, scalar=True),
+            "layerwise_loss": dict(self.layerwise_loss),
+            "metadata": {
+                "loss_fn": args.loss_fn,
+                "num_samples": args.num_samples,
+                "batch_size": args.batch_size,
+                "dataset": args.dataset,
+                "start_idx": args.start_idx,
+                "model_name_or_path": args.model_name_or_path,
+                "resolved_model_name_or_path": resolve_model_name_or_path(args.model_name_or_path),
+                "subset_seed": args.subset_seed,
+                "ema": args.ema,
+                "layers": self.layers,
+                "layer_to_num_experts": self.layer_to_num_experts,
+                "layer_to_num_channels": self.layer_to_num_channels,
+                "available_channel_metrics": list(CHANNEL_METRICS),
+                "available_expert_metrics": list(EXPERT_METRICS),
+            },
+        }
+        return payload

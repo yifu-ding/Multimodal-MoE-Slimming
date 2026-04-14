@@ -31,7 +31,7 @@ export PYTHONPATH="${PREFIX}"
 
 # ── Task grid ──────────────────────────────────────────────────────────────────
 # All 14 tasks requested; override via SWEEP_TASKS env var.
-SWEEP_TASKS="${SWEEP_TASKS:-gqa textvqa chartqa mmstar mmbench mmvet mme realworldqa coco2017cap mvbench egoschema videomme longvideobench video_mmmu}"
+SWEEP_TASKS="${SWEEP_TASKS:-textvqa gqa chartqa mmstar mmbench mmvet mme realworldqa coco2017cap mvbench egoschema videomme longvideobench video_mmmu}"
 
 # ── Setting grids (same defaults as sweep_prune_eval_kimi_gqa.sh) ──────────────
 SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-loss_smooth_2 uniform}"
@@ -43,7 +43,8 @@ SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act 3proj_act d
 # ── Output paths ───────────────────────────────────────────────────────────────
 # Timestamp is fixed at script start so all runs share the same directory.
 SWEEP_TS="${SWEEP_TS:-$(date +%m%d%H%M)}"
-SWEEP_BASE="${REPO_ROOT}/results/prune_eval_kimi_gqa_p50/sweep_tasks-kimi-gqa-rell2-${SWEEP_TS}"
+MODEL_NAME="${MODEL_NAME:-kimi}"
+SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-gqa-rell2-${SWEEP_TS}"
 
 SUMMARY_FILE="${SUMMARY_FILE:-${SWEEP_BASE}/summary.md}"
 SWEEP_LOG_DIR="${SWEEP_LOG_DIR:-${SWEEP_BASE}/logs}"
@@ -112,6 +113,7 @@ for TASK in ${SWEEP_TASKS}; do
             MODALITY_AWARE="${MODALITY_AWARE}" \
             INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC}" \
             SMOOTH_FN="${SMOOTH_FN}" \
+            MODEL_NAME="${MODEL_NAME}" \
             PREFIX="${PREFIX}" \
             bash "${SCRIPT_DIR}/run_prune_eval_kimi_gqa.sh" 2>&1 | tee "${RUN_LOG}"
           EXIT_CODE=${PIPESTATUS[0]}

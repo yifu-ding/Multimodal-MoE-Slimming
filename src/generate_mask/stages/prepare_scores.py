@@ -5,7 +5,7 @@ import torch
 
 from src.base.shared_utils import _print
 from src.base.shared_utils.dict_to_tensor import dict_to_tensor
-from src.calibration.collect_scores_main import CHANNEL_METRICS, EXPERT_METRICS
+from src.calibration.helpers.score_namespace import CHANNEL_METRICS, EXPERT_METRICS
 
 
 __all__ = [
@@ -64,7 +64,6 @@ def load_modality_channel_scores(
         "ema_matrix": ema_tensor,
     }
 
-
 def prepare_scores(
     scores_dir: str,
     mask_method_kwargs: Dict[str, Any],
@@ -76,24 +75,14 @@ def prepare_scores(
     payload = _load_payload(scores_dir, device)
     if verbose:
         _print(f"[Score Loading] Loaded scores payload from {scores_dir}")
-
-    channel_scores = {
-        m: _nested_to_layer_tensors(v) for m, v in payload["channel_scores"].items()
-    }
-    expert_scores = {
-        m: _nested_to_layer_tensors(v) for m, v in payload["expert_scores"].items()
-    }
-    gate_scores = {
-        m: _nested_to_layer_tensors(v) for m, v in payload["gate_scores"].items()
-    }
+    
     layers = _payload_get(payload, "layers")
     if layers is None:
         first_metric = next(iter(payload["channel_scores"].keys()))
         nested = payload["channel_scores"][first_metric]
         layers = sorted(int(k) for k in nested.keys())
-
+        
     intra_expert_metric = mask_method_kwargs.get("intra_expert_metric", "activation")
-
     if modality_aware:
         modality_scores = load_modality_channel_scores(payload, device, intra_expert_metric)
         intermediate_scores = (modality_scores["text"] + modality_scores["visual"]) / 2.0
@@ -101,35 +90,34 @@ def prepare_scores(
         L, E, I = intermediate_scores.shape
         intermediate_scores = (intermediate_scores, modality_scores)
     else:
+        channel_scores = {
+            m: _nested_to_layer_tensors(v) for m, v in payload["channel_scores"].items()
+        }
         intermediate_scores = dict_to_tensor(channel_scores[intra_expert_metric]).to(
             device=device, dtype=torch.float32
         )
         L, E, I = intermediate_scores.shape
-
-    # ---- expert budget source ----
+    
     intra_layer_method = mask_method_kwargs.get("intra_layer_method", "uniform")
-    expert_scores_by_method = {
-        "attr_coverage": "first_attr",
-        "second_attr_coverage": "second_attr",
-        "true_ablate": "true_ablate",
-        "true_ablate_coverage": "true_ablate",
-    }
-    gate_scores_by_method = {
-        "usage": "usage",
-        "usage_coverage": "usage",
-        "router": "router",
-        "router_coverage": "router",
-    }
-    if intra_layer_method in expert_scores_by_method:
-        metric_name = expert_scores_by_method[intra_layer_method]
-        expertwise_scores = dict_to_tensor(expert_scores[metric_name]).to(device=device, dtype=torch.float32)
-    elif intra_layer_method in gate_scores_by_method:
-        metric_name = gate_scores_by_method[intra_layer_method]
-        expertwise_scores = dict_to_tensor(gate_scores[metric_name]).to(device=device, dtype=torch.float32)
-    elif intra_layer_method == "uniform":
+    if intra_layer_method == "uniform":
         expertwise_scores = torch.ones((L, E), dtype=torch.float32, device=device)
     else:
-        raise ValueError(f"Invalid intra_layer_method: {intra_layer_method}")
+        expert_scores = {
+            m: _nested_to_layer_tensors(v) for m, v in payload["expert_scores"].items()
+        }
+        metric_name = intra_layer_method.removesuffix("_coverage")
+        if metric_name not in EXPERT_METRICS:
+            raise ValueError(
+                f"Invalid intra_layer_method: {intra_layer_method} is not in EXPERT_METRICS. "
+            )
+        if metric_name not in expert_scores:
+            raise KeyError(
+                f"Metric '{metric_name}' not found in payload['expert_scores']. "
+                f"Available keys: {sorted(expert_scores.keys())}. Re-run score collection to get all the scores. "
+            )
+        expertwise_scores = dict_to_tensor(expert_scores[metric_name]).to(
+            device=device, dtype=torch.float32
+        )
 
     # ---- inter-layer loss ----
     inter_layer_method = mask_method_kwargs.get("inter_layer_method", "uniform")

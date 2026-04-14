@@ -42,28 +42,30 @@ INTER_METHOD="${INTER_METHOD:-loss_smooth_1}"
 # 在 loss_smooth 的时候会读取，可选：sqrt, cbrt, fourth_root, log, ...
 SMOOTH_FN="${SMOOTH_FN:-fourth_root}"
 # INTRA_METHOD options (intra-layer planner, 基于 EXPERT_METRICS):
-#   uniform
-#   usage              # gate_scores.usage
-#   usage_coverage
-#   router             # gate_scores.router
-#   router_coverage
-#   attr_coverage      # expert_scores.first_attr
+#   uniform_*
+#   usage_*              # gate_scores.usage
+#   router_*             # gate_scores.router
+#   true_ablate_*        # expert_scores.true_ablate
+#   first_attr_coverage
+#   first_attr_fillzero
+#   first_attr_fillzero_coverage
 #   second_attr_coverage  # expert_scores.second_attr
-#   true_ablate        # expert_scores.true_ablate
-#   true_ablate_coverage
-INTRA_METHOD="${INTRA_METHOD:-attr_coverage}"
+#   second_attr_fillzero
+#   second_attr_fillzero_coverage
+INTRA_METHOD="${INTRA_METHOD:-first_attr_coverage}"
 # INTRA_EXPERT_METRIC options (must exist in scores payload channel_scores):
 # 下列 metric 都有 _text / _visual 后缀版本，开双模态时用 xxx_text + xxx_visual
-#   gateup_act, gateup_text, gateup_visual
-#   3proj_act, 3proj_act_text, 3proj_act_visual
-#   down_second_order, down_second_order_text, down_second_order_visual
-#   3proj_second_order, 3proj_second_order_text, 3proj_second_order_visual
-#   down_saliency, down_saliency_text, down_saliency_visual
-#   3proj_saliency, 3proj_saliency_text, 3proj_saliency_visual
-#   wa, wa_text, wa_visual
-#   3proj_grad, 3proj_grad_text, 3proj_grad_visual
-# 这两个 metric 没有双模态版本
-#   wg 
+#   gateup_act
+#   3proj_act
+#   down_second_order  # 这个是 approx 的
+#   3proj_second_order
+#   down_saliency
+#   3proj_saliency
+#   wa
+#   3proj_grad
+#   down_second_order_exact
+#   wg
+# 这个 metric 没有双模态版本
 #   weight
 MODALITY_AWARE="${MODALITY_AWARE:-1}"  # 是否开启双模态
 INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-3proj_act}"
@@ -80,8 +82,28 @@ BATCH_SIZE="${BATCH_SIZE:-1}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"
 SUBSET_SEED="${SUBSET_SEED:-}"
 
+MODEL_NAME="${MODEL_NAME:-}"
+if [[ -z "${MODEL_NAME}" ]]; then
+    MODEL_TAG_RAW="${MODEL_PATH##*/}"
+    MODEL_NAME="${MODEL_TAG_RAW,,}"
+    case "${MODEL_NAME}" in
+        qwen3-vl-30b-a3b-instruct)
+            MODEL_NAME="qwen3-vl-30b-a3b"
+            ;;
+        kimi-vl-a3b-instruct)
+            MODEL_NAME="kimi-vl-a3b"
+            ;;
+        internvl-3.5-gpt-oss-20b-a4b-preview-hf)
+            MODEL_NAME="internvl-3.5-20b-a4b"
+            ;;
+        *)
+            MODEL_NAME="${MODEL_NAME%-instruct}"
+            ;;
+    esac
+fi
+
 RATIO_TAG="p$(python3 -c "print(str(int(float('${PRUNE_RATIO}')*100)))")"
-OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/results/prune_eval_kimi_gqa_${RATIO_TAG}}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/results/prune_eval_${MODEL_NAME}_gqa_${RATIO_TAG}-rell2-$(date +%m%d%H%M)}/tmp_logs"
 
 EXTRA_ARGS=("$@")
 

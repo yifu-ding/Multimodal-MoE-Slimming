@@ -2,22 +2,6 @@ import torch
 import torch.nn as nn
 from .utils import *
 
-def weight_rms(weight: torch.Tensor, channel_dim: int = 0) -> torch.Tensor:
-    # weight 形状 [..., I, ...], 在除 channel_dim 以外的维度上做 L2 norm
-    x = weight.detach()
-    reduce_dims = [d for d in range(x.ndim) if d != channel_dim]
-    x2 = x.pow(2).sum(dim=reduce_dims)
-    return x2.sqrt()
-
-# 通道 activation, Wanda / MoE-Pruner 中的 ‖X_j‖ (L2 范數)
-def channel_rms(act: torch.Tensor) -> torch.Tensor:
-    # act 形状 [..., I], 先在樣本維度上做 L2 norm
-    x = act.detach()
-    dims = tuple(range(x.dim() - 1))        # 除最後一維外都是樣本維度
-    x2 = x.pow(2).sum(dim=dims)             # [I], sum_t X_{t,j}^2
-    return x2.sqrt()  
-
-
 def masked_channel_rms(
     act: torch.Tensor | None,
     token_mask: torch.Tensor | None,
@@ -34,7 +18,6 @@ def masked_channel_rms(
 def wa_score(weight: torch.Tensor, activation: torch.Tensor, sum_dim=0) -> torch.Tensor:
     return (weight.abs() * activation.unsqueeze(0)).sum(dim=sum_dim)  # [channels]
 
-
 def snip_score(
     weight: torch.Tensor,
     grad: torch.Tensor,
@@ -43,7 +26,6 @@ def snip_score(
     score = (weight * grad).abs()
     reduce_dims = [d for d in range(score.ndim) if d != channel_dim]
     return score.sum(dim=reduce_dims)
-
 
 def token_contrib_old(g: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
     dims = tuple(range(z.dim() - 1))  # 平均 batch, seq 维度
@@ -126,7 +108,7 @@ def channel_saliency_masked(
             return None
         s = s[token_mask]
     dims = tuple[int, ...](range(s.dim() - 1))
-    return s.mean(dim=dims)
+    return s.mean(dim=dims).to(torch.float32)
 
 
 def compute_token_contrib_I(down_input: torch.Tensor = None, 
@@ -139,7 +121,7 @@ def compute_token_contrib_I(down_input: torch.Tensor = None,
     up_token_contrib = token_contrib(up_out_grad, up_output)   # [I]
     gate_token_contrib = token_contrib(gate_grad, gate_output) # [I]
     token_contrib_mean = (down_token_contrib + up_token_contrib + gate_token_contrib) / 3.0  # [I]
-    return token_contrib_mean
+    return token_contrib_mean.to(torch.float32)
 
 def compute_grad_I(down_grad: torch.Tensor = None, 
                     up_out_grad: torch.Tensor = None, 
@@ -149,7 +131,7 @@ def compute_grad_I(down_grad: torch.Tensor = None,
     up_out_grad = channel_rms(up_out_grad)
     gate_grad = channel_rms(gate_grad)
     grad_mean = (down_grad + up_out_grad + gate_grad) / 3.0
-    return grad_mean, down_grad, up_out_grad, gate_grad
+    return grad_mean.to(torch.float32), down_grad.to(torch.float32), up_out_grad.to(torch.float32), gate_grad.to(torch.float32)
 
 
 def compute_grad_I_masked(
@@ -163,25 +145,27 @@ def compute_grad_I_masked(
     gate_grad_ch = masked_channel_rms(gate_grad, token_mask)
     if down_grad_ch is None or up_out_grad_ch is None or gate_grad_ch is None:
         return None
-    return (down_grad_ch + up_out_grad_ch + gate_grad_ch) / 3.0
+    ret = (down_grad_ch + up_out_grad_ch + gate_grad_ch) / 3.0
+    return ret.to(torch.float32)
         
 def compute_saliency_I(down_input: torch.Tensor = None, 
                         down_grad: torch.Tensor = None,
-                        up_output: torch.Tensor = None, 
-                        up_out_grad: torch.Tensor = None,
-                        gate_output: torch.Tensor = None,
-                        gate_grad: torch.Tensor = None):
+                        # up_output: torch.Tensor = None, 
+                        # up_out_grad: torch.Tensor = None,
+                        # gate_output: torch.Tensor = None,
+                        # gate_grad: torch.Tensor = None):
+                    ):
 
     # 1) 三个 proj 的通道 saliency
     down_sal = channel_saliency(down_input, down_grad)
-    up_sal   = channel_saliency(up_output, up_out_grad)
-    gate_sal = channel_saliency(gate_output, gate_grad)
+    # up_sal   = channel_saliency(up_output, up_out_grad)
+    # gate_sal = channel_saliency(gate_output, gate_grad)
 
     # 三者通道数应该一致
-    assert down_sal.shape == up_sal.shape == gate_sal.shape
+    # assert down_sal.shape == up_sal.shape == gate_sal.shape
     # sal_mean = (down_sal + up_sal + gate_sal) / 3.0  # [I]
     # return sal_mean
-    return down_sal
+    return down_sal.to(torch.float32)
 
 
 def compute_3proj_saliency_I(
@@ -196,7 +180,8 @@ def compute_3proj_saliency_I(
     up_sal = channel_saliency(up_output, up_out_grad)
     gate_sal = channel_saliency(gate_output, gate_grad)
     assert down_sal.shape == up_sal.shape == gate_sal.shape
-    return (down_sal + up_sal + gate_sal) / 3.0
+    ret = (down_sal + up_sal + gate_sal) / 3.0
+    return ret.to(torch.float32)
 
 
 def compute_3proj_saliency_I_masked(
@@ -213,7 +198,8 @@ def compute_3proj_saliency_I_masked(
     gate_sal = channel_saliency_masked(gate_output, gate_grad, token_mask)
     if down_sal is None or up_sal is None or gate_sal is None:
         return None
-    return (down_sal + up_sal + gate_sal) / 3.0
+    ret = (down_sal + up_sal + gate_sal) / 3.0
+    return ret.to(torch.float32)
             
 def compute_activation_I(down_input: torch.Tensor = None, 
                           up_output: torch.Tensor = None,
@@ -226,7 +212,7 @@ def compute_activation_I(down_input: torch.Tensor = None,
     assert down_act.shape == up_act.shape == gate_act.shape
     act_mean = (down_act + up_act + gate_act) / 3.0  # [I]
 
-    return act_mean, down_act
+    return act_mean.to(torch.float32), down_act.to(torch.float32)
 
 
 def compute_activation_I_masked(
@@ -240,7 +226,8 @@ def compute_activation_I_masked(
     gate_act = masked_channel_rms(gate_output, token_mask)
     if down_act is None or up_act is None or gate_act is None:
         return None
-    return (down_act + up_act + gate_act) / 3.0
+    ret = (down_act + up_act + gate_act) / 3.0
+    return ret.to(torch.float32)
 
 def compute_wa_I(W_down: torch.Tensor = None, 
                  W_up: torch.Tensor = None, 
@@ -260,7 +247,7 @@ def compute_wa_I(W_down: torch.Tensor = None,
 
     wa_mean = (wa_down + wa_up + wa_gate) / 3.0  # [I]
 
-    return wa_mean
+    return wa_mean.to(torch.float32)
 
 
 def compute_wa_I_masked(
@@ -280,7 +267,8 @@ def compute_wa_I_masked(
     wa_down = wa_score(W_down, down_ch_act, sum_dim=0)
     wa_up = wa_score(W_up, up_in, sum_dim=1)
     wa_gate = wa_score(W_gate, gate_in, sum_dim=1)
-    return (wa_down + wa_up + wa_gate) / 3.0
+    ret = (wa_down + wa_up + wa_gate) / 3.0
+    return ret.to(torch.float32)
 
 
 def compute_wg_I(W_down: torch.Tensor = None, 
@@ -308,7 +296,7 @@ def compute_wg_I(W_down: torch.Tensor = None,
     snip_score_gate = snip_score(W_gate, W_gate_grad, channel_dim=0)  # [I]
     snip_score_mean = (snip_score_down + snip_score_up + snip_score_gate) / 3.0  # [I]
 
-    return snip_score_mean
+    return snip_score_mean.to(torch.float32)
 
 def compute_grad_H(down_out_grad: torch.Tensor = None, 
                    up_in_grad: torch.Tensor = None,     # shape [S, H]
@@ -320,7 +308,7 @@ def compute_grad_H(down_out_grad: torch.Tensor = None,
     gate_grad = channel_rms(gate_in_grad)
     grad_mean = (down_grad + up_grad + gate_grad) / 3.0
 
-    return grad_mean
+    return grad_mean.to(torch.float32)
 
 def compute_saliency_H(down_output: torch.Tensor = None, 
                        down_out_grad: torch.Tensor = None, 
@@ -336,7 +324,7 @@ def compute_saliency_H(down_output: torch.Tensor = None,
     assert down_sal.shape == up_sal.shape == gate_sal.shape
     sal_mean = (down_sal + up_sal + gate_sal) / 3.0  # [I]
 
-    return sal_mean
+    return sal_mean.to(torch.float32)
 
 def compute_activation_H(down_output: torch.Tensor = None, 
                          up_input: torch.Tensor = None,
@@ -350,7 +338,7 @@ def compute_activation_H(down_output: torch.Tensor = None,
     assert down_act.shape == up_act.shape == gate_act.shape
     act_mean = (down_act + up_act + gate_act) / 3.0  # [H]
 
-    return act_mean
+    return act_mean.to(torch.float32)
 
 def compute_wa_H(down_input: torch.Tensor = None, 
                  up_input: torch.Tensor = None,     # shape [S, H]
@@ -368,8 +356,7 @@ def compute_wa_H(down_input: torch.Tensor = None,
     wa_gate = wa_score(W_gate, gate_input, sum_dim=0)   # [I, H] * [1, H] -> [I, H] -> [H]
     wa_mean = (wa_down + wa_up + wa_gate) / 3.0  # [H]
 
-    return wa_mean
-        
+    return wa_mean.to(torch.float32)
         
 
 def resolve_activation_fn(expert: nn.Module):
@@ -378,6 +365,7 @@ def resolve_activation_fn(expert: nn.Module):
         if fn is not None:
             return fn
     return torch.nn.functional.silu
+
 
 def compute_channel_hessian_diag(
     W_down: torch.Tensor,
@@ -390,9 +378,10 @@ def compute_channel_hessian_diag(
     if token_mask is not None:
         token_mask = token_mask.to(device=h.device).view(-1).bool()
         if not bool(token_mask.any()):
-            return torch.zeros(h.shape[-1], dtype=torch.float32, device=h.device)
+            # return torch.zeros(h.shape[-1], dtype=torch.float32, device=h.device)
+            return None
         h = h[token_mask]
-    return (w_col_norm2 * h.pow(2).sum(dim=0)).float()
+    return (w_col_norm2 * h.pow(2).sum(dim=0)).to(torch.float32)
 
 
 def compute_3linear_hessian_diag(
@@ -408,7 +397,8 @@ def compute_3linear_hessian_diag(
     down_h = compute_channel_hessian_diag(W_down, down_input, token_mask)
     up_h = compute_channel_hessian_diag(W_up.transpose(0, 1), up_output, token_mask)
     gate_h = compute_channel_hessian_diag(W_gate.transpose(0, 1), gate_output, token_mask)
-    return (down_h + up_h + gate_h) / 3.0
+    ret = (down_h + up_h + gate_h) / 3.0
+    return ret.to(torch.float32)
 
 
 def compute_gateup_act(
@@ -426,6 +416,5 @@ def compute_gateup_act(
             return None
         activation = activation[token_mask]
     dims = tuple(range(activation.dim() - 1))
-    return activation.abs().to(torch.float32).mean(dim=dims)
-
-
+    ret = activation.abs().to(torch.float32).mean(dim=dims)
+    return ret.to(torch.float32)

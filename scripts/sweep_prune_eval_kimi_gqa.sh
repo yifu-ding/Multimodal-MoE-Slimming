@@ -38,17 +38,47 @@ export PYTHONPATH="${PREFIX}"
 # Default grids (edit or override via env)
 # INTRA_METHOD = --intra_method (intra-layer planner); see run_prune_eval_kimi_gqa.sh
 SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform uniform_coverage loss_smooth_1 loss_smooth_2 loss_coverage}"
-SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-uniform second_attr_coverage usage usage_coverage}"  # usage usage_coverage router router_coverage attr_coverage 
-SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-0}"  # 0, 1
+# INTRA_METHOD options (intra-layer planner, 基于 EXPERT_METRICS):
+#   uniform_*
+#   usage_*              # gate_scores.usage
+#   router_*             # gate_scores.router
+#   true_ablate_*        # expert_scores.true_ablate
+#   first_attr_coverage
+#   first_attr_fillzero
+#   first_attr_fillzero_coverage
+#   second_attr_coverage  # expert_scores.second_attr
+#   second_attr_fillzero
+#   second_attr_fillzero_coverage
+SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-uniform first_attr_coverage first_attr_fillzero_coverage second_attr_coverage second_attr_fillzero_coverage usage usage_coverage}"  # usage usage_coverage router router_coverage attr_coverage 
+SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-0 1}"  # 0, 1
 # Not swept; passed through to run_prune_eval_kimi_gqa.sh (see SMOOTH_FN there).
 SMOOTH_FN="${SMOOTH_FN:-sqrt}"
 # Default: full list from run_prune_eval_kimi_gqa.sh (long run); override to shorten.
-SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act 3proj_act down_second_order 3proj_second_order down_saliency 3proj_saliency 3proj_grad}"
+# INTRA_EXPERT_METRIC options (must exist in scores payload channel_scores):
+# 下列 metric 都有 _text / _visual 后缀版本，开双模态时用 xxx_text + xxx_visual
+#   gateup_act
+#   3proj_act
+#   down_second_order  # 这个是 approx 的
+#   3proj_second_order
+#   down_saliency
+#   3proj_saliency
+#   wa
+#   3proj_grad
+#   down_second_order_exact
+#   wg
+# 这个 metric 没有双模态版本
+#   weight
+SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act down_second_order_exact 3proj_second_order}"
+# 3proj_act down_second_order 3proj_second_order down_saliency 3proj_saliency 3proj_grad
 
-SUMMARY_FILE="${SUMMARY_FILE:-${REPO_ROOT}/results/prune_eval_kimi_gqa_p50/summary-kimi_gqa-rell2-04131052.md}"
-SWEEP_LOG_DIR="${SWEEP_LOG_DIR:-${REPO_ROOT}/results/prune_eval_kimi_gqa_p50/sweep_runs-kimi_gqa-rell2-04131052}"
+SWEEP_TS="${SWEEP_TS:-$(date +%m%d%H%M)}"
+MODEL_NAME="${MODEL_NAME:-kimi}"
+SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-gqa-rell2-${SWEEP_TS}"
+
+SUMMARY_FILE="${SUMMARY_FILE:-${SWEEP_BASE}/summary.md}"
+SWEEP_LOG_DIR="${SWEEP_LOG_DIR:-${SWEEP_BASE}/logs}"
 SWEEP_SKIP_DONE="${SWEEP_SKIP_DONE:-1}"
-mkdir -p "$(dirname "${SUMMARY_FILE}")"
+mkdir -p "${SWEEP_BASE}"
 mkdir -p "${SWEEP_LOG_DIR}"
 
 RUN_IDX=0

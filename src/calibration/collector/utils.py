@@ -1,68 +1,24 @@
 import torch
 import torch.nn as nn
-from typing import Dict
+from src.calibration.helpers.utils import (
+    clear_fused_saved_tensors,
+    is_fused_expert_container,
+)
 
-def _is_fused_expert_container(experts) -> bool:
-    return (
-        experts is not None
-        and getattr(experts, "__class__", type(None)).__name__ == "Qwen3VLMoeTextExperts"
-        and hasattr(experts, "gate_up_proj")
-        and hasattr(experts, "down_proj")
-    )
-
-
-def _tensor_map_to_nested_dict(layer_map: Dict[int, torch.Tensor]) -> Dict[int, Dict[int, torch.Tensor]]:
-    return {
-        layer_idx: {
-            eid: tensor[eid].detach().cpu().float()
-            for eid in range(tensor.shape[0])
-        }
-        for layer_idx, tensor in layer_map.items()
-    }
+def weight_rms(weight: torch.Tensor, channel_dim: int = 0) -> torch.Tensor:
+    # weight shape [..., I, ...], take L2 norm over all dims except channel_dim.
+    x = weight.detach()
+    reduce_dims = [d for d in range(x.ndim) if d != channel_dim]
+    x2 = x.pow(2).sum(dim=reduce_dims)
+    return x2.sqrt()
 
 
-def _scalar_map_to_nested_dict(layer_map: Dict[int, torch.Tensor]) -> Dict[int, Dict[int, float]]:
-    return {
-        layer_idx: {
-            eid: float(tensor[eid].item())
-            for eid in range(tensor.shape[0])
-        }
-        for layer_idx, tensor in layer_map.items()
-    }
-
-
-def _normalize_per_layer_counts(counts_map: Dict[int, torch.Tensor]) -> Dict[int, torch.Tensor]:
-    output = {}
-    for layer_idx, counts in counts_map.items():
-        counts = counts.detach().cpu().float()
-        denom = counts.sum().clamp_min(1.0)
-        output[layer_idx] = counts / denom
-    return output
-
-
-def _to_nested_expert_dict(layer_map: Dict[int, torch.Tensor], scalar: bool = False):
-    nested = {}
-    for layer_idx, tensor in layer_map.items():
-        if scalar:
-            nested[layer_idx] = {
-                eid: float(tensor[eid].item())
-                for eid in range(tensor.shape[0])
-            }
-        else:
-            nested[layer_idx] = {
-                eid: tensor[eid].detach().cpu().float()
-                for eid in range(tensor.shape[0])
-            }
-    return nested
-
-
-def is_fused_expert_container(experts: nn.Module) -> bool:
-    return (
-        experts is not None
-        and getattr(experts, "__class__", type(None)).__name__ == "Qwen3VLMoeTextExperts"
-        and hasattr(experts, "gate_up_proj")
-        and hasattr(experts, "down_proj")
-    )
+def channel_rms(act: torch.Tensor) -> torch.Tensor:
+    # act shape [..., I], aggregate over sample dims and keep channel dim.
+    x = act.detach()
+    dims = tuple(range(x.dim() - 1))
+    x2 = x.pow(2).sum(dim=dims)
+    return x2.sqrt()
 
 
 def get_fused_saved_tensor(experts: nn.Module, name: str, expert_idx: int):
@@ -88,8 +44,7 @@ def safe_add_with_ema(target, ema, value, key=None):
                 return new.clone()
             old.mul_(ema).add_(new, alpha=1.0 - ema)
             return old
-        else:
-            return new if old is None else old * ema + new * (1.0 - ema)
+        return new if old is None else old * ema + new * (1.0 - ema)
 
     if key is None:
         return ema_update(target, value)
@@ -97,15 +52,24 @@ def safe_add_with_ema(target, ema, value, key=None):
     assert isinstance(target, nn.Module), f"target must be nn.Module, got {type(target)}"
     old = getattr(target, key, None)
     setattr(target, key, ema_update(old, value))
-        
+
 
 def unwrap_output(output):
     return output[0] if isinstance(output, (tuple, list)) else output
 
 
-def get_saved_tensors(experts=None, expert_idx=None, is_fused=False, expert=None, 
-                       down_proj_t=None, up_proj=None, gate_proj=None, down_grad_t=None, 
-                       up_grad_w=None, gate_grad_w=None):
+def get_saved_tensors(
+    experts=None,
+    expert_idx=None,
+    is_fused=False,
+    expert=None,
+    down_proj_t=None,
+    up_proj=None,
+    gate_proj=None,
+    down_grad_t=None,
+    up_grad_w=None,
+    gate_grad_w=None,
+):
     if is_fused:
         activation_owner = experts
         down_input = get_fused_saved_tensor(experts, "saved_down_input", expert_idx)
@@ -132,32 +96,31 @@ def get_saved_tensors(experts=None, expert_idx=None, is_fused=False, expert=None
         W_gate_grad = None if gate_grad_w is None else gate_grad_w[expert_idx]
     else:
         activation_owner = expert
-        # 取出并清空 hook 保存的张量
-        down_input    = getattr(expert.down_proj, "saved_input", None)
-        down_output   = getattr(expert.down_proj, "saved_output", None)
-        down_grad     = getattr(expert.down_proj, "saved_grad_in", None)
+        down_input = getattr(expert.down_proj, "saved_input", None)
+        down_output = getattr(expert.down_proj, "saved_output", None)
+        down_grad = getattr(expert.down_proj, "saved_grad_in", None)
         down_out_grad = getattr(expert.down_proj, "saved_grad_out", None)
-        expert.down_proj.saved_input    = None
-        expert.down_proj.saved_output   = None
-        expert.down_proj.saved_grad_in  = None
+        expert.down_proj.saved_input = None
+        expert.down_proj.saved_output = None
+        expert.down_proj.saved_grad_in = None
         expert.down_proj.saved_grad_out = None
 
-        up_input    = getattr(expert.up_proj, "saved_input", None)
-        up_output   = getattr(expert.up_proj, "saved_output", None)
-        up_in_grad  = getattr(expert.up_proj, "saved_grad_in", None)
+        up_input = getattr(expert.up_proj, "saved_input", None)
+        up_output = getattr(expert.up_proj, "saved_output", None)
+        up_in_grad = getattr(expert.up_proj, "saved_grad_in", None)
         up_out_grad = getattr(expert.up_proj, "saved_grad_out", None)
-        expert.up_proj.saved_input    = None
-        expert.up_proj.saved_output   = None
-        expert.up_proj.saved_grad_in  = None
+        expert.up_proj.saved_input = None
+        expert.up_proj.saved_output = None
+        expert.up_proj.saved_grad_in = None
         expert.up_proj.saved_grad_out = None
 
-        gate_input      = getattr(expert.gate_proj, "saved_input", None)
-        gate_output     = getattr(expert.gate_proj, "saved_output", None)
-        gate_in_grad    = getattr(expert.gate_proj, "saved_grad_in", None)
-        gate_grad       = getattr(expert.gate_proj, "saved_grad_out", None)
-        expert.gate_proj.saved_input    = None
-        expert.gate_proj.saved_output   = None
-        expert.gate_proj.saved_grad_in  = None
+        gate_input = getattr(expert.gate_proj, "saved_input", None)
+        gate_output = getattr(expert.gate_proj, "saved_output", None)
+        gate_in_grad = getattr(expert.gate_proj, "saved_grad_in", None)
+        gate_grad = getattr(expert.gate_proj, "saved_grad_out", None)
+        expert.gate_proj.saved_input = None
+        expert.gate_proj.saved_output = None
+        expert.gate_proj.saved_grad_in = None
         expert.gate_proj.saved_grad_out = None
         text_mask = getattr(expert, "saved_text_mask", None)
         visual_mask = getattr(expert, "saved_visual_mask", None)
@@ -170,30 +133,28 @@ def get_saved_tensors(experts=None, expert_idx=None, is_fused=False, expert=None
         W_down_grad = W_down.grad
         W_up_grad = W_up.grad
         W_gate_grad = W_gate.grad
-    
-    return activation_owner, down_input, down_output, down_grad, \
-        down_out_grad, up_input, up_output, up_in_grad, up_out_grad, \
-        gate_input, gate_output, gate_in_grad, gate_grad, text_mask, \
-        visual_mask, router_weights, W_down, W_up, W_gate, W_down_grad, W_up_grad, W_gate_grad
 
-
-def clear_fused_saved_tensors(experts: nn.Module) -> None:
-    for name in (
-        "saved_down_input",
-        "saved_down_output",
-        "saved_down_grad",
-        "saved_down_out_grad",
-        "saved_up_input",
-        "saved_up_output",
-        "saved_up_in_grad",
-        "saved_up_out_grad",
-        "saved_gate_input",
-        "saved_gate_output",
-        "saved_gate_in_grad",
-        "saved_gate_grad",
-        "saved_text_mask",
-        "saved_visual_mask",
-        "saved_router_weights",
-    ):
-        if hasattr(experts, name):
-            setattr(experts, name, None)
+    return (
+        activation_owner,
+        down_input,
+        down_output,
+        down_grad,
+        down_out_grad,
+        up_input,
+        up_output,
+        up_in_grad,
+        up_out_grad,
+        gate_input,
+        gate_output,
+        gate_in_grad,
+        gate_grad,
+        text_mask,
+        visual_mask,
+        router_weights,
+        W_down,
+        W_up,
+        W_gate,
+        W_down_grad,
+        W_up_grad,
+        W_gate_grad,
+    )
