@@ -20,14 +20,7 @@ export PYTHONPATH="${PREFIX}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
-# 这两个 scores 保留路径位置
-# SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa-second_order-rell2/scores.pt}"
-# SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa-0412-2015/scores.pt}"
-# 这三个是新的 scores 路径位置
-# storage/prune/scores/kimi_gqa-0413-0119/scores.pt
-# storage/prune/scores/kimi_coco-0413-0119/scores.pt
-# storage/prune/scores/kimi_video_mmmu-0413-0208/scores.pt
-SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa-rell2-04131052/scores.pt}"
+SCORES_PATH="${SCORES_PATH:-}"
 
 PRUNE_RATIO="${PRUNE_RATIO:-0.50}"
 # INTER_METHOD options (inter-layer planner):

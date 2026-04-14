@@ -229,7 +229,7 @@ def _merge_payloads(loaded: List[LoadedScores], winner_idx_by_layer: Dict[int, i
 def main() -> None:
     parser = argparse.ArgumentParser(description="Merge multiple calibration scores.pt by layer index.")
     parser.add_argument("scores", nargs="+", help="Input scores.pt files or directories containing scores.pt")
-    parser.add_argument("--output", type=str, required=True, help="Output merged scores.pt path")
+    parser.add_argument("--output", "-o", type=str, required=True, help="Output merged scores.pt path")
     args = parser.parse_args()
 
     loaded: List[LoadedScores] = []
