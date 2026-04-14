@@ -109,7 +109,7 @@ def prepare_scores(
     # ---- expert budget source ----
     intra_layer_method = mask_method_kwargs.get("intra_layer_method", "uniform")
     expert_scores_by_method = {
-        "attr_coverage": "first_attr_usage",
+        "attr_coverage": "first_attr",
         "second_attr_coverage": "second_attr",
         "true_ablate": "true_ablate",
         "true_ablate_coverage": "true_ablate",

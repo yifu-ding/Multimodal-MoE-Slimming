@@ -273,8 +273,6 @@ def get_block_eval_context(_kwargs: dict):
 def compute_second_approx_attr(
     down_output: torch.Tensor,
     down_out_grad: torch.Tensor,
-    first_attr_usage: torch.Tensor,
-    usage: float,
     _kwargs: dict,
 ):
     if down_output is None or down_out_grad is None or _kwargs is None:
