@@ -152,13 +152,13 @@ def loop_1_channelwise_scores(
             activation_owner, gate_output, up_output, token_mask=text_mask
         )
         if text_act is not None:
-            metrics["gateup_text"] = text_act.to(torch.float32)
+            metrics["gateup_act_text"] = text_act.to(torch.float32)
         # gate*up activation
         visual_act = compute_gateup_act(
             activation_owner, gate_output, up_output, token_mask=visual_mask
         )
         if visual_act is not None:
-            metrics["gateup_visual"] = visual_act.to(torch.float32)
+            metrics["gateup_act_visual"] = visual_act.to(torch.float32)
         # three proj activation
         act_mean, down_act = compute_activation_I(down_input, up_output, gate_output)
         metrics["3proj_act"] = act_mean.to(torch.float32)

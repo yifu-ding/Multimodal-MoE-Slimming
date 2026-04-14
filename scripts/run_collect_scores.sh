@@ -57,7 +57,7 @@ case "${DATASET,,}" in
 esac
 
 # OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/kimi_${DATASET_TAG}-second_order}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/kimi_${DATASET_TAG}-$(date +%m%d-%H%M)}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/kimi_${DATASET_TAG}-rell2-$(date +%m%d%H%M)}"
 
 EXTRA_ARGS=("$@")
 

@@ -27,7 +27,7 @@ MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 # storage/prune/scores/kimi_gqa-0413-0119/scores.pt
 # storage/prune/scores/kimi_coco-0413-0119/scores.pt
 # storage/prune/scores/kimi_video_mmmu-0413-0208/scores.pt
-SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa-0413-0119/scores.pt}"
+SCORES_PATH="${SCORES_PATH:-${PREFIX}/storage/prune/scores/kimi_gqa-rell2-04131052/scores.pt}"
 
 PRUNE_RATIO="${PRUNE_RATIO:-0.50}"
 # INTER_METHOD options (inter-layer planner):

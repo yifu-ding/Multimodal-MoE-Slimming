@@ -30,6 +30,19 @@ def _load_payload(scores_dir: str, device: str) -> dict:
     path = scores_dir if os.path.isfile(scores_dir) else os.path.join(scores_dir, "scores.pt")
     return torch.load(path, map_location=device, weights_only=False)
 
+
+def _payload_get(payload: dict, key: str, default=None):
+    """Read a field from legacy top-level scores.pt or from ``metadata`` (new format).
+
+    Prefer top-level when both exist so older files behave unchanged.
+    """
+    if key in payload:
+        return payload[key]
+    meta = payload.get("metadata")
+    if isinstance(meta, dict) and key in meta:
+        return meta[key]
+    return default
+
 def load_modality_channel_scores(
     payload, 
     device: str = "cpu",
@@ -73,7 +86,11 @@ def prepare_scores(
     gate_scores = {
         m: _nested_to_layer_tensors(v) for m, v in payload["gate_scores"].items()
     }
-    layers = payload["layers"]
+    layers = _payload_get(payload, "layers")
+    if layers is None:
+        first_metric = next(iter(payload["channel_scores"].keys()))
+        nested = payload["channel_scores"][first_metric]
+        layers = sorted(int(k) for k in nested.keys())
 
     intra_expert_metric = mask_method_kwargs.get("intra_expert_metric", "activation")
 
@@ -123,7 +140,9 @@ def prepare_scores(
         "layerwise_loss": None,
     }
     if "loss" in inter_layer_method:
-        raw = payload["layerwise_loss"]
+        raw = _payload_get(payload, "layerwise_loss")
+        if raw is None:
+            raw = {}
         loss_based_kwargs["layerwise_loss"] = torch.tensor(
             [raw[l] for l in sorted(raw.keys())], dtype=torch.float32, device=device
         )

@@ -263,20 +263,6 @@ class RichScoreAccumulator:
             ema_matrix[layer_idx] = (visual_freq - text_freq) / (visual_freq + text_freq + 1e-8)
 
         payload = {
-            "model_name_or_path": args.model_name_or_path,
-            "resolved_model_name_or_path": resolve_model_name_or_path(args.model_name_or_path),
-            "dataset": args.dataset,
-            "num_samples": args.num_samples,
-            "batch_size": args.batch_size,
-            "start_idx": args.start_idx,
-            "subset_seed": args.subset_seed,
-            "ema": args.ema,
-            "modality_aware": self.modality_aware,
-            "layers": self.layers,
-            "layer_to_num_experts": self.layer_to_num_experts,
-            "layer_to_num_channels": self.layer_to_num_channels,
-            "available_channel_metrics": list(CHANNEL_METRICS),
-            "available_expert_metrics": list(EXPERT_METRICS),
             "channel_scores": channel_scores,
             "expert_scores": expert_scores,
             "gate_scores": {
@@ -289,6 +275,22 @@ class RichScoreAccumulator:
             "layerwise_loss": dict(self.layerwise_loss),
             "expert_usage": _scalar_map_to_nested_dict(self.gate_scores["usage"]),
             "expert_router": _scalar_map_to_nested_dict(self.gate_scores["router"]),
+            "metadata": {
+                "loss_fn": args.loss_fn,
+                "num_samples": args.num_samples,
+                "batch_size": args.batch_size,
+                "dataset": args.dataset,
+                "start_idx": args.start_idx,
+                "model_name_or_path": args.model_name_or_path,
+                "resolved_model_name_or_path": resolve_model_name_or_path(args.model_name_or_path),
+                "subset_seed": args.subset_seed,
+                "ema": args.ema,
+                "layers": self.layers,
+                "layer_to_num_experts": self.layer_to_num_experts,
+                "layer_to_num_channels": self.layer_to_num_channels,
+                "available_channel_metrics": list(CHANNEL_METRICS),
+                "available_expert_metrics": list(EXPERT_METRICS),
+            },
         }
         if self.modality_scores is not None:
             payload["modality_channel_scores"] = {
@@ -427,6 +429,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--start_idx", type=int, default=0)
     p.add_argument("--subset_seed", type=int, default=42)
     p.add_argument("--ema", type=float, default=0.9)
+    p.add_argument(
+        "--loss_fn",
+        type=str,
+        default="rel_l2",
+        choices=["l2", "rel_l2", "cosine"],
+        help="Block reconstruction loss used during score collection (saved in scores.pt metadata).",
+    )
     p.add_argument("--modality_aware", action="store_true")
     p.add_argument("--force", "-f", action="store_true")
     return p
@@ -499,7 +508,7 @@ def run_collection(args) -> None:
             dataloader=loader,
             dataset_name=args.dataset,
             saliency_ema=args.ema,
-            loss_fn="l2",
+            loss_fn=args.loss_fn,
             second_order_mode="exact",  # default second-order mode is exact
             dtype=block_dtype,
             verbose=True,
