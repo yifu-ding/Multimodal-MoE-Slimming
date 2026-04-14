@@ -1,5 +1,6 @@
 import argparse
 import copy
+import numbers
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
@@ -52,23 +53,46 @@ class LoadedScores:
 def _pick_winners(loaded: List[LoadedScores]) -> Tuple[Dict[int, int], List[str]]:
     winner_idx_by_layer: Dict[int, int] = {}
     warnings: List[str] = []
+    layer_to_candidate_idx: Dict[int, List[int]] = {}
     for idx, item in enumerate(loaded):
         for layer in item.layers:
-            if layer not in winner_idx_by_layer:
-                winner_idx_by_layer[layer] = idx
-                continue
-            prev_idx = winner_idx_by_layer[layer]
-            prev = loaded[prev_idx]
-            if item.ts > prev.ts:
+            layer_to_candidate_idx.setdefault(layer, []).append(idx)
+
+    for layer, candidate_indices in sorted(layer_to_candidate_idx.items()):
+        nonzero_indices = [
+            idx for idx in candidate_indices if not _layer_is_all_zero(loaded[idx].payload, layer)
+        ]
+
+        if nonzero_indices:
+            winner_idx = max(nonzero_indices, key=lambda i: loaded[i].ts)
+            for idx in candidate_indices:
+                if idx in nonzero_indices:
+                    continue
+                skipped = loaded[idx]
                 warnings.append(
-                    f"[merge warning] layer={layer} found in multiple files: "
-                    f"use newer {item.path} (ts={item.ts:.3f}) over {prev.path} (ts={prev.ts:.3f})"
+                    f"[merge warning] layer={layer} ignore all-zero source {skipped.path} "
+                    f"(ts={skipped.ts:.3f})"
                 )
-                winner_idx_by_layer[layer] = idx
-            else:
+        else:
+            winner_idx = max(candidate_indices, key=lambda i: loaded[i].ts)
+            if len(candidate_indices) > 1:
+                winner = loaded[winner_idx]
                 warnings.append(
-                    f"[merge warning] layer={layer} found in multiple files: "
-                    f"keep newer {prev.path} (ts={prev.ts:.3f}), ignore {item.path} (ts={item.ts:.3f})"
+                    f"[merge warning] layer={layer} all candidates are zero; fallback to newest "
+                    f"{winner.path} (ts={winner.ts:.3f})"
+                )
+
+        winner_idx_by_layer[layer] = winner_idx
+
+        if len(candidate_indices) > 1:
+            winner = loaded[winner_idx]
+            for idx in candidate_indices:
+                if idx == winner_idx:
+                    continue
+                other = loaded[idx]
+                warnings.append(
+                    f"[merge warning] layer={layer} selected {winner.path} (ts={winner.ts:.3f}), "
+                    f"ignored {other.path} (ts={other.ts:.3f})"
                 )
     return winner_idx_by_layer, warnings
 
@@ -80,6 +104,54 @@ def _get_layer_value(layer_map: Dict[Any, Any], layer: int):
     if key_str in layer_map:
         return layer_map[key_str]
     return None
+
+
+def _value_has_nonzero(v: Any) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, torch.Tensor):
+        if v.numel() == 0:
+            return False
+        return bool(torch.any(v != 0).item())
+    if isinstance(v, numbers.Number):
+        return v != 0
+    if isinstance(v, dict):
+        return any(_value_has_nonzero(x) for x in v.values())
+    if isinstance(v, (list, tuple, set)):
+        return any(_value_has_nonzero(x) for x in v)
+    try:
+        t = torch.as_tensor(v)
+        if t.numel() == 0:
+            return False
+        return bool(torch.any(t != 0).item())
+    except Exception:
+        return False
+
+
+def _layer_is_all_zero(payload: dict, layer: int) -> bool:
+    layer_values: List[Any] = []
+
+    for layer_map in payload.get("channel_scores", {}).values():
+        val = _get_layer_value(layer_map, layer)
+        if val is not None:
+            layer_values.append(val)
+
+    for layer_map in payload.get("expert_scores", {}).values():
+        val = _get_layer_value(layer_map, layer)
+        if val is not None:
+            layer_values.append(val)
+
+    val = _get_layer_value(payload.get("ema_matrix", {}), layer)
+    if val is not None:
+        layer_values.append(val)
+
+    val = _get_layer_value(payload.get("layerwise_loss", {}), layer)
+    if val is not None:
+        layer_values.append(val)
+
+    if not layer_values:
+        return True
+    return not any(_value_has_nonzero(v) for v in layer_values)
 
 
 def _merge_payloads(loaded: List[LoadedScores], winner_idx_by_layer: Dict[int, int]) -> dict:
@@ -184,3 +256,9 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+############# take notes ###############
+# /home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_coco-rell2-04142126/scores.pt  
+# /home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_coco-rell2-04142125/scores.pt
+# merged -> /home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_coco-rell2-041421.pt
