@@ -37,6 +37,7 @@ CHANNEL_METRICS = (
     "wg_visual",
     # weight
     "weight",
+    "down_second_order_exact"
 )
 
 EXPERT_METRICS = (

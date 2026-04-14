@@ -9,14 +9,14 @@ def masked_channel_rms(
     if act is None:
         return None
     if token_mask is None:
-        return channel_rms(act)
+        return channel_rms(act).to(torch.float32)
     token_mask = token_mask.to(device=act.device).view(-1).bool()
     if token_mask.numel() != act.shape[0] or not bool(token_mask.any()):
         return None
-    return channel_rms(act[token_mask])
+    return channel_rms(act[token_mask]).to(torch.float32)
 
 def wa_score(weight: torch.Tensor, activation: torch.Tensor, sum_dim=0) -> torch.Tensor:
-    return (weight.abs() * activation.unsqueeze(0)).sum(dim=sum_dim)  # [channels]
+    return (weight.abs() * activation.unsqueeze(0)).sum(dim=sum_dim).to(torch.float32)  # [channels]
 
 def snip_score(
     weight: torch.Tensor,
@@ -25,13 +25,13 @@ def snip_score(
 ) -> torch.Tensor:
     score = (weight * grad).abs()
     reduce_dims = [d for d in range(score.ndim) if d != channel_dim]
-    return score.sum(dim=reduce_dims)
+    return score.sum(dim=reduce_dims).to(torch.float32)
 
 def token_contrib_old(g: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
     dims = tuple(range(z.dim() - 1))  # 平均 batch, seq 维度
     token_contrib = (g * z).sum(dim=dims) / z.size(-1)  # [S, I] -> [I]
     # Q_e = token_contrib.mean()
-    return token_contrib
+    return token_contrib.to(torch.float32)
 
 def token_contrib(
     g: torch.Tensor,
@@ -51,7 +51,6 @@ def token_contrib(
     """
     assert g.shape == z.shape, "g 和 z 的形状必须一致"
     I = z.size(-1)
-    orig_dtype = z.dtype
 
     # 所有非最后一维都看作 token 维度, 展平
     gz = g * z                               # [..., I]
@@ -60,7 +59,7 @@ def token_contrib(
     N = gz_flat.size(0)
     # 样本太少或不开启 clip, 退化为普通均值
     if N <= 2 or trim_head <= 0.0:
-        return gz_flat.mean(dim=0).to(orig_dtype)  # [I]
+        return gz_flat.mean(dim=0).to(torch.float32)  # [I]
 
     # 限制一下比例, 避免奇怪超参
     trim_head = float(max(0.0, min(trim_head, 0.49)))
@@ -82,7 +81,7 @@ def token_contrib(
     # 对 token 维度取均值
     contrib_mean = clipped.mean(dim=0)  # [I], float32
 
-    return contrib_mean.to(orig_dtype)
+    return contrib_mean.to(torch.float32)
 
 
 # 通道 saliency, 使用 act * grad
@@ -90,7 +89,7 @@ def channel_saliency(act: torch.Tensor, grad: torch.Tensor) -> torch.Tensor:
     # act, grad 形状类似 [..., I], 最后一维是通道
     s = (act * grad).abs().detach()
     dims = tuple[int, ...](range(s.dim() - 1))  # 平均 batch, seq 维度
-    return s.mean(dim=dims)
+    return s.mean(dim=dims).to(torch.float32)
 
 
 def channel_saliency_masked(
