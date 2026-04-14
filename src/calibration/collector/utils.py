@@ -1,3 +1,5 @@
+import numbers
+
 import torch
 import torch.nn as nn
 from src.calibration.helpers.utils import (
@@ -42,8 +44,13 @@ def safe_add_with_ema(target, ema, value, key=None):
         if isinstance(new, torch.Tensor):
             if old is None:
                 return new.clone()
-            old.mul_(ema).add_(new, alpha=1.0 - ema)
-            return old
+            if isinstance(old, torch.Tensor):
+                old.mul_(ema).add_(new, alpha=1.0 - ema)
+                return old
+            # e.g. attribute was seeded with 0.0 before first tensor observation
+            if isinstance(old, numbers.Number):
+                return torch.as_tensor(old, dtype=new.dtype, device=new.device) * ema + new * (1.0 - ema)
+            raise TypeError(f"EMA previous value must be None, Tensor, or scalar number, got {type(old)}")
         return new if old is None else old * ema + new * (1.0 - ema)
 
     if key is None:
