@@ -51,7 +51,7 @@ SMOOTH_FN="${SMOOTH_FN:-fourth_root}"
 #   second_attr_coverage  # expert_scores.second_attr
 #   true_ablate        # expert_scores.true_ablate
 #   true_ablate_coverage
-INTRA_METHOD="${INTRA_METHOD:-second_attr_coverage}"
+INTRA_METHOD="${INTRA_METHOD:-attr_coverage}"
 # INTRA_EXPERT_METRIC options (must exist in scores payload channel_scores):
 # 下列 metric 都有 _text / _visual 后缀版本，开双模态时用 xxx_text + xxx_visual
 #   gateup_act, gateup_text, gateup_visual
