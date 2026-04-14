@@ -4,12 +4,14 @@ import types
 from typing import Any, Dict, Iterable, List, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
 
 from observations.common import move_inputs_to_model_device, prepare_inputs
 from src.base.shared_utils import angle_loss
 from src.calibration.collector import collect_scores_from_moe_module
+from src.calibration.collector.utils import _is_fused_expert_container, clear_fused_saved_tensors
 
 __all__ = [
     "block_forward",
@@ -56,6 +58,10 @@ def unwrap_output(output):
 
 
 def _clear_block_saved_tensors(block: nn.Module) -> None:
+    experts = getattr(getattr(block, "mlp", None), "experts", None)
+    if _is_fused_expert_container(experts):
+        clear_fused_saved_tensors(experts)
+        return
     for expert in _iter_experts(block.mlp):
         for attr in ("saved_text_mask", "saved_visual_mask", "saved_router_weights"):
             setattr(expert, attr, None)
@@ -161,6 +167,166 @@ def compute_block_loss(
 
 def _kimi_teacher_block(model) -> Iterable[nn.Module]:
     return model.language_model.model.layers
+
+
+def _teacher_blocks(bundle) -> Iterable[nn.Module]:
+    if bundle.family == "qwen3":
+        return bundle.model.model.language_model.layers
+    return _kimi_teacher_block(bundle.model)
+
+
+def _resolve_special_token_tensor(bundle):
+    model = bundle.model
+    if bundle.family == "qwen3":
+        return getattr(model.model, "special_token_id_tensor", None)
+    return getattr(model, "special_token_id_tensor", None)
+
+
+def _resolve_media_token_ids(bundle) -> List[int]:
+    config = bundle.model.config
+    token_ids = []
+    if bundle.family == "qwen3":
+        for attr in ("image_token_id", "video_token_id"):
+            value = getattr(config, attr, None)
+            if value is not None:
+                token_ids.append(int(value))
+    else:
+        value = getattr(config, "media_placeholder_token_id", None)
+        if value is not None:
+            token_ids.append(int(value))
+    return token_ids
+
+
+def _fused_linear(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    if weight.dim() != 2:
+        raise ValueError(f"Expected 2D fused expert weight, got shape={tuple(weight.shape)}")
+    if weight.shape[-1] == hidden_states.shape[-1]:
+        return F.linear(hidden_states, weight)
+    if weight.shape[0] == hidden_states.shape[-1]:
+        return hidden_states @ weight
+    raise ValueError(
+        f"Unsupported fused expert weight shape {tuple(weight.shape)} "
+        f"for hidden size {hidden_states.shape[-1]}."
+    )
+
+
+def _set_block_modality_masks(bundle, cnt_block: nn.Module, input_ids: torch.Tensor, attn_mask: torch.Tensor):
+    flat_input_ids = input_ids.view(-1)
+    special_ids = _resolve_special_token_tensor(bundle)
+    if special_ids is not None:
+        special_ids = special_ids.to(flat_input_ids.device)
+        moe_text_mask = ~torch.isin(flat_input_ids, special_ids)
+    else:
+        moe_text_mask = torch.ones_like(flat_input_ids, dtype=torch.bool)
+
+    media_token_ids = _resolve_media_token_ids(bundle)
+    if media_token_ids:
+        media_token_tensor = torch.tensor(
+            media_token_ids, device=flat_input_ids.device, dtype=flat_input_ids.dtype
+        )
+        moe_media_mask = torch.isin(flat_input_ids, media_token_tensor)
+    else:
+        moe_media_mask = torch.zeros_like(flat_input_ids, dtype=torch.bool)
+
+    cnt_block.mlp.moe_text_mask = moe_text_mask[:, None]
+    cnt_block.mlp.moe_media_mask = moe_media_mask[:, None]
+    if bundle.family == "qwen3":
+        cnt_block.mlp.moe_padding_mask = (~attn_mask.to(torch.bool)).view(-1, 1)
+    return moe_text_mask, moe_media_mask
+
+
+def _patch_qwen_fused_experts_forward(block: nn.Module):
+    experts = getattr(getattr(block, "mlp", None), "experts", None)
+    if not _is_fused_expert_container(experts):
+        return None
+
+    original = experts.forward
+
+    def _save_grad_attr(obj, index: int, name: str):
+        def _hook(grad):
+            saved = getattr(obj, name)
+            saved[index] = grad.detach()
+
+        return _hook
+
+    def _instrumented_forward(self, hidden_states, router_indices, routing_weights):
+        num_experts = int(self.num_experts)
+        for name in (
+            "saved_down_input",
+            "saved_down_output",
+            "saved_down_grad",
+            "saved_down_out_grad",
+            "saved_up_input",
+            "saved_up_output",
+            "saved_up_in_grad",
+            "saved_up_out_grad",
+            "saved_gate_input",
+            "saved_gate_output",
+            "saved_gate_in_grad",
+            "saved_gate_grad",
+            "saved_text_mask",
+            "saved_visual_mask",
+            "saved_router_weights",
+        ):
+            setattr(self, name, [None] * num_experts)
+
+        text_mask = getattr(block.mlp, "moe_text_mask", None)
+        visual_mask = getattr(block.mlp, "moe_media_mask", None)
+        padding_mask = getattr(block.mlp, "moe_padding_mask", None)
+        if text_mask is None:
+            text_mask = torch.zeros(hidden_states.shape[0], dtype=torch.bool, device=hidden_states.device)
+        else:
+            text_mask = text_mask.to(hidden_states.device).view(-1)
+        if visual_mask is None:
+            visual_mask = torch.zeros(hidden_states.shape[0], dtype=torch.bool, device=hidden_states.device)
+        else:
+            visual_mask = visual_mask.to(hidden_states.device).view(-1)
+        if padding_mask is not None:
+            keep = ~padding_mask.to(hidden_states.device).view(-1)
+            text_mask = text_mask[keep]
+            visual_mask = visual_mask[keep]
+
+        next_states = torch.zeros_like(hidden_states)
+        expert_mask = F.one_hot(router_indices, num_classes=self.num_experts).permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_tensor in expert_hit:
+            expert_idx = int(expert_tensor[0].item())
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+            gate_up = _fused_linear(current_state, self.gate_up_proj[expert_idx])
+            gate, up = gate_up.chunk(2, dim=-1)
+            current_hidden_states = self.act_fn(gate) * up
+            down_out = _fused_linear(current_hidden_states, self.down_proj[expert_idx])
+            weighted = down_out * routing_weights[token_idx, top_k_pos, None]
+
+            self.saved_gate_input[expert_idx] = current_state
+            self.saved_gate_output[expert_idx] = gate
+            self.saved_up_input[expert_idx] = current_state
+            self.saved_up_output[expert_idx] = up
+            self.saved_down_input[expert_idx] = current_hidden_states
+            self.saved_down_output[expert_idx] = down_out
+            self.saved_text_mask[expert_idx] = text_mask[token_idx]
+            self.saved_visual_mask[expert_idx] = visual_mask[token_idx]
+            self.saved_router_weights[expert_idx] = routing_weights[token_idx, top_k_pos]
+
+            if gate.requires_grad:
+                gate.register_hook(_save_grad_attr(self, expert_idx, "saved_gate_grad"))
+            if up.requires_grad:
+                up.register_hook(_save_grad_attr(self, expert_idx, "saved_up_out_grad"))
+            if current_hidden_states.requires_grad:
+                current_hidden_states.register_hook(
+                    _save_grad_attr(self, expert_idx, "saved_down_grad")
+                )
+            if down_out.requires_grad:
+                down_out.register_hook(_save_grad_attr(self, expert_idx, "saved_down_out_grad"))
+
+            next_states.index_add_(0, token_idx, weighted.to(next_states.dtype))
+
+        return next_states
+
+    experts.forward = types.MethodType(_instrumented_forward, experts)
+    return experts, original
 
 
 def _patch_grad_enabled_kimi_moe_infer(block: nn.Module, layer_idx: int):
@@ -302,7 +468,7 @@ def block_forward(
 ):
     model = bundle.model
     model.eval()
-    teacher_block = list(_kimi_teacher_block(model))[layer_idx]
+    teacher_block = list(_teacher_blocks(bundle))[layer_idx]
     block_device = next(teacher_block.parameters()).device
     cnt_block = cnt_block.to(device=block_device, dtype=dtype)
     cnt_block.eval()
@@ -311,6 +477,7 @@ def block_forward(
     teacher_handle = _register_teacher_block_hook(teacher_block, teacher_state)
     copied_handles = _register_copied_block_hooks(cnt_block)
     moe_infer_state = _patch_grad_enabled_kimi_moe_infer(cnt_block, layer_idx=layer_idx)
+    fused_expert_state = _patch_qwen_fused_experts_forward(cnt_block)
 
     total_loss = 0.0
     total_batches = 0
@@ -325,20 +492,19 @@ def block_forward(
             inputs = move_inputs_to_model_device(model, inputs)
             attn_mask = inputs["attention_mask"].to(block_device)
             input_ids = inputs.get("input_ids", None)
+            moe_text_mask = torch.zeros_like(attn_mask, dtype=torch.bool)
+            moe_media_mask = torch.zeros_like(attn_mask, dtype=torch.bool)
 
             # Ensure copied-block moe_infer can access per-token modality masks.
             # Unlike full-model forward, block-only calibration does not automatically
             # refresh these fields on the copied block.
             # 构造 block 级别的 modality mask（用于 channel 二阶计算）
             if input_ids is not None and hasattr(cnt_block, "mlp"):
-                special_ids = getattr(model, "special_token_id_tensor", None)
-                media_token_id = getattr(model.config, "media_placeholder_token_id", None)
-                if special_ids is not None and media_token_id is not None:
-                    special_ids = special_ids.to(input_ids.device)
-                    moe_text_mask = ~torch.isin(input_ids, special_ids).view(-1)
-                    moe_media_mask = (input_ids == media_token_id).view(-1)
-                    cnt_block.mlp.moe_text_mask = moe_text_mask[:, None]
-                    cnt_block.mlp.moe_media_mask = moe_media_mask[:, None]
+                flat_text_mask, flat_media_mask = _set_block_modality_masks(
+                    bundle, cnt_block, input_ids, attn_mask
+                )
+                moe_text_mask = flat_text_mask.view_as(attn_mask)
+                moe_media_mask = flat_media_mask.view_as(attn_mask)
 
             with torch.no_grad():
                 model(**inputs, use_cache=False, return_dict=True)
@@ -428,6 +594,9 @@ def block_forward(
         if moe_infer_state is not None:
             mlp, original_moe_infer = moe_infer_state
             mlp.moe_infer = original_moe_infer
+        if fused_expert_state is not None:
+            experts, original_forward = fused_expert_state
+            experts.forward = original_forward
         _clear_block_saved_tensors(cnt_block)
 
     return total_loss / max(total_batches, 1)

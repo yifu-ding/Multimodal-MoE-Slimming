@@ -90,6 +90,28 @@ EXPERT_METRICS = (
     # "expert_modality_affinity",
 )
 
+
+def _iter_moe_layers(bundle):
+    model = bundle.model
+    config = model.config.text_config
+    if bundle.family == "qwen3":
+        for layer_idx, layer in enumerate(model.model.language_model.layers):
+            if (
+                config.num_experts > 0
+                and (layer_idx + 1) % config.decoder_sparse_step == 0
+                and layer_idx not in getattr(config, "mlp_only_layers", [])
+            ):
+                yield layer_idx, layer
+        return
+
+    for layer_idx, layer in enumerate(model.language_model.model.layers):
+        if (
+            config.n_routed_experts is not None
+            and layer_idx >= config.first_k_dense_replace
+            and layer_idx % config.moe_layer_freq == 0
+        ):
+            yield layer_idx, layer
+
 class ModalityActivationAccumulator:
     def __init__(self, layer_to_num_experts: Dict[int, int], layer_to_num_channels: Dict[int, int]) -> None:
         self.layers = sorted(layer_to_num_experts.keys())
@@ -392,19 +414,68 @@ def restore_kimi_modality_hooks(states) -> None:
         mlp.gate.layer_idx = old_layer_idx
 
 
-def collect_weight_scores(model, config, accumulator: RichScoreAccumulator) -> None:
-    for layer_idx, layer in enumerate(model.language_model.model.layers):
-        if not (
-            config.n_routed_experts is not None
-            and layer_idx >= config.first_k_dense_replace
-            and layer_idx % config.moe_layer_freq == 0
-        ):
+def collect_weight_scores(bundle, accumulator: RichScoreAccumulator) -> None:
+    for layer_idx, layer in _iter_moe_layers(bundle):
+        experts = layer.mlp.experts
+        if _is_fused_expert_container(experts):
+            gate_up = experts.gate_up_proj.detach()
+            down = experts.down_proj.detach()
+            intermediate_size = getattr(experts, "intermediate_size", None)
+            if intermediate_size is None:
+                intermediate_size = getattr(experts, "intermediate_dim", None)
+            if intermediate_size is None:
+                raise ValueError(
+                    "Cannot infer fused Qwen3 intermediate size: expected "
+                    "`intermediate_size` or `intermediate_dim`."
+                )
+            intermediate_size = int(intermediate_size)
+            doubled_intermediate = intermediate_size * 2
+            if gate_up.shape[1] == doubled_intermediate:
+                gate = gate_up[:, :intermediate_size, :]
+                up = gate_up[:, intermediate_size:, :]
+                gateup_channel_dim = 1
+            elif gate_up.shape[2] == doubled_intermediate:
+                gate = gate_up[:, :, :intermediate_size]
+                up = gate_up[:, :, intermediate_size:]
+                gateup_channel_dim = 2
+            else:
+                raise ValueError(
+                    "Cannot infer fused Qwen3 gate_up_proj layout from shape "
+                    f"{tuple(gate_up.shape)} and intermediate_size={intermediate_size}."
+                )
+            if down.ndim != 3:
+                raise ValueError(
+                    f"Expected fused Qwen3 down_proj to be rank-3, got shape {tuple(down.shape)}."
+                )
+            if down.shape[1] == intermediate_size:
+                down_channel_dim = 1
+            elif down.shape[2] == intermediate_size:
+                down_channel_dim = 2
+            else:
+                raise ValueError(
+                    "Cannot infer fused Qwen3 down_proj channel axis from shape "
+                    f"{tuple(down.shape)} and intermediate_size={intermediate_size}."
+                )
+            score = (
+                weight_rms(down, channel_dim=down_channel_dim)
+                + weight_rms(up, channel_dim=gateup_channel_dim)
+                + weight_rms(gate, channel_dim=gateup_channel_dim)
+            ) / 3.0
+            accumulator.channel_metrics["weight"][layer_idx] = score.detach().cpu().float()
+            accumulator.hit_counts[layer_idx] = torch.ones_like(
+                accumulator.hit_counts[layer_idx]
+            )
             continue
-        for eid, expert in enumerate(layer.mlp.experts):
+
+        for eid, expert in enumerate(experts):
             g = expert.gate_proj.weight
             u = expert.up_proj.weight
             d = expert.down_proj.weight
-            score = (weight_rms(d, channel_dim=1) + weight_rms(u, channel_dim=0) + weight_rms(g, channel_dim=0)) / 3.0
+            score = (
+                weight_rms(d, channel_dim=1)
+                + weight_rms(u, channel_dim=0)
+                + weight_rms(g, channel_dim=0)
+            ) / 3.0
             accumulator.channel_metrics["weight"][layer_idx][eid] = score.detach().cpu().float()
             accumulator.hit_counts[layer_idx][eid] = 1
 
@@ -419,7 +490,7 @@ def save_score_artifacts(output_dir: str, accumulator: RichScoreAccumulator, arg
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Collect channel scores for Kimi-VL on multimodal calibration data."
+        description="Collect channel scores for Kimi-VL or Qwen3-VL on multimodal calibration data."
     )
     p.add_argument("--model_name_or_path", type=str, required=True)
     p.add_argument("--output_dir", type=str, required=True)
@@ -437,6 +508,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Block reconstruction loss used during score collection (saved in scores.pt metadata).",
     )
     p.add_argument("--modality_aware", action="store_true")
+    p.add_argument(
+        "--device_map",
+        type=str,
+        default=None,
+        help="Device map for model loading. Defaults to `cuda:0` when CUDA is available, else `auto`.",
+    )
+    p.add_argument(
+        "--attn_implementation",
+        type=str,
+        default="flash_attention_2",
+        choices=["flash_attention_2", "sdpa", "eager"],
+    )
+    p.add_argument(
+        "--max_layers",
+        type=int,
+        default=None,
+        help="Optional cap on the number of MoE layers to calibrate. Useful for smoke tests.",
+    )
     p.add_argument("--force", "-f", action="store_true")
     return p
 
@@ -459,12 +548,17 @@ def run_collection(args) -> None:
         )
         return
 
-    bundle = load_model_bundle(args.model_name_or_path)
-    if bundle.family != "kimi":
-        raise NotImplementedError("The current calibration adapter only supports Kimi-VL.")
+    device_map = args.device_map
+    if device_map is None:
+        device_map = "cuda:0" if torch.cuda.is_available() else "auto"
+
+    bundle = load_model_bundle(
+        args.model_name_or_path,
+        device_map=device_map,
+        attn_implementation=args.attn_implementation,
+    )
 
     model = bundle.model
-    config = model.config.text_config
     layer_to_num_experts, layer_to_num_channels = discover_layer_structure(bundle)
     accumulator = RichScoreAccumulator(
         layer_to_num_experts,
@@ -477,7 +571,7 @@ def run_collection(args) -> None:
         f"{sum(layer_to_num_experts.values())} experts total."
     )
 
-    collect_weight_scores(model, config, accumulator)
+    collect_weight_scores(bundle, accumulator)
     save_score_artifacts(args.output_dir, accumulator, args)
 
     dataset = build_dataset(args.dataset, bundle.family)
@@ -497,8 +591,19 @@ def run_collection(args) -> None:
     )
 
     print("[calibration] Collecting block-reconstruction scores with attn_mlp collector...")
-    for layer_idx in accumulator.layers:
-        teacher_block = model.language_model.model.layers[layer_idx]
+    target_layers = accumulator.layers
+    if args.max_layers is not None:
+        target_layers = accumulator.layers[: max(args.max_layers, 0)]
+        print(
+            f"[calibration] Restricting block calibration to {len(target_layers)} layer(s) "
+            f"for this run: {target_layers}"
+        )
+
+    for layer_idx in target_layers:
+        if bundle.family == "qwen3":
+            teacher_block = model.model.language_model.layers[layer_idx]
+        else:
+            teacher_block = model.language_model.model.layers[layer_idx]
         copied_block = copy.deepcopy(teacher_block)
         block_dtype = next(teacher_block.parameters()).dtype
         layer_loss = block_forward(
