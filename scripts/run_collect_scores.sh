@@ -35,6 +35,11 @@ NUM_SAMPLES="${NUM_SAMPLES:-512}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 START_IDX="${START_IDX:-0}"
 SUBSET_SEED="${SUBSET_SEED:-42}"
+# LAYERS="${LAYERS:-}"  # 默认不传值，全部层calibration
+# LAYERS="${LAYERS:-1-6}"
+LAYERS="${LAYERS:-7-13}"
+# LAYERS="${LAYERS:-14-20}"
+# LAYERS="${LAYERS:-20-26}"
 
 EMA="${EMA:-0.9}"
 
@@ -91,12 +96,45 @@ CMD=(
     --ema                "${EMA}"
 )
 
+# Optional explicit layer list, e.g.:
+#   LAYERS="4 5 6 7"
+#   LAYERS="4,5,6,7"
+#   LAYERS="17-32"
+#   LAYERS="4,6-8,10"
+if [[ -n "${LAYERS// }" ]]; then
+    LAYERS_NORM="${LAYERS//,/ }"
+    # shellcheck disable=SC2206
+    LAYERS_TOKENS=(${LAYERS_NORM})
+    LAYERS_LIST=()
+    for token in "${LAYERS_TOKENS[@]}"; do
+        if [[ "${token}" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            start="${BASH_REMATCH[1]}"
+            end="${BASH_REMATCH[2]}"
+            if (( start > end )); then
+                echo "Invalid LAYERS range: ${token} (start > end)" >&2
+                exit 1
+            fi
+            for ((i = start; i <= end; i++)); do
+                LAYERS_LIST+=("${i}")
+            done
+        elif [[ "${token}" =~ ^[0-9]+$ ]]; then
+            LAYERS_LIST+=("${token}")
+        else
+            echo "Invalid LAYERS token: ${token}" >&2
+            echo "Supported format examples: 4,5,6 or 17-32 or 4,6-8,10" >&2
+            exit 1
+        fi
+    done
+    CMD+=(--layers "${LAYERS_LIST[@]}")
+fi
+
 # --force if you want to recompute the scores and overwrite the existing ones
 
 CMD+=("${EXTRA_ARGS[@]}")
 
 echo "Model      : ${MODEL_PATH}"
 echo "Dataset    : ${DATASET} (${NUM_SAMPLES} samples)"
+echo "Layers     : ${LAYERS:-<all MoE layers>}"
 echo "Output     : ${OUTPUT_DIR}"
 echo "GPU        : ${CUDA_VISIBLE_DEVICES}"
 echo ""

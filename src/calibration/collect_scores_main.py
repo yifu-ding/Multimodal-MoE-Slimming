@@ -71,10 +71,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["flash_attention_2", "sdpa", "eager"],
     )
     p.add_argument(
-        "--max_layers",
+        "--layers",
         type=int,
+        nargs="+",
         default=None,
-        help="Optional cap on the number of MoE layers to calibrate. Useful for smoke tests.",
+        help="Specific MoE layer indices to calibrate, e.g. `--layers 20 21 22`.",
     )
     p.add_argument("--force", "-f", action="store_true")
     return p
@@ -137,13 +138,27 @@ def run_collection(args) -> None:
 
     print("[calibration] Collecting block-reconstruction scores with attn_mlp collector...")
     target_layers = accumulator.layers
-    if args.max_layers is not None:
-        target_layers = accumulator.layers[: max(args.max_layers, 0)]
+    if args.layers is not None:
+        available = set(accumulator.layers)
+        requested = []
+        seen = set()
+        for layer_idx in args.layers:
+            if layer_idx in seen:
+                continue
+            seen.add(layer_idx)
+            if layer_idx not in available:
+                raise ValueError(
+                    f"Requested layer {layer_idx} is not a MoE layer. "
+                    f"Available MoE layers: {accumulator.layers}"
+                )
+            requested.append(layer_idx)
+        if not requested:
+            raise ValueError("`--layers` provided but no valid layer indices remained.")
+        target_layers = requested
         print(
-            f"[calibration] Restricting block calibration to {len(target_layers)} layer(s) "
-            f"for this run: {target_layers}"
+            f"[calibration] Restricting block calibration to {len(target_layers)} "
+            f"specified layer(s): {target_layers}"
         )
-
     for layer_idx in target_layers:
         current_teacher_block = teacher_block(bundle, layer_idx)
         copied_block = copy.deepcopy(current_teacher_block)

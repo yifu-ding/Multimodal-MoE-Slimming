@@ -1,5 +1,6 @@
 from typing import Dict
 
+import datetime as dt
 import torch
 
 from observations.common import resolve_model_name_or_path
@@ -50,8 +51,6 @@ class ScoreAccumulator:
                 value = getattr(expert_container, metric, None)
                 if isinstance(value, torch.Tensor) and value.ndim >= 1 and value.shape[0] == num_experts:
                     self.expert_scores[metric][layer_idx] = value.detach().cpu().float().view(-1)
-                else:
-                    self.expert_scores[metric][layer_idx][eid] = float(value)
             activation = getattr(expert_container, "activation", None)
             if isinstance(activation, torch.Tensor) and activation.ndim >= 2 and activation.shape[0] == num_experts:
                 self.hit_counts[layer_idx] = (activation.detach().cpu().float().abs().sum(dim=1) > 0).to(torch.int64)
@@ -111,6 +110,8 @@ class ScoreAccumulator:
                 "layer_to_num_channels": self.layer_to_num_channels,
                 "available_channel_metrics": list(CHANNEL_METRICS),
                 "available_expert_metrics": list(EXPERT_METRICS),
+                "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "created_at_unix": dt.datetime.now(dt.timezone.utc).timestamp(),
             },
         }
         return payload
