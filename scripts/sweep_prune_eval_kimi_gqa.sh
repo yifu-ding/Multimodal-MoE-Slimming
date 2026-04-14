@@ -50,7 +50,7 @@ SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform uniform_coverage loss_smooth
 #   second_attr_fillzero
 #   second_attr_fillzero_coverage
 SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-uniform first_attr_coverage first_attr_fillzero_coverage second_attr_coverage second_attr_fillzero_coverage usage usage_coverage}"  # usage usage_coverage router router_coverage attr_coverage 
-SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-0 1}"  # 0, 1
+SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-0}"  # 0, 1
 # Not swept; passed through to run_prune_eval_kimi_gqa.sh (see SMOOTH_FN there).
 SMOOTH_FN="${SMOOTH_FN:-sqrt}"
 # Default: full list from run_prune_eval_kimi_gqa.sh (long run); override to shorten.
@@ -68,12 +68,12 @@ SMOOTH_FN="${SMOOTH_FN:-sqrt}"
 #   wg
 # 这个 metric 没有双模态版本
 #   weight
-SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act down_second_order_exact 3proj_second_order}"
+SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act down_second_order_exact 3proj_act 3proj_saliency 3proj_second_order}"
 # 3proj_act down_second_order 3proj_second_order down_saliency 3proj_saliency 3proj_grad
 
 SWEEP_TS="${SWEEP_TS:-$(date +%m%d%H%M)}"
 MODEL_NAME="${MODEL_NAME:-kimi}"
-SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-gqa-rell2-${SWEEP_TS}"
+SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-gqa-rell2-newscores-${SWEEP_TS}"
 
 SUMMARY_FILE="${SUMMARY_FILE:-${SWEEP_BASE}/summary.md}"
 SWEEP_LOG_DIR="${SWEEP_LOG_DIR:-${SWEEP_BASE}/logs}"
