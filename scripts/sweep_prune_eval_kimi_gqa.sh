@@ -50,7 +50,7 @@ SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform uniform_coverage loss_smooth
 #   second_attr_fillzero
 #   second_attr_fillzero_coverage
 SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-uniform first_attr_coverage first_attr_fillzero_coverage second_attr_coverage second_attr_fillzero_coverage usage usage_coverage}"  # usage usage_coverage router router_coverage attr_coverage 
-SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-0}"  # 0, 1
+SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-1}"  # 0, 1
 # Not swept; passed through to run_prune_eval_kimi_gqa.sh (see SMOOTH_FN there).
 SMOOTH_FN="${SMOOTH_FN:-sqrt}"
 # Default: full list from run_prune_eval_kimi_gqa.sh (long run); override to shorten.
