@@ -21,13 +21,13 @@ if ! command -v hf >/dev/null 2>&1; then
     exit 1
 fi
 
-MODEL_ROOT="${MODEL_ROOT:-$(pwd)/storage/models}"
+# MODEL_ROOT="${MODEL_ROOT:-$(pwd)/storage/models}"
 mkdir -p "${MODEL_ROOT}"
 
 MODELS=(
     "moonshotai/Kimi-VL-A3B-Instruct"
     "Qwen/Qwen3-VL-30B-A3B-Instruct"
-    "OpenGVLab/InternVL-3.5-GPT-OSS-20B-A4B-Preview-HF"
+    "OpenGVLab/InternVL3_5-GPT-OSS-20B-A4B-Preview-HF"
 )
 
 if [[ -n "${EXTRA_MODELS:-}" ]]; then

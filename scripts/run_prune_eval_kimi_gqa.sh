@@ -38,7 +38,7 @@ PRUNE_RATIO="${PRUNE_RATIO:-0.50}"
 #   loss_smooth_<N>      # e.g. loss_smooth_1, loss_smooth_2
 #   loss_coverage
 #   raw_loss_coverage
-INTER_METHOD="${INTER_METHOD:-uniform}"
+INTER_METHOD="${INTER_METHOD:-loss_smooth_1}"
 # 在 loss_smooth 的时候会读取，可选：sqrt, cbrt, fourth_root, log, ...
 SMOOTH_FN="${SMOOTH_FN:-fourth_root}"
 # INTRA_METHOD options (intra-layer planner, 基于 EXPERT_METRICS):
@@ -51,7 +51,7 @@ SMOOTH_FN="${SMOOTH_FN:-fourth_root}"
 #   second_attr_coverage  # expert_scores.second_attr
 #   true_ablate        # expert_scores.true_ablate
 #   true_ablate_coverage
-INTRA_METHOD="${INTRA_METHOD:-second_attr_coverage}"
+INTRA_METHOD="${INTRA_METHOD:-attr_coverage}"
 # INTRA_EXPERT_METRIC options (must exist in scores payload channel_scores):
 # 下列 metric 都有 _text / _visual 后缀版本，开双模态时用 xxx_text + xxx_visual
 #   gateup_act, gateup_text, gateup_visual
@@ -86,7 +86,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/results/prune_eval_kimi_gqa_${RATIO_TAG}}"
 EXTRA_ARGS=("$@")
 
 CMD=(
-    python scripts/prune_and_eval_kimi_gqa.py
+    python3 scripts/prune_and_eval_kimi_gqa.py
     --model_path "${MODEL_PATH}"
     --scores_path "${SCORES_PATH}"
     --output_dir "${OUTPUT_DIR}"
