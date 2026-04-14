@@ -37,6 +37,15 @@ import torch.nn.functional as F
 import os
 import pickle
 
+
+# transformers>=4.57 DynamicCache dropped `get_usable_length`, while Kimi's
+# remote modeling code still calls it during attention forward.
+if not hasattr(DynamicCache, "get_usable_length"):
+    def _get_usable_length(self, new_seq_length=None, layer_idx=None):
+        return self.get_seq_length(0 if layer_idx is None else layer_idx)
+
+    DynamicCache.get_usable_length = _get_usable_length
+
 HS_DICT = None
 FREQ_DICT = None
 TEXT_FREQ_DICT = None
@@ -295,7 +304,7 @@ def model_forward(
         use_legacy_cache = not isinstance(past_key_values, Cache)
         if use_legacy_cache:
             past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-        past_key_values_length = past_key_values.get_usable_length(seq_length)
+        past_key_values_length = past_key_values.get_seq_length()
 
     if position_ids is None:
         device = input_ids.device if input_ids is not None else inputs_embeds.device
@@ -1281,8 +1290,8 @@ def prepare_inputs_for_generation_language(
     if past_key_values is not None:
         if isinstance(past_key_values, Cache):
             cache_length = past_key_values.get_seq_length()
-            past_length = past_key_values.seen_tokens
-            max_cache_length = past_key_values.get_seq_length()
+            past_length = cache_length
+            max_cache_length = past_key_values.get_max_cache_shape()
         else:
             cache_length = past_length = past_key_values[0][0].shape[2]
             max_cache_length = None
@@ -1306,6 +1315,22 @@ def prepare_inputs_for_generation_language(
             and cache_length + input_ids.shape[1] > max_cache_length
         ):
             attention_mask = attention_mask[:, -max_cache_length:]
+
+        # HF generation in recent transformers may pass an attention_mask that
+        # tracks only cached tokens (length == past_length). Align it to the
+        # current KV length expected by model forward: past + current inputs.
+        if attention_mask is not None:
+            target_len = past_length + input_ids.shape[1]
+            current_len = attention_mask.shape[1]
+            if current_len < target_len:
+                pad = torch.ones(
+                    (attention_mask.shape[0], target_len - current_len),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+                attention_mask = torch.cat([attention_mask, pad], dim=1)
+            elif current_len > target_len:
+                attention_mask = attention_mask[:, -target_len:]
 
     position_ids = kwargs.get("position_ids", None)
     if attention_mask is not None and position_ids is None:
