@@ -67,6 +67,10 @@ def is_fused_expert_container(experts: nn.Module) -> bool:
 
 def get_fused_saved_tensor(experts: nn.Module, name: str, expert_idx: int):
     value = getattr(experts, name, None)
+    if isinstance(value, (list, tuple)):
+        if expert_idx >= len(value):
+            return None
+        return value[expert_idx]
     if not isinstance(value, torch.Tensor):
         return None
     if value.ndim == 0 or value.shape[0] <= expert_idx:

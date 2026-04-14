@@ -1,4 +1,20 @@
 import torch
+
+# Compat shim: Kimi-VL's remote-code `modeling_kimi_vl.py` does
+#   `from transformers.activations import GELUActivation, ACT2FN, PytorchGELUTanh`
+# Some transformers versions don't expose `PytorchGELUTanh` under that exact
+# symbol name. Re-export it if missing so trust_remote_code loading works.
+import transformers.activations as _tf_activations  # noqa: E402
+if not hasattr(_tf_activations, "PytorchGELUTanh"):
+    import torch.nn as _nn
+    import torch.nn.functional as _F
+
+    class PytorchGELUTanh(_nn.Module):
+        def forward(self, x):
+            return _F.gelu(x, approximate="tanh")
+
+    _tf_activations.PytorchGELUTanh = PytorchGELUTanh
+
 from typing import Optional, Tuple, List, Union
 from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
 from transformers.modeling_outputs import (

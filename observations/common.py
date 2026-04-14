@@ -269,7 +269,12 @@ class ModelBundle:
     model_config: Dict[str, Any]
 
 
-def load_model_bundle(model_name_or_path: str) -> ModelBundle:
+def load_model_bundle(
+    model_name_or_path: str,
+    *,
+    device_map: str = "auto",
+    attn_implementation: str = "flash_attention_2",
+) -> ModelBundle:
     resolved_name_or_path = resolve_model_name_or_path(model_name_or_path)
     family = infer_model_family(model_name_or_path)
     text_to_message = lambda text: [
@@ -283,8 +288,8 @@ def load_model_bundle(model_name_or_path: str) -> ModelBundle:
     ]
     if family == "kimi":
         model, processor = load_kimi_model(resolved_name_or_path,
-                                            device_map="auto",
-                                            attn_implementation="flash_attention_2",
+                                            device_map=device_map,
+                                            attn_implementation=attn_implementation,
                                            )
         model_config = {
             "family": family,
@@ -298,8 +303,8 @@ def load_model_bundle(model_name_or_path: str) -> ModelBundle:
         }
     else:
         model, processor = load_qwen3_model(resolved_name_or_path, 
-                                            device_map="auto", 
-                                            attn_implementation="flash_attention_2")
+                                            device_map=device_map, 
+                                            attn_implementation=attn_implementation)
         model_config = {
             "family": family,
             "get_lm": lambda m: m.model.language_model,
@@ -385,7 +390,16 @@ def resolve_activation_fn(obj: Any) -> Callable[[torch.Tensor], torch.Tensor]:
 
 
 def compute_qwen3_channel_activation(experts, expert_idx: int, hidden_states: torch.Tensor):
-    gate_up = F.linear(hidden_states, experts.gate_up_proj[expert_idx])
+    gate_weight = experts.gate_up_proj[expert_idx]
+    if gate_weight.shape[-1] == hidden_states.shape[-1]:
+        gate_up = F.linear(hidden_states, gate_weight)
+    elif gate_weight.shape[0] == hidden_states.shape[-1]:
+        gate_up = hidden_states @ gate_weight
+    else:
+        raise ValueError(
+            f"Unsupported Qwen3 fused gate_up_proj shape {tuple(gate_weight.shape)} "
+            f"for hidden size {hidden_states.shape[-1]}."
+        )
     gate, up = gate_up.chunk(2, dim=-1)
     return experts.act_fn(gate) * up
 
@@ -705,7 +719,19 @@ def discover_layer_structure(bundle: ModelBundle) -> Tuple[Dict[int, int], Dict[
                 and layer_idx not in getattr(config, "mlp_only_layers", [])
             ):
                 layer_to_num_experts[layer_idx] = layer.mlp.experts.num_experts
-                layer_to_num_channels[layer_idx] = layer.mlp.experts.intermediate_dim
+                intermediate_size = getattr(
+                    layer.mlp.experts, "intermediate_dim", None
+                )
+                if intermediate_size is None:
+                    intermediate_size = getattr(
+                        layer.mlp.experts, "intermediate_size", None
+                    )
+                if intermediate_size is None:
+                    raise AttributeError(
+                        "Cannot infer Qwen3 expert width: expected "
+                        "`intermediate_dim` or `intermediate_size` on fused experts."
+                    )
+                layer_to_num_channels[layer_idx] = int(intermediate_size)
         return layer_to_num_experts, layer_to_num_channels
     config = bundle.model.config.text_config
     for layer_idx, layer in enumerate(bundle.model.language_model.model.layers):

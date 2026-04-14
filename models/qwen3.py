@@ -18,6 +18,8 @@ try:
     from transformers.masking_utils import create_causal_mask
 except Exception:
     logger.warning("Qwen3VLMoeForConditionalGeneration is not available.")
+    Qwen3VLMoeForConditionalGeneration = None
+    AutoProcessor = None
     TransformersKwargs = None
     Qwen3VLMoeModelOutputWithPast = None
     Qwen3VLMoeCausalLMOutputWithPast = None
@@ -40,6 +42,19 @@ import pickle
 
 SKIP_EXP_COUNT = 0
 TOTAL_EXP_COUNT = 0
+
+
+def _fused_linear(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    if weight.dim() != 2:
+        raise ValueError(f"Expected 2D fused expert weight, got shape={tuple(weight.shape)}")
+    if weight.shape[-1] == hidden_states.shape[-1]:
+        return torch.nn.functional.linear(hidden_states, weight)
+    if weight.shape[0] == hidden_states.shape[-1]:
+        return hidden_states @ weight
+    raise ValueError(
+        f"Unsupported fused expert weight shape {tuple(weight.shape)} "
+        f"for hidden size {hidden_states.shape[-1]}."
+    )
 
 
 def experts_forward(
@@ -71,10 +86,10 @@ def experts_forward(
             continue
         top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
         current_state = hidden_states[token_idx]
-        gate_up = torch.nn.functional.linear(current_state, self.gate_up_proj[expert_idx])
+        gate_up = _fused_linear(current_state, self.gate_up_proj[expert_idx])
         gate, up = gate_up.chunk(2, dim=-1)
         current_hidden_states = self.act_fn(gate) * up
-        current_hidden_states = torch.nn.functional.linear(
+        current_hidden_states = _fused_linear(
             current_hidden_states, self.down_proj[expert_idx]
         )
         current_hidden_states = (
@@ -124,8 +139,21 @@ def mlp_forward(
             skip_mask = skip_mask & self.moe_padding_mask
         skip_mask = ~skip_mask.to(hidden_states.device).view(-1)
         hidden_states = hidden_states.view(-1, hidden_size)[skip_mask, :]
-    top_k = getattr(self, "top_k", getattr(self.gate, "top_k"))
-    num_experts = getattr(self, "num_experts", getattr(self.gate, "num_experts"))
+    top_k = getattr(self, "top_k", None)
+    if top_k is None:
+        top_k = getattr(self.gate, "top_k", None)
+    if top_k is None:
+        top_k = getattr(self.config, "num_experts_per_tok", None)
+    if top_k is None:
+        raise AttributeError("Cannot infer Qwen3 MoE top_k from MLP module or config.")
+
+    num_experts = getattr(self, "num_experts", None)
+    if num_experts is None:
+        num_experts = getattr(self.gate, "num_experts", None)
+    if num_experts is None:
+        num_experts = getattr(self.config, "num_experts", None)
+    if num_experts is None:
+        raise AttributeError("Cannot infer Qwen3 MoE num_experts from MLP module or config.")
     TOTAL_EXP_COUNT += hidden_states.shape[0] * top_k
 
     gate_outputs = self.gate(hidden_states)
@@ -721,6 +749,19 @@ def load_model(
     Returns:
         Tuple of (model, processor).
     """
+    if Qwen3VLMoeForConditionalGeneration is None or AutoProcessor is None:
+        try:
+            import transformers
+
+            transformers_version = transformers.__version__
+        except Exception:
+            transformers_version = "unknown"
+        raise ImportError(
+            "Qwen3-VL-MoE loading requires a transformers build that provides "
+            "`Qwen3VLMoeForConditionalGeneration`. "
+            f"Installed transformers version: {transformers_version}. "
+            "Upgrade transformers to a version with Qwen3-VL-MoE support, then retry."
+        )
     if layer_gate_dict is not None:
         logger.info(f"layer_gate_dict: {layer_gate_dict}")
     model = Qwen3VLMoeForConditionalGeneration.from_pretrained(
