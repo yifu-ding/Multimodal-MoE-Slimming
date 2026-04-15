@@ -56,7 +56,7 @@ def loop_2_score_collector(
             _kwargs=_kwargs,
             modality_mask=text_mask,
         )
-        down_second_order_exact_image = compute_down_second_order(
+        down_second_order_exact_visual = compute_down_second_order(
             cnt_block=cnt_block,
             expert=expert_proxy,
             _kwargs=_kwargs,
@@ -68,20 +68,15 @@ def loop_2_score_collector(
             if down_second_order_exact_text is not None:
                 fused_metric_stacks.setdefault("down_second_order_exact_text", {})[expert_idx] = \
                     down_second_order_exact_text.detach()
-            if down_second_order_exact_image is not None:
-                fused_metric_stacks.setdefault("down_second_order_exact_image", {})[expert_idx] = \
-                    down_second_order_exact_image.detach()
-                # Keep visual alias for naming consistency with existing metric keys.
+            if down_second_order_exact_visual is not None:
                 fused_metric_stacks.setdefault("down_second_order_exact_visual", {})[expert_idx] = \
-                    down_second_order_exact_image.detach()
+                    down_second_order_exact_visual.detach()
         else:
             safe_add_with_ema(expert, ema, down_second_order_exact, "down_second_order_exact")
             if down_second_order_exact_text is not None:
                 safe_add_with_ema(expert, ema, down_second_order_exact_text, "down_second_order_exact_text")
-            if down_second_order_exact_image is not None:
-                safe_add_with_ema(expert, ema, down_second_order_exact_image, "down_second_order_exact_image")
-                # Keep visual alias for naming consistency with existing metric keys.
-                safe_add_with_ema(expert, ema, down_second_order_exact_image, "down_second_order_exact_visual")
+            if down_second_order_exact_visual is not None:
+                safe_add_with_ema(expert, ema, down_second_order_exact_visual, "down_second_order_exact_visual")
 
         # true_ablate = compute_true_ablate_attr(
         #     cnt_block=cnt_block,
