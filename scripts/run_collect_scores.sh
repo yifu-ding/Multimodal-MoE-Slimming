@@ -42,6 +42,7 @@ LAYERS="${LAYERS:-}"  # 默认不传值，全部层calibration
 # LAYERS="${LAYERS:-20-26}"
 
 EMA="${EMA:-0.9}"
+FILL_ZERO_FOR_UNROUTED="${FILL_ZERO_FOR_UNROUTED:-true}"
 
 case "${DATASET,,}" in
     gqa)
@@ -80,7 +81,7 @@ case "${MODEL_TAG}" in
 esac
 
 # OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/${MODEL_TAG}_${DATASET_TAG}-second_order}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/${MODEL_TAG}_${DATASET_TAG}-rell2-$(date +%m%d-%H%M%S)}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/${MODEL_TAG}_${DATASET_TAG}-rell2-fill0-$(date +%m%d-%H%M%S)}"
 
 EXTRA_ARGS=("$@")
 
@@ -95,6 +96,10 @@ CMD=(
     --subset_seed        "${SUBSET_SEED}"
     --ema                "${EMA}"
 )
+
+if [[ "${FILL_ZERO_FOR_UNROUTED}" == "true" ]]; then
+    CMD+=(--fill_zero_for_unrouted)
+fi
 
 # Optional explicit layer list, e.g.:
 #   LAYERS="4 5 6 7"
@@ -136,6 +141,11 @@ echo "Model      : ${MODEL_PATH}"
 echo "Dataset    : ${DATASET} (${NUM_SAMPLES} samples)"
 echo "Layers     : ${LAYERS:-<all MoE layers>}"
 echo "Output     : ${OUTPUT_DIR}"
+echo "Fill zero for unrouted: ${FILL_ZERO_FOR_UNROUTED}"
 echo "GPU        : ${CUDA_VISIBLE_DEVICES}"
+echo ""
+echo "CMD: ${CMD[@]}"
+echo ""
+echo "Running command..."
 echo ""
 "${CMD[@]}"

@@ -51,6 +51,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--subset_seed", type=int, default=42)
     p.add_argument("--ema", type=float, default=0.9)
     p.add_argument(
+        "--fill_zero_for_unrouted",
+        action="store_true",
+        help="EMA-update unrouted experts with zero-filled loop_1 activations instead of leaving previous values untouched.",
+    )
+    p.add_argument(
         "--loss_fn",
         type=str,
         default="rel_l2",
@@ -170,6 +175,7 @@ def run_collection(args) -> None:
             dataloader=loader,
             dataset_name=args.dataset,
             saliency_ema=args.ema,
+            fill_zero_for_unrouted=args.fill_zero_for_unrouted,
             loss_fn=args.loss_fn,
             dtype=block_dtype,
             verbose=True,

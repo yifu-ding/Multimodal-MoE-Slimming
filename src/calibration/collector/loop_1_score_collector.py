@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from .utils import *
 from .loop_1_helpers import *
+from src.calibration.helpers.score_namespace import CHANNEL_METRICS
 
 def loop_1_score_collector(
     expert_iter,
@@ -16,12 +17,16 @@ def loop_1_score_collector(
     gate_grad_w,
     fused_metric_stacks: dict,
     ema: float,
+    fill_zero_for_unrouted: bool = False,
     _kwargs: dict = None,
 ):
     debug_down_input_hits = 0
     debug_gateup_hits = 0
     debug_total_experts = 0
     expert_records = []
+
+    def _make_zero_tensor(num_channels: int, *, ref: torch.Tensor) -> torch.Tensor:
+        return torch.zeros((1, num_channels), dtype=ref.dtype, device=ref.device)
 
     def _sanity_check_tensors(expert_idx: int, **tensors):
         missing = [name for name, value in tensors.items() if value is None]
@@ -56,7 +61,27 @@ def loop_1_score_collector(
         visual_mask: torch.Tensor = None,
         router_weights: torch.Tensor = None,
         attn_mask: torch.Tensor = None,
+        force_zero_metrics: bool = False,
     ):
+        if force_zero_metrics:
+            num_channels = int(W_down.shape[1])
+            hidden_size = int(W_down.shape[0])
+            down_input = _make_zero_tensor(num_channels, ref=W_down)
+            down_output = _make_zero_tensor(hidden_size, ref=W_down)
+            down_in_grad = _make_zero_tensor(num_channels, ref=W_down)
+            down_out_grad = _make_zero_tensor(hidden_size, ref=W_down)
+            up_input = _make_zero_tensor(hidden_size, ref=W_up)
+            up_output = _make_zero_tensor(num_channels, ref=W_up)
+            up_in_grad = _make_zero_tensor(hidden_size, ref=W_up)
+            up_out_grad = _make_zero_tensor(num_channels, ref=W_up)
+            gate_input = _make_zero_tensor(hidden_size, ref=W_gate)
+            gate_output = _make_zero_tensor(num_channels, ref=W_gate)
+            gate_in_grad = _make_zero_tensor(hidden_size, ref=W_gate)
+            gate_grad = _make_zero_tensor(num_channels, ref=W_gate)
+            text_mask = torch.zeros(1, dtype=torch.bool, device=W_down.device)
+            visual_mask = torch.zeros(1, dtype=torch.bool, device=W_down.device)
+            router_weights = torch.zeros(1, dtype=torch.float32, device=W_down.device)
+
         _sanity_check_tensors(
             expert_idx,
             down_input=down_input,
@@ -140,6 +165,19 @@ def loop_1_score_collector(
         # Expert Modality Affinity: (visual - text) / (visual + text + eps), per batch, EMA-accumulated.
         # +1 means visual-preferring, -1 means text-preferring, 0 means balanced.
         # metrics["expert_modality_affinity"] = (v_count - t_count) / (v_count + t_count + 1e-8)
+        if force_zero_metrics:
+            zero_channel = torch.zeros_like(metrics["weight"])
+            for key in CHANNEL_METRICS:
+                if key.startswith("down_second_order_exact"):
+                    continue
+                metrics.setdefault(key, zero_channel.clone())
+            metrics["usage"] = 0.0
+            metrics["usage_text"] = 0.0
+            metrics["usage_visual"] = 0.0
+            metrics["router"] = 0.0
+            metrics["first_attr"] = 0.0
+            metrics["token_count_text"] = 0.0
+            metrics["token_count_visual"] = 0.0
         return metrics
 
     for expert_idx, expert in enumerate(expert_iter):
@@ -158,7 +196,8 @@ def loop_1_score_collector(
         # Gate on routing: if this expert was not routed to this sample,
         # loop_1 metrics are strictly "no-update" for both fused/non-fused.
         # loop_2 handles second_attr / second_attr_fillzero policies.
-        if down_input is None:
+        force_zero_metrics = down_input is None and fill_zero_for_unrouted
+        if down_input is None and not force_zero_metrics:
             expert_records.append(
                 {
                     "expert_idx": expert_idx,
@@ -203,6 +242,7 @@ def loop_1_score_collector(
                 visual_mask=visual_mask,
                 router_weights=router_weights,
                 attn_mask=None if _kwargs is None else _kwargs.get("attn_mask", None),
+                force_zero_metrics=force_zero_metrics,
             )
             
             # gateup_act = metrics.get("gateup_act", None)

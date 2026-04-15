@@ -125,6 +125,7 @@ class ScoreAccumulator:
                 "resolved_model_name_or_path": resolve_model_name_or_path(args.model_name_or_path),
                 "subset_seed": args.subset_seed,
                 "ema": args.ema,
+                "fill_zero_for_unrouted": getattr(args, "fill_zero_for_unrouted", False),
                 "layers": self.layers,
                 "layer_to_num_experts": self.layer_to_num_experts,
                 "layer_to_num_channels": self.layer_to_num_channels,

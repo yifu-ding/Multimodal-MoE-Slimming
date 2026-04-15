@@ -7,6 +7,7 @@ from .loop_2_score_collector import *
 def collect_scores_from_moe_module(cnt_block, 
                             ema: float = 0.9, 
                             _kwargs: dict = None) -> None:
+    fill_zero_for_unrouted = False if _kwargs is None else bool(_kwargs.get("fill_zero_for_unrouted", False))
     experts = getattr(cnt_block.mlp, "experts", None)
     is_fused = is_fused_expert_container(experts)
     fused_metric_stacks = {}
@@ -57,6 +58,7 @@ def collect_scores_from_moe_module(cnt_block,
             gate_grad_w=gate_grad_w,
             fused_metric_stacks=fused_metric_stacks,
             ema=ema,
+            fill_zero_for_unrouted=fill_zero_for_unrouted,
             _kwargs=_kwargs,
         )
     )
