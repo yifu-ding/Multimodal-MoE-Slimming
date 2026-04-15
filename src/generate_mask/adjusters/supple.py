@@ -13,8 +13,7 @@ def trim_masks_to_layer_budget(
     total_per_layer = E * I
     
     # _scores = torch.maximum(modality_scores["text"], modality_scores["visual"])
-    _scores = modality_scores["text"] + modality_scores["visual"]
-    _scores = _scores / 2.0
+    _scores = (modality_scores["text"] + modality_scores["visual"])/2
 
     for lid in range(L):
         keep_ratio = layerwise_keep_plan[lid]

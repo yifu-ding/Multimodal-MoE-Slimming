@@ -21,7 +21,6 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 SCORES_PATH="${SCORES_PATH:-}"
-# SCORES_PATH=/home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_gqa-rell2-041513.pt
 
 PRUNE_RATIO="${PRUNE_RATIO:-0.50}"
 # INTER_METHOD options (inter-layer planner):
