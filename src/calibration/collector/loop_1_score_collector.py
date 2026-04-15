@@ -92,7 +92,7 @@ def loop_1_score_collector(
         
         # 只取中间一层来算
         metrics["gateup_act"] = compute_gateup_act(activation_owner, gate_output, up_output)
-        metrics["down_second_order"] = compute_channel_hessian_diag(W_down, down_input, None)
+        metrics["down_second_order_approx"] = compute_channel_hessian_diag(W_down, down_input, None)
         metrics["down_saliency"] = compute_saliency_I(down_input, down_grad_ch)
 
         # 算 expertwise 的 usage、router 
@@ -109,11 +109,13 @@ def loop_1_score_collector(
 
         t_count = float(text_mask.sum().item()) if isinstance(text_mask, torch.Tensor) else 0.0
         v_count = float(visual_mask.sum().item()) if isinstance(visual_mask, torch.Tensor) else 0.0
+        metrics["token_count_text"] = t_count
+        metrics["token_count_visual"] = v_count
 
         if t_count > 0:
             metrics["3proj_grad_text"] = compute_grad_I_masked(down_in_grad, up_out_grad, gate_grad, text_mask)
             metrics["wg_text"] = metrics["wg"] * (t_count / max(total_tokens, 1.0))
-            metrics["down_second_order_text"] = compute_channel_hessian_diag(W_down, down_input, text_mask)
+            metrics["down_second_order_approx_text"] = compute_channel_hessian_diag(W_down, down_input, text_mask)
             metrics["3proj_second_order_text"] = compute_3linear_hessian_diag(W_down, W_up, W_gate, down_input, up_output, gate_output, text_mask)
             metrics["gateup_act_text"] = compute_gateup_act(activation_owner, gate_output, up_output, token_mask=text_mask)
             metrics["3proj_act_text"] = compute_activation_I_masked(down_input, up_output, gate_output, token_mask=text_mask)
@@ -125,7 +127,7 @@ def loop_1_score_collector(
         if v_count > 0:
             metrics["3proj_grad_visual"] = compute_grad_I_masked(down_in_grad, up_out_grad, gate_grad, visual_mask)
             metrics["wg_visual"] = metrics["wg"] * (v_count / max(total_tokens, 1.0))
-            metrics["down_second_order_visual"] = compute_channel_hessian_diag(W_down, down_input, visual_mask)
+            metrics["down_second_order_approx_visual"] = compute_channel_hessian_diag(W_down, down_input, visual_mask)
             metrics["3proj_second_order_visual"] = compute_3linear_hessian_diag(W_down, W_up, W_gate, down_input, up_output, gate_output, visual_mask)
             metrics["gateup_act_visual"] = compute_gateup_act(activation_owner, gate_output, up_output, token_mask=visual_mask)
             metrics["3proj_act_visual"] = compute_activation_I_masked(down_input, up_output, gate_output, token_mask=visual_mask)
@@ -214,11 +216,11 @@ def loop_1_score_collector(
                     fused_metric_stacks.setdefault(key, {})[expert_idx] = stacked_value
             else:
                 for key, value in metrics.items():
-                    # if key in ("usage_text", "usage_visual"):
-                    #     current = float(getattr(expert, key, 0.0))
-                    #     setattr(expert, key, current + float(value))
-                    # else:
-                    safe_add_with_ema(expert, ema, value, key)
+                    if key in ("token_count_text", "token_count_visual"):
+                        current = float(getattr(expert, key, 0.0))
+                        setattr(expert, key, current + float(value))
+                    else:
+                        safe_add_with_ema(expert, ema, value, key)
             expert_records.append({"expert_idx": expert_idx, 
                                    "expert": expert, 
                                    "has_activation": down_input is not None, 
@@ -226,4 +228,3 @@ def loop_1_score_collector(
        
 
     return expert_records, debug_down_input_hits, debug_gateup_hits, debug_total_experts
-

@@ -7,10 +7,14 @@ CHANNEL_METRICS = (
     "3proj_act",
     "3proj_act_text",
     "3proj_act_visual",
-    # down proj second order
-    "down_second_order",
-    "down_second_order_text",
-    "down_second_order_visual",
+    # down proj second order (approx)
+    "down_second_order_approx",
+    "down_second_order_approx_text",
+    "down_second_order_approx_visual",
+    # down second order (exact)
+    "down_second_order_exact",
+    "down_second_order_exact_text",
+    "down_second_order_exact_visual",
     # three proj second order
     "3proj_second_order",
     "3proj_second_order_text",
@@ -36,14 +40,17 @@ CHANNEL_METRICS = (
     "wg_text",
     "wg_visual",
     # weight
-    "weight",
-    "down_second_order_exact"
+    "weight"
 )
 
 EXPERT_METRICS = (
     "first_attr",
     "first_attr_fillzero",
     "usage",
+    "usage_text",
+    "usage_visual",
+    "token_count_text",
+    "token_count_visual",
     "usage_fillzero",
     "router",
     "router_fillzero",

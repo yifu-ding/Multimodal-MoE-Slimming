@@ -31,8 +31,8 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 # MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-VL-30B-A3B-Instruct}"
 DATASET="${DATASET:-gqa}"
-NUM_SAMPLES="${NUM_SAMPLES:-2048}"
-BATCH_SIZE="${BATCH_SIZE:-8}"
+NUM_SAMPLES="${NUM_SAMPLES:-128}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
 START_IDX="${START_IDX:-0}"
 SUBSET_SEED="${SUBSET_SEED:-42}"
 LAYERS="${LAYERS:-}"  # 默认不传值，全部层calibration
@@ -80,7 +80,7 @@ case "${MODEL_TAG}" in
 esac
 
 # OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/${MODEL_TAG}_${DATASET_TAG}-second_order}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/${MODEL_TAG}_${DATASET_TAG}-rell2-$(date +%m%d%H%M)}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/${MODEL_TAG}_${DATASET_TAG}-rell2-$(date +%m%d-%H%M%S)}"
 
 EXTRA_ARGS=("$@")
 

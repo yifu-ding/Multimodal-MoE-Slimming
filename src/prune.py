@@ -69,7 +69,7 @@ def _shrink_kimi_router_for_active_experts(module: nn.Module, keep_mask: torch.T
 @torch.no_grad()
 def apply_structural_pruning(
     model: nn.Module,
-    masks: Dict[int, torch.Tensor],
+    masks: Dict[int, torch.Tensor] | None,
     config,
 ) -> None:
     """Structurally prune routed expert intermediate dimensions in-place.
@@ -81,6 +81,8 @@ def apply_structural_pruning(
 
     Shared experts (layer.mlp.shared_experts) are never touched.
     """
+    if masks is None:
+        return
     layers = model.language_model.model.layers
     pbar = tqdm(total=len(layers), desc="Pruning experts", unit="layer")
 

@@ -94,7 +94,12 @@ def collect_scores_from_moe_module(cnt_block,
             # else:
             for eid, v in per_expert.items():
                 value = v.detach().to(device=device, dtype=torch.float32)
-                if is_first_update:
+                if key in ("token_count_text", "token_count_visual"):
+                    if is_first_update:
+                        current[eid] = value
+                    else:
+                        current[eid].add_(value)
+                elif is_first_update:
                     current[eid] = value
                 else:
                     current[eid].mul_(ema).add_(value, alpha=1.0 - ema)

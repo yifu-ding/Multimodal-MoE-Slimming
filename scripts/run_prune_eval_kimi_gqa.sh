@@ -21,6 +21,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 SCORES_PATH="${SCORES_PATH:-}"
+# SCORES_PATH=/home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_gqa-rell2-041511-1-5+14-17.pt
 
 PRUNE_RATIO="${PRUNE_RATIO:-0.50}"
 # INTER_METHOD options (inter-layer planner):
@@ -45,7 +46,7 @@ SMOOTH_FN="${SMOOTH_FN:-sqrt}"
 #   second_attr_coverage  # expert_scores.second_attr
 #   second_attr_fillzero
 #   second_attr_fillzero_coverage
-INTRA_METHOD="${INTRA_METHOD:-second_attr_coverage}"
+INTRA_METHOD="${INTRA_METHOD:-second_attr_fillzero_coverage}"
 # INTRA_EXPERT_METRIC options (must exist in scores payload channel_scores):
 # 下列 metric 都有 _text / _visual 后缀版本，开双模态时用 xxx_text + xxx_visual
 #   gateup_act
@@ -61,7 +62,7 @@ INTRA_METHOD="${INTRA_METHOD:-second_attr_coverage}"
 # 这个 metric 没有双模态版本
 #   weight
 MODALITY_AWARE="${MODALITY_AWARE:-1}"  # 是否开启双模态
-INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-gateup_act}"
+INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-down_second_order_exact}"
 
 ALIGN_INTER="${ALIGN_INTER:-0}"
 MIN_PER_EXPERT="${MIN_PER_EXPERT:-256}"
