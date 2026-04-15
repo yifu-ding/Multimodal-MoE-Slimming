@@ -74,7 +74,7 @@ def build_masks_coverage(scores, loss_matrix=None, keep_ratio=None, L=None, E=No
         _print("Probe of intra_layer_planning:")
         _print(f"\t intra_layer_planning: prepare_time: {prepare_time * 1000:.2f}ms", flush=True)
         _print(f"\t intra_layer_planning: total_time: {total_time * 1000:.2f}ms ({L} layers, {E} experts, {total_time * 1000/L:.2f}ms/layer)", flush=True)
-        _print(f"\t remaining channels (L1): {K_E[0]}")
+        _print(f"\t Initial planned channels (L1): {K_E[0]}")
     return masks, K_E
 
 def _prepare_keep_ratio(keep_ratio, L: int, device: torch.device) -> torch.Tensor:

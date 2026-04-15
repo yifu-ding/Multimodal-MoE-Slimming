@@ -66,47 +66,48 @@ def main() -> None:
 
     print(f"[Run] Loading scores from: {args.scores_path}")
     
-    if args.thresholds_path is not None and args.modality_aware:
-        # 读取 threshold_path 的 pt 文件中存储的intra_expert_metric并覆盖 args.intra_expert_metric
-        thresh = torch.load(args.thresholds_path, map_location="cpu", weights_only=False)
-        args.intra_expert_metric = thresh["metadata"].get("intra_expert_metric", "down_second_order")
-        print(f"[Run] Overridden from thresholds.pt: intra_expert_metric={args.intra_expert_metric}")
-    
-    mask_result = build_masks_pipeline(
-        scores_dir=args.scores_path,
-        prune_kwargs={
-            "prune_ratio": args.prune_ratio,
-            "thresholds_path": args.thresholds_path,
-            "mask_method_kwargs": {
-                "inter_layer_method": args.inter_method,
-                "intra_layer_method": args.intra_method,
-                "intra_expert_metric": args.intra_expert_metric,
+    # if args.thresholds_path is not None and args.modality_aware:
+    #     # 读取 threshold_path 的 pt 文件中存储的intra_expert_metric并覆盖 args.intra_expert_metric
+    #     thresh = torch.load(args.thresholds_path, map_location="cpu", weights_only=False)
+    #     args.intra_expert_metric = thresh["metadata"].get("intra_expert_metric", "down_second_order")
+    #     print(f"[Run] Overridden from thresholds.pt: intra_expert_metric={args.intra_expert_metric}")
+    masks = None
+    if args.prune_ratio is not None and args.prune_ratio > 0:
+        mask_result = build_masks_pipeline(
+            scores_dir=args.scores_path,
+            prune_kwargs={
+                "prune_ratio": args.prune_ratio,
+                "thresholds_path": args.thresholds_path,
+                "mask_method_kwargs": {
+                    "inter_layer_method": args.inter_method,
+                    "intra_layer_method": args.intra_method,
+                    "intra_expert_metric": args.intra_expert_metric,
+                },
+                "adjust_masks_kwargs": {
+                    "align_inter": args.align_inter,
+                    "min_per_expert": args.min_per_expert,
+                },
+                "modality_aware": args.modality_aware,
+                "prune_hidden": False,
+                "prune_gqa": False,
+                "smooth_fn": args.smooth_fn,
             },
-            "adjust_masks_kwargs": {
-                "align_inter": args.align_inter,
-                "min_per_expert": args.min_per_expert,
-            },
-            "modality_aware": args.modality_aware,
-            "prune_hidden": False,
-            "prune_gqa": False,
-            "smooth_fn": args.smooth_fn,
-        },
-        device="cpu",
-        verbose=True,
-    )
-    mask_tensor = mask_result["intermediate_masks"]
-    layers = [int(layer) for layer in mask_result.get("layers", list(range(mask_tensor.shape[0])))]
-    masks = {
-        layer_idx: mask_tensor[pos].detach().cpu().bool()
-        for pos, layer_idx in enumerate(layers)
-    }
-    k_e = mask_result["K_E_inter"].detach().cpu()
-    i_orig = int(mask_tensor.shape[-1])
-    print(
-        f"[Run] Generated masks for {len(layers)} layers. "
-        f"I_orig={i_orig}, I_prime min={int(k_e.min().item())} "
-        f"max={int(k_e.max().item())} mean={float(k_e.float().mean().item()):.1f}"
-    )
+            device="cpu",
+            verbose=True,
+        )
+        mask_tensor = mask_result["intermediate_masks"]
+        layers = [int(layer) for layer in mask_result.get("layers", list(range(mask_tensor.shape[0])))]
+        masks = {
+            layer_idx: mask_tensor[pos].detach().cpu().bool()
+            for pos, layer_idx in enumerate(layers)
+        }
+        k_e = mask_result["K_E_inter"].detach().cpu()
+        i_orig = int(mask_tensor.shape[-1])
+        print(
+            f"[Run] Generated masks for {len(layers)} layers. "
+            f"I_orig={i_orig}, I_prime min={int(k_e.min().item())} "
+            f"max={int(k_e.max().item())} mean={float(k_e.float().mean().item()):.1f}"
+        )
 
     resolved_model_path = resolve_model_name_or_path(args.model_path)
     print(f"[Run] Loading model from: {resolved_model_path}")

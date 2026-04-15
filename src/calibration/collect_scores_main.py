@@ -171,7 +171,6 @@ def run_collection(args) -> None:
             dataset_name=args.dataset,
             saliency_ema=args.ema,
             loss_fn=args.loss_fn,
-            second_order_mode="exact",  # default second-order mode is exact
             dtype=block_dtype,
             verbose=True,
         )

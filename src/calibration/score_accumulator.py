@@ -11,6 +11,15 @@ from src.calibration.helpers.utils import is_fused_expert_container
 from src.calibration.helpers.score_namespace import CHANNEL_METRICS, EXPERT_METRICS
 
 
+def _normalize_per_layer_counts(counts_map: Dict[int, torch.Tensor]) -> Dict[int, torch.Tensor]:
+    output = {}
+    for layer_idx, counts in counts_map.items():
+        counts = counts.detach().cpu().float()
+        denom = counts.sum().clamp_min(1.0)
+        output[layer_idx] = counts / denom
+    return output
+
+
 class ScoreAccumulator:
     def __init__(
         self,
@@ -24,7 +33,7 @@ class ScoreAccumulator:
         for metric in CHANNEL_METRICS:
             self.channel_metrics[metric] = {}
         self.expert_scores: Dict[str, Dict[int, torch.Tensor]] = {}
-        for metric in EXPERT_METRICS + ("usage_text", "usage_visual"):
+        for metric in EXPERT_METRICS:
             self.expert_scores[metric] = {}
 
         self.hit_counts: Dict[int, torch.Tensor] = {}
@@ -35,7 +44,7 @@ class ScoreAccumulator:
             i = layer_to_num_channels[layer_idx]
             for metric in CHANNEL_METRICS:
                 self.channel_metrics[metric][layer_idx] = torch.zeros(e, i, dtype=torch.float32)
-            for metric in EXPERT_METRICS + ("usage_text", "usage_visual"):
+            for metric in EXPERT_METRICS:
                 self.expert_scores[metric][layer_idx] = torch.zeros(e, dtype=torch.float32)
             self.hit_counts[layer_idx] = torch.zeros(e, dtype=torch.int64)
 
@@ -47,7 +56,7 @@ class ScoreAccumulator:
                 value = getattr(expert_container, metric, None)
                 if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[0] == num_experts:
                     self.channel_metrics[metric][layer_idx] = value.detach().cpu().float()
-            for metric in EXPERT_METRICS + ("usage_text", "usage_visual"):
+            for metric in EXPERT_METRICS:
                 value = getattr(expert_container, metric, None)
                 if isinstance(value, torch.Tensor) and value.ndim >= 1 and value.shape[0] == num_experts:
                     self.expert_scores[metric][layer_idx] = value.detach().cpu().float().view(-1)
@@ -63,8 +72,7 @@ class ScoreAccumulator:
                 if value is None:
                     continue
                 self.channel_metrics[metric][layer_idx][eid] = value.detach().cpu().float()
-            for metric in EXPERT_METRICS + ("usage_text", "usage_visual"): 
-                # usage_text and usage_visual are not in EXPERT_METRICS, but they are used to compute ema_matrix
+            for metric in EXPERT_METRICS:
                 value = getattr(expert, metric, None)
                 if value is None:
                     continue
@@ -84,11 +92,23 @@ class ScoreAccumulator:
             metric: to_nested_expert_dict(self.expert_scores[metric], scalar=True)
             for metric in EXPERT_METRICS
         }
+        normalized_token_count_text = _normalize_per_layer_counts(
+            {layer_idx: self.expert_scores["token_count_text"][layer_idx] for layer_idx in self.layers}
+        )
+        normalized_token_count_visual = _normalize_per_layer_counts(
+            {layer_idx: self.expert_scores["token_count_visual"][layer_idx] for layer_idx in self.layers}
+        )
+        expert_scores["token_count_text"] = to_nested_expert_dict(
+            normalized_token_count_text, scalar=True
+        )
+        expert_scores["token_count_visual"] = to_nested_expert_dict(
+            normalized_token_count_visual, scalar=True
+        )
         ema_matrix = {}
         for layer_idx in self.layers:
-            text_freq = self.expert_scores["usage_text"][layer_idx]
-            visual_freq = self.expert_scores["usage_visual"][layer_idx]
-            ema_matrix[layer_idx] = (visual_freq - text_freq).clamp(-1.0, 1.0)
+            text_freq = self.expert_scores["token_count_text"][layer_idx]
+            visual_freq = self.expert_scores["token_count_visual"][layer_idx]
+            ema_matrix[layer_idx] = (visual_freq - text_freq) / (visual_freq + text_freq + 1e-8)
 
         payload = {
             "channel_scores": channel_scores,
