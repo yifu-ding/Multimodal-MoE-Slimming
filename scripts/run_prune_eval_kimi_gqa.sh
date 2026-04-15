@@ -21,8 +21,6 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 SCORES_PATH="${SCORES_PATH:-}"
-# SCORES_PATH=/home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_gqa-rell2-041511-1-5+14-17.pt
-# SCORES_PATH=/home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_gqa-rell2-041513-11-15.pt
 
 PRUNE_RATIO="${PRUNE_RATIO:-0.50}"
 # INTER_METHOD options (inter-layer planner):
@@ -33,7 +31,7 @@ PRUNE_RATIO="${PRUNE_RATIO:-0.50}"
 #   loss_smooth_<N>      # e.g. loss_smooth_1, loss_smooth_2
 #   loss_coverage
 #   raw_loss_coverage
-INTER_METHOD="${INTER_METHOD:-uniform}"
+INTER_METHOD="${INTER_METHOD:-loss_smooth_2}"
 # 在 loss_smooth 的时候会读取，可选：sqrt, cbrt, fourth_root, log, ...
 SMOOTH_FN="${SMOOTH_FN:-sqrt}"
 # INTRA_METHOD options (intra-layer planner, 基于 EXPERT_METRICS):
@@ -47,7 +45,7 @@ SMOOTH_FN="${SMOOTH_FN:-sqrt}"
 #   second_attr_coverage  # expert_scores.second_attr
 #   second_attr_fillzero
 #   second_attr_fillzero_coverage
-INTRA_METHOD="${INTRA_METHOD:-second_attr_fillzero_coverage}"
+INTRA_METHOD="${INTRA_METHOD:-second_attr_coverage}"
 # INTRA_EXPERT_METRIC options (must exist in scores payload channel_scores):
 # 下列 metric 都有 _text / _visual 后缀版本，开双模态时用 xxx_text + xxx_visual
 #   gateup_act
@@ -63,7 +61,7 @@ INTRA_METHOD="${INTRA_METHOD:-second_attr_fillzero_coverage}"
 # 这个 metric 没有双模态版本
 #   weight
 MODALITY_AWARE="${MODALITY_AWARE:-1}"  # 是否开启双模态
-INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-down_second_order_exact}"
+INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-gateup_act}"
 
 ALIGN_INTER="${ALIGN_INTER:-0}"
 MIN_PER_EXPERT="${MIN_PER_EXPERT:-256}"
@@ -98,7 +96,7 @@ if [[ -z "${MODEL_NAME}" ]]; then
 fi
 
 RATIO_TAG="p$(python3 -c "print(str(int(float('${PRUNE_RATIO}')*100)))")"
-OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/results/prune_eval_${MODEL_NAME}_gqa_${RATIO_TAG}-rell2-$(date +%m%d%H%M)}/tmp_logs"
+OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/results/prune_eval_${MODEL_NAME}_gqa_${RATIO_TAG}-rell2-$(date +%m%d%H%M)}/logs"
 
 EXTRA_ARGS=("$@")
 
