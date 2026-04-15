@@ -91,15 +91,24 @@ def _merge_nonzero_candidates(candidates: List[Tuple[float, Any]]) -> Optional[A
             if isinstance(v, dict):
                 keys.update(v.keys())
         merged_dict = {}
+        any_nonzero = False
         for k in sorted(keys, key=lambda x: str(x)):
             child_candidates = []
             for ts, v in candidates:
                 if isinstance(v, dict) and k in v and v[k] is not None:
                     child_candidates.append((ts, v[k]))
+            if not child_candidates:
+                continue
             child = _merge_nonzero_candidates(child_candidates)
             if child is not None:
                 merged_dict[k] = child
-        return merged_dict if merged_dict else None
+                any_nonzero = True
+            else:
+                # All candidates for this child are zero; keep the key (use latest)
+                # so downstream stacking over a layer's expert dict stays shape-consistent.
+                _, latest = max(child_candidates, key=lambda x: x[0])
+                merged_dict[k] = latest
+        return merged_dict if any_nonzero else None
 
     for _, v in sorted(candidates, key=lambda x: x[0], reverse=True):
         if _value_has_nonzero(v):
