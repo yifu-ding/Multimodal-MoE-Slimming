@@ -7,9 +7,7 @@ from observations.common import resolve_model_name_or_path
 from src.calibration.helpers.helpers import to_nested_expert_dict
 from src.calibration.helpers.utils import is_fused_expert_container
 
-
-from src.calibration.helpers.score_namespace import CHANNEL_METRICS, EXPERT_METRICS
-
+from src.calibration.helpers.score_namespace import ACTIVE_CHANNEL_METRICS as CHANNEL_METRICS, EXPERT_METRICS
 
 def _normalize_per_layer_counts(counts_map: Dict[int, torch.Tensor]) -> Dict[int, torch.Tensor]:
     output = {}
