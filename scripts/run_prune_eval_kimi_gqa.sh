@@ -21,6 +21,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 SCORES_PATH="${SCORES_PATH:-}"
+TASK="${TASK:-gqa}"
 
 PRUNE_RATIO="${PRUNE_RATIO:-0.50}"
 # INTER_METHOD options (inter-layer planner):
@@ -104,6 +105,7 @@ CMD=(
     python3 scripts/prune_and_eval_kimi_gqa.py
     --model_path "${MODEL_PATH}"
     --scores_path "${SCORES_PATH}"
+    --task "${TASK}"
     --output_dir "${OUTPUT_DIR}"
     --prune_ratio "${PRUNE_RATIO}"
     --inter_method "${INTER_METHOD}"
@@ -137,6 +139,7 @@ TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="${OUTPUT_DIR}/stdout_${TIMESTAMP}.log"
 {
 echo "Model       : ${MODEL_PATH}"
+echo "Task        : ${TASK}"
 echo "Scores      : ${SCORES_PATH}"
 echo "Thresholds  : $([[ -n "${THRESHOLDS_PATH}" ]] && echo "${THRESHOLDS_PATH}" || echo "disabled")"
 echo "Prune ratio : ${PRUNE_RATIO}"
