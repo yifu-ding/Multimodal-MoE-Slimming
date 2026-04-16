@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from .utils import *
 from .loop_1_helpers import *
-from src.calibration.helpers.score_namespace import CHANNEL_METRICS
+from src.calibration.helpers.score_namespace import ACTIVE_CHANNEL_METRICS as CHANNEL_METRICS
 
 def loop_1_score_collector(
     expert_iter,
@@ -98,27 +98,53 @@ def loop_1_score_collector(
             gate_grad=gate_grad,
         )
         
-        # 三层线性层取平均
-        metrics = {"weight": (weight_rms(W_down, channel_dim=1) + \
-            weight_rms(W_up, channel_dim=0) + weight_rms(W_gate, channel_dim=0)) / 3.0}
-        metrics["wg"] = compute_wg_I(
-            W_down=W_down,
-            W_up=W_up,
-            W_gate=W_gate,
-            W_down_grad=W_down_grad,
-            W_up_grad=W_up_grad,
-            W_gate_grad=W_gate_grad,)
-        metrics["3proj_grad"], down_grad_ch, up_out_grad_ch, gate_grad_ch = compute_grad_I(
-            down_in_grad, up_out_grad, gate_grad,)
-        metrics["3proj_second_order"] = compute_3linear_hessian_diag(W_down, W_up, W_gate, down_input, up_output, gate_output, None)
-        metrics["3proj_act"], down_act = compute_activation_I(down_input, up_output, gate_output)
-        metrics["wa"] = compute_wa_I(W_down=W_down, W_up=W_up, W_gate=W_gate, down_ch_act=down_act, up_input=up_input, gate_input=gate_input)
-        metrics["3proj_saliency"] = compute_3proj_saliency_I(down_input, down_grad_ch, up_output, up_out_grad_ch, gate_output, gate_grad_ch)
-        
-        # 只取中间一层来算
-        metrics["gateup_act"] = compute_gateup_act(activation_owner, gate_output, up_output)
-        metrics["down_second_order_approx"] = compute_channel_hessian_diag(W_down, down_input, None)
-        metrics["down_saliency"] = compute_saliency_I(down_input, down_grad_ch)
+        metrics = {}
+        if "weight" in CHANNEL_METRICS:
+            metrics["weight"] = (
+                weight_rms(W_down, channel_dim=1)
+                + weight_rms(W_up, channel_dim=0)
+                + weight_rms(W_gate, channel_dim=0)
+            ) / 3.0
+        if "wg" in CHANNEL_METRICS:
+            metrics["wg"] = compute_wg_I(
+                W_down=W_down,
+                W_up=W_up,
+                W_gate=W_gate,
+                W_down_grad=W_down_grad,
+                W_up_grad=W_up_grad,
+                W_gate_grad=W_gate_grad,
+            )
+
+        down_grad_ch = up_out_grad_ch = gate_grad_ch = down_act = None
+        if "3proj_grad" in CHANNEL_METRICS:
+            metrics["3proj_grad"], down_grad_ch, up_out_grad_ch, gate_grad_ch = compute_grad_I(
+                down_in_grad, up_out_grad, gate_grad
+            )
+        if "3proj_act" in CHANNEL_METRICS:
+            metrics["3proj_act"], down_act = compute_activation_I(down_input, up_output, gate_output)
+        if "3proj_second_order" in CHANNEL_METRICS:
+            metrics["3proj_second_order"] = compute_3linear_hessian_diag(
+                W_down, W_up, W_gate, down_input, up_output, gate_output, None
+            )
+        if "wa" in CHANNEL_METRICS:
+            metrics["wa"] = compute_wa_I(
+                W_down=W_down,
+                W_up=W_up,
+                W_gate=W_gate,
+                down_ch_act=down_act,
+                up_input=up_input,
+                gate_input=gate_input,
+            )
+        if "3proj_saliency" in CHANNEL_METRICS:
+            metrics["3proj_saliency"] = compute_3proj_saliency_I(
+                down_input, down_grad_ch, up_output, up_out_grad_ch, gate_output, gate_grad_ch
+            )
+        if "gateup_act" in CHANNEL_METRICS:
+            metrics["gateup_act"] = compute_gateup_act(activation_owner, gate_output, up_output)
+        if "down_second_order_approx" in CHANNEL_METRICS:
+            metrics["down_second_order_approx"] = compute_channel_hessian_diag(W_down, down_input, None)
+        if "down_saliency" in CHANNEL_METRICS:
+            metrics["down_saliency"] = compute_saliency_I(down_input, down_grad_ch)
 
         # 算 expertwise 的 usage、router 
         total_tokens = float(down_output.shape[0])
@@ -137,29 +163,55 @@ def loop_1_score_collector(
         metrics["token_count_text"] = t_count
         metrics["token_count_visual"] = v_count
 
-        if t_count > 0:
-            metrics["3proj_grad_text"] = compute_grad_I_masked(down_in_grad, up_out_grad, gate_grad, text_mask)
-            metrics["wg_text"] = metrics["wg"] * (t_count / max(total_tokens, 1.0))
-            metrics["down_second_order_approx_text"] = compute_channel_hessian_diag(W_down, down_input, text_mask)
-            metrics["3proj_second_order_text"] = compute_3linear_hessian_diag(W_down, W_up, W_gate, down_input, up_output, gate_output, text_mask)
-            metrics["gateup_act_text"] = compute_gateup_act(activation_owner, gate_output, up_output, token_mask=text_mask)
-            metrics["3proj_act_text"] = compute_activation_I_masked(down_input, up_output, gate_output, token_mask=text_mask)
-            metrics["wa_text"] = compute_wa_I_masked(W_down=W_down, W_up=W_up, W_gate=W_gate, down_input=down_input, up_input=up_input, gate_input=gate_input, token_mask=text_mask)
-            metrics["down_saliency_text"] = channel_saliency_masked(down_input, down_in_grad, text_mask)
-            metrics["3proj_saliency_text"] = compute_3proj_saliency_I_masked(down_input, down_in_grad, up_output, up_out_grad, gate_output, gate_grad, text_mask)
-            metrics["usage_text"] = t_count / max(total_tokens, 1.0)
-
-        if v_count > 0:
-            metrics["3proj_grad_visual"] = compute_grad_I_masked(down_in_grad, up_out_grad, gate_grad, visual_mask)
-            metrics["wg_visual"] = metrics["wg"] * (v_count / max(total_tokens, 1.0))
-            metrics["down_second_order_approx_visual"] = compute_channel_hessian_diag(W_down, down_input, visual_mask)
-            metrics["3proj_second_order_visual"] = compute_3linear_hessian_diag(W_down, W_up, W_gate, down_input, up_output, gate_output, visual_mask)
-            metrics["gateup_act_visual"] = compute_gateup_act(activation_owner, gate_output, up_output, token_mask=visual_mask)
-            metrics["3proj_act_visual"] = compute_activation_I_masked(down_input, up_output, gate_output, token_mask=visual_mask)
-            metrics["wa_visual"] = compute_wa_I_masked(W_down=W_down, W_up=W_up, W_gate=W_gate, down_input=down_input, up_input=up_input, gate_input=gate_input, token_mask=visual_mask)
-            metrics["down_saliency_visual"] = channel_saliency_masked(down_input, down_in_grad, visual_mask)
-            metrics["3proj_saliency_visual"] = compute_3proj_saliency_I_masked(down_input, down_in_grad, up_output, up_out_grad, gate_output, gate_grad, visual_mask)
-            metrics["usage_visual"] = v_count / max(total_tokens, 1.0)
+        for suffix, token_mask, token_count in (
+            ("text", text_mask, t_count),
+            ("visual", visual_mask, v_count),
+        ):
+            if token_count <= 0:
+                continue
+            ratio = token_count / max(total_tokens, 1.0)
+            if f"3proj_grad_{suffix}" in CHANNEL_METRICS:
+                metrics[f"3proj_grad_{suffix}"] = compute_grad_I_masked(
+                    down_in_grad, up_out_grad, gate_grad, token_mask
+                )
+            if f"wg_{suffix}" in CHANNEL_METRICS:
+                metrics[f"wg_{suffix}"] = metrics["wg"] * ratio
+            if f"down_second_order_approx_{suffix}" in CHANNEL_METRICS:
+                metrics[f"down_second_order_approx_{suffix}"] = compute_channel_hessian_diag(
+                    W_down, down_input, token_mask
+                )
+            if f"3proj_second_order_{suffix}" in CHANNEL_METRICS:
+                metrics[f"3proj_second_order_{suffix}"] = compute_3linear_hessian_diag(
+                    W_down, W_up, W_gate, down_input, up_output, gate_output, token_mask
+                )
+            if f"gateup_act_{suffix}" in CHANNEL_METRICS:
+                metrics[f"gateup_act_{suffix}"] = compute_gateup_act(
+                    activation_owner, gate_output, up_output, token_mask=token_mask
+                )
+            if f"3proj_act_{suffix}" in CHANNEL_METRICS:
+                metrics[f"3proj_act_{suffix}"] = compute_activation_I_masked(
+                    down_input, up_output, gate_output, token_mask=token_mask
+                )
+            if f"wa_{suffix}" in CHANNEL_METRICS:
+                metrics[f"wa_{suffix}"] = compute_wa_I_masked(
+                    W_down=W_down,
+                    W_up=W_up,
+                    W_gate=W_gate,
+                    down_input=down_input,
+                    up_input=up_input,
+                    gate_input=gate_input,
+                    token_mask=token_mask,
+                )
+            if f"down_saliency_{suffix}" in CHANNEL_METRICS:
+                metrics[f"down_saliency_{suffix}"] = channel_saliency_masked(
+                    down_input, down_in_grad, token_mask
+                )
+            if f"3proj_saliency_{suffix}" in CHANNEL_METRICS:
+                metrics[f"3proj_saliency_{suffix}"] = compute_3proj_saliency_I_masked(
+                    down_input, down_in_grad, up_output, up_out_grad, gate_output, gate_grad, token_mask
+                )
+            if f"usage_{suffix}" in CHANNEL_METRICS:
+                metrics[f"usage_{suffix}"] = ratio
         
         # ema_matrix 在外部计算过了，我感觉不用 ema 平滑来算
         # Expert Modality Affinity: (visual - text) / (visual + text + eps), per batch, EMA-accumulated.
