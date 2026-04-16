@@ -28,8 +28,10 @@ export PYTHONPATH="${PREFIX}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
-MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
+# MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 # MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-VL-30B-A3B-Instruct}"
+MODEL_PATH="${MODEL_PATH:-OpenGVLab/InternVL3_5-GPT-OSS-20B-A4B-Preview-HF}"
+
 DATASET="${DATASET:-gqa}"
 NUM_SAMPLES="${NUM_SAMPLES:-1024}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
@@ -42,7 +44,7 @@ LAYERS="${LAYERS:-}"  # 默认不传值，全部层calibration
 # LAYERS="${LAYERS:-20-26}"
 
 EMA="${EMA:-0.9}"
-FILL_ZERO_FOR_UNROUTED="${FILL_ZERO_FOR_UNROUTED:-true}"
+FILL_ZERO_FOR_UNROUTED="${FILL_ZERO_FOR_UNROUTED:-1}"
 
 case "${DATASET,,}" in
     gqa)
@@ -81,7 +83,7 @@ case "${MODEL_TAG}" in
 esac
 
 # OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/${MODEL_TAG}_${DATASET_TAG}-second_order}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/${MODEL_TAG}_${DATASET_TAG}-rell2-fill0-$(date +%m%d-%H%M%S)}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/${MODEL_TAG}_${DATASET_TAG}-rell2-fill${FILL_ZERO_FOR_UNROUTED}-$(date +%m%d-%H%M%S)}"
 
 EXTRA_ARGS=("$@")
 
@@ -97,7 +99,7 @@ CMD=(
     --ema                "${EMA}"
 )
 
-if [[ "${FILL_ZERO_FOR_UNROUTED}" == "true" ]]; then
+if [[ "${FILL_ZERO_FOR_UNROUTED}" == "1" ]]; then
     CMD+=(--fill_zero_for_unrouted)
 fi
 

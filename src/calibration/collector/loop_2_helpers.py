@@ -5,6 +5,11 @@ from typing import Optional
 import torch
 from src.base.shared_utils import angle_loss
 from .utils import unwrap_output
+from src.calibration.helpers.utils import (
+    get_fused_expert_layout,
+    get_fused_intermediate_size,
+    split_fused_gate_up_tensor,
+)
 
 
 class _LinearWeightView:
@@ -18,11 +23,12 @@ class FusedExpertProxy(nn.Module):
         self.fused_container = fused_container
         self.expert_idx = int(expert_idx)
         self.act_fn = getattr(fused_container, "act_fn", torch.nn.functional.silu)
+        self.fused_layout = get_fused_expert_layout(fused_container)
 
         gate_up = fused_container.gate_up_proj[self.expert_idx].detach().transpose(0, 1)
-        intermediate_size = gate_up.shape[0] // 2
-        self.gate_proj = _LinearWeightView(gate_up[:intermediate_size, :])
-        self.up_proj = _LinearWeightView(gate_up[intermediate_size:, :])
+        gate_proj, up_proj = split_fused_gate_up_tensor(fused_container, gate_up)
+        self.gate_proj = _LinearWeightView(gate_proj)
+        self.up_proj = _LinearWeightView(up_proj)
         self.down_proj = _LinearWeightView(
             fused_container.down_proj[self.expert_idx].detach().transpose(0, 1)
         )
@@ -57,11 +63,25 @@ def _run_single_fused_expert(
     zero_output: bool = False,
 ) -> torch.Tensor:
     gate_up = _fused_linear(hidden_states, fused_container.gate_up_proj[expert_idx])
-    gate, up = gate_up.chunk(2, dim=-1)
-    hidden = fused_container.act_fn(gate) * up
+    fused_layout = get_fused_expert_layout(fused_container)
+    if fused_layout == "gpt_oss":
+        gate_up = gate_up + fused_container.gate_up_proj_bias[expert_idx].to(
+            device=gate_up.device, dtype=gate_up.dtype
+        )
+        gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+        gate = gate.clamp(min=None, max=fused_container.limit)
+        up = up.clamp(min=-fused_container.limit, max=fused_container.limit)
+        hidden = (up + 1) * (gate * torch.sigmoid(gate * fused_container.alpha))
+    else:
+        gate, up = gate_up.chunk(2, dim=-1)
+        hidden = fused_container.act_fn(gate) * up
     if channel_alpha is not None:
         hidden = hidden * channel_alpha.to(device=hidden.device, dtype=hidden.dtype)
     out = _fused_linear(hidden, fused_container.down_proj[expert_idx])
+    if fused_layout == "gpt_oss":
+        out = out + fused_container.down_proj_bias[expert_idx].to(
+            device=out.device, dtype=out.dtype
+        )
     if zero_output:
         out = torch.zeros_like(out)
     if output_alpha is not None:
@@ -89,6 +109,11 @@ def _patch_fused_container_forward(
         _channel_alpha=channel_alpha,
         _zero_output=zero_output,
     ):
+        fused_layout = get_fused_expert_layout(self)
+        if fused_layout == "gpt_oss":
+            batch_size = hidden_states.shape[0]
+            hidden_size = hidden_states.shape[-1]
+            hidden_states = hidden_states.reshape(-1, hidden_size)
         next_states = torch.zeros_like(hidden_states)
         expert_mask = torch.nn.functional.one_hot(
             router_indices, num_classes=self.num_experts
@@ -108,10 +133,14 @@ def _patch_fused_container_forward(
                 channel_alpha=_channel_alpha if current_expert_idx == _expert_idx else None,
                 zero_output=_zero_output and current_expert_idx == _expert_idx,
             )
-            current_hidden_states = (
-                current_hidden_states * routing_weights[token_idx, top_k_pos, None]
-            )
+            if fused_layout == "gpt_oss":
+                expert_routing_weights = routing_weights[token_idx, current_expert_idx]
+            else:
+                expert_routing_weights = routing_weights[token_idx, top_k_pos]
+            current_hidden_states = current_hidden_states * expert_routing_weights[:, None]
             next_states.index_add_(0, token_idx, current_hidden_states.to(next_states.dtype))
+        if fused_layout == "gpt_oss":
+            return next_states.view(batch_size, -1, hidden_size)
         return next_states
 
     fused_container.forward = types.MethodType(_forward_with_patch, fused_container)
@@ -414,7 +443,7 @@ def compute_down_second_order(
         return None
 
     device = context["teacher_target"].device
-    num_channels = expert.up_proj.weight.shape[0]  # I
+    num_channels = expert.up_proj.weight.shape[0] if hasattr(expert.up_proj, "weight") else get_fused_intermediate_size(expert.fused_container)
     alpha = torch.ones(num_channels, device=device, dtype=torch.float32, requires_grad=True)
 
     # patch: h = h * alpha，在 expert 的 intermediate 输出处
