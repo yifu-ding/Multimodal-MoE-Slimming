@@ -59,8 +59,12 @@ case "${DATASET,,}" in
         DATASET="video_mmmu"
         DATASET_TAG="video_mmmu"
         ;;
+    m4|m4_instruct|m4-instruct|m4_instruct_data)
+        DATASET="m4_instruct"
+        DATASET_TAG="m4_instruct"
+        ;;
     *)
-        echo "Unsupported DATASET=${DATASET}. Supported values: gqa, coco, VMMMU (video_mmmu)." >&2
+        echo "Unsupported DATASET=${DATASET}. Supported values: gqa, coco, VMMMU (video_mmmu), m4 (m4_instruct)." >&2
         exit 1
         ;;
 esac

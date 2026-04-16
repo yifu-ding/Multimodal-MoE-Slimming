@@ -229,6 +229,9 @@ def normalize_dataset_name(dataset_name: str) -> str:
     normalized = dataset_name.strip().lower()
     aliases = {
         "vmmmu": "video_mmmu",
+        "m4": "m4_instruct",
+        "m4-instruct": "m4_instruct",
+        "m4_instruct_data": "m4_instruct",
     }
     return aliases.get(normalized, normalized)
 
@@ -260,6 +263,10 @@ def build_dataset(dataset_name: str, model_family: str):
         data = concatenate_datasets([adaptation, comprehension, perception])
         data.set_transform(videommmu_transform)
         return data
+    if dataset_name == "m4_instruct":
+        from tasks.m4_instruct import load_m4_instruct_rows, m4_instruct_transform
+
+        return TransformedListDataset(load_m4_instruct_rows(), m4_instruct_transform)
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
