@@ -24,7 +24,7 @@ for p in (REPO_PARENT, REPO_ROOT):
 import torch
 from tqdm.auto import tqdm
 
-from models.kimi import load_model
+from src.base.models.kimi import load_model
 from observations.common import resolve_model_name_or_path
 from tasks.gqa import (
     gqa_doc_to_answer,

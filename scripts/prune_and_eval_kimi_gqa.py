@@ -1,9 +1,8 @@
-"""Prune Kimi-VL in memory and evaluate directly on GQA without saving a ckpt."""
+"""Prune a VL-MoE model in memory and evaluate on a given task without saving a ckpt."""
 
 import argparse
 import json
 import os
-import random
 import sys
 
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -16,19 +15,13 @@ for p in (REPO_PARENT, REPO_ROOT):
 import torch
 from tqdm.auto import tqdm
 
-from models.kimi import load_model
-from observations.common import resolve_model_name_or_path
+from src.base.load_dataset import load_eval_task
+from src.base.models import auto_load_model
 from src.generate_mask import generate_masks as build_masks_pipeline
 from src.prune import apply_structural_pruning
-from tasks.gqa import (
-    gqa_doc_to_answer,
-    gqa_doc_to_text,
-    gqa_doc_to_visual,
-    load_gqa_instruction_rows,
-)
 
 
-def normalize_answer(s: str) -> str:
+def _normalize_answer(s: str) -> str:
     return s.strip().lower()
 
 
@@ -38,10 +31,12 @@ def move_to_device(inputs: dict, device) -> dict:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Prune Kimi-VL in memory and evaluate on GQA without saving a checkpoint."
+        description="Prune a VL-MoE model in memory and evaluate on a task without saving a checkpoint."
     )
     p.add_argument("--model_path", type=str, required=True)
     p.add_argument("--scores_path", type=str, required=True)
+    p.add_argument("--task", type=str, default="gqa",
+                   help="Evaluation task: gqa, coco, video_mmmu")
     p.add_argument("--thresholds_path", type=str, default=None)
     p.add_argument("--output_dir", type=str, required=True)
     p.add_argument("--prune_ratio", type=float, default=0.30)
@@ -60,17 +55,30 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _build_messages_batch(questions, media_type):
+    """Build chat messages for a batch of questions."""
+    messages = []
+    for q in questions:
+        if media_type == "video":
+            content = [
+                {"type": "video", "video": "placeholder"},
+                {"type": "text", "text": q},
+            ]
+        else:
+            content = [
+                {"type": "image", "image": "placeholder"},
+                {"type": "text", "text": q},
+            ]
+        messages.append([{"role": "user", "content": content}])
+    return messages
+
+
 def main() -> None:
     args = build_parser().parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # ── Mask generation ──
     print(f"[Run] Loading scores from: {args.scores_path}")
-    
-    # if args.thresholds_path is not None and args.modality_aware:
-    #     # 读取 threshold_path 的 pt 文件中存储的intra_expert_metric并覆盖 args.intra_expert_metric
-    #     thresh = torch.load(args.thresholds_path, map_location="cpu", weights_only=False)
-    #     args.intra_expert_metric = thresh["metadata"].get("intra_expert_metric", "down_second_order")
-    #     print(f"[Run] Overridden from thresholds.pt: intra_expert_metric={args.intra_expert_metric}")
     masks = None
     if args.prune_ratio is not None and args.prune_ratio > 0:
         mask_result = build_masks_pipeline(
@@ -109,13 +117,9 @@ def main() -> None:
             f"max={int(k_e.max().item())} mean={float(k_e.float().mean().item()):.1f}"
         )
 
-    resolved_model_path = resolve_model_name_or_path(args.model_path)
-    print(f"[Run] Loading model from: {resolved_model_path}")
-    model, processor = load_model(
-        resolved_model_path,
-        device_map="auto",
-        attn_implementation="flash_attention_2",
-    )
+    # ── Model loading (auto-dispatch) ──
+    print(f"[Run] Loading model from: {args.model_path}")
+    model, processor = auto_load_model(args.model_path)
     model.eval()
     text_config = model.config.text_config
     apply_structural_pruning(model, masks, text_config)
@@ -123,52 +127,64 @@ def main() -> None:
 
     device = next(model.parameters()).device
     print(f"[Run] Model ready. Primary device: {device}")
-    print(f"[Run] Loading dataset for [{args.dataset}]...")
-    rows = load_gqa_instruction_rows()
-    pool = rows[args.start_idx :]
-    if args.num_samples > 0:
-        if args.subset_seed is not None:
-            rng = random.Random(args.subset_seed)
-            pool = rng.sample(pool, min(args.num_samples, len(pool)))
-        else:
-            pool = pool[: args.num_samples]
 
+    # ── Dataset loading (auto-dispatch) ──
+    print(f"[Run] Loading task: {args.task}")
+    pool, task = load_eval_task(
+        args.task,
+        start_idx=args.start_idx,
+        num_samples=args.num_samples,
+        subset_seed=args.subset_seed,
+    )
     total = len(pool)
     print(f"[Run] Evaluating {total} samples (batch_size={args.batch_size}).")
 
-    correct = 0
+    # ── Eval loop ──
     predictions = []
     with torch.no_grad():
-        for i in tqdm(range(0, total, args.batch_size), desc="Eval", unit="batch"):
+        for i in tqdm(range(0, total, args.batch_size), desc=f"Prune+Eval {args.task}", unit="batch"):
             batch_rows = pool[i : i + args.batch_size]
-            images = []
+            visuals = []
             questions = []
             gt_answers = []
             for row in batch_rows:
-                images.append(gqa_doc_to_visual(row)[0])
-                questions.append(gqa_doc_to_text(row))
-                gt_answers.append(gqa_doc_to_answer(row))
+                visual = task.doc_to_visual(row)
+                if isinstance(visual, tuple):
+                    # video_mmmu returns (frames_list, num_frames)
+                    visuals.append(visual[0] if task.media_type == "video" else visual[0])
+                elif isinstance(visual, list):
+                    visuals.append(visual[0])
+                else:
+                    visuals.append(visual)
+                questions.append(task.doc_to_text(row))
+                gt_answers.append(task.doc_to_answer(row))
 
-            messages_batch = [
-                [{"role": "user", "content": [
-                    {"type": "image", "image": "placeholder"},
-                    {"type": "text", "text": q},
-                ]}]
-                for q in questions
-            ]
+            messages_batch = _build_messages_batch(questions, task.media_type)
             texts = processor.apply_chat_template(
                 messages_batch,
                 add_generation_prompt=True,
                 return_tensors="pt",
             )
-            inputs = processor(
-                images=images,
-                text=texts,
-                return_tensors="pt",
-                padding=True,
-                padding_side="left",
-                truncation=True,
-            )
+
+            if task.media_type == "video":
+                inputs = processor(
+                    videos=visuals,
+                    text=texts,
+                    return_tensors="pt",
+                    padding=True,
+                    padding_side="left",
+                    truncation=True,
+                )
+            else:
+                inputs = processor(
+                    images=visuals,
+                    text=texts,
+                    return_tensors="pt",
+                    padding=True,
+                    padding_side="left",
+                    truncation=True,
+                )
+
             inputs = move_to_device(inputs, device)
             input_len = inputs["input_ids"].shape[1]
             outputs = model.generate(
@@ -180,25 +196,33 @@ def main() -> None:
             for j, (gt, out_ids) in enumerate(zip(gt_answers, outputs)):
                 pred_ids = out_ids[input_len:]
                 pred = processor.decode(pred_ids, skip_special_tokens=True)
-                is_correct = normalize_answer(pred) == normalize_answer(gt)
-                correct += int(is_correct)
-                predictions.append(
-                    {
-                        "question": batch_rows[j]["question"],
-                        "gt": gt,
-                        "pred": pred,
-                        "correct": is_correct,
-                    }
-                )
+                record = {
+                    "gt": gt,
+                    "pred": pred,
+                    "correct": _normalize_answer(pred) == _normalize_answer(gt),
+                }
+                # Preserve question field if available
+                if "question" in batch_rows[j]:
+                    record["question"] = batch_rows[j]["question"]
+                # Extra fields for task-specific eval (e.g. question_type for VideoMMMU)
+                for field in task.extra_fields:
+                    if field in batch_rows[j]:
+                        record[field] = batch_rows[j][field]
+                predictions.append(record)
 
-    accuracy = correct / total if total > 0 else 0.0
-    print(f"\n[Run] Accuracy: {accuracy:.4f}  ({correct}/{total})")
+    # ── Evaluate with task-specific metric ──
+    eval_result = task.evaluate(predictions)
+    metric_name = eval_result["metric_name"]
+    metric_value = eval_result["metric_value"]
+    detail = eval_result.get("detail", "")
+    print(f"\n[Run] {metric_name}: {metric_value:.4f}  ({detail})")
+
     summary = {
         "model": args.model_path,
-        "dataset": "gqa_testdev_balanced",
+        "task": args.task,
+        "dataset": args.task,
         "num_samples": total,
-        "accuracy": round(accuracy, 6),
-        "correct": correct,
+        metric_name.lower(): round(metric_value, 6),
         "scores_path": args.scores_path,
         "prune_ratio": args.prune_ratio,
         "inter_method": args.inter_method,
@@ -207,6 +231,11 @@ def main() -> None:
         "modality_aware": args.modality_aware,
         "saved_pruned_checkpoint": False,
     }
+    # Include extra eval fields (correct, total, etc.)
+    for k, v in eval_result.items():
+        if k not in ("metric_name", "metric_value", "detail"):
+            summary[k] = v
+
     summary_path = os.path.join(args.output_dir, "summary.json")
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)

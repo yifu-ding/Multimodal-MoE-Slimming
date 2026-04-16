@@ -35,9 +35,10 @@ cd "${REPO_ROOT}"
 PREFIX="${PREFIX:-${REPO_ROOT}}"
 export PYTHONPATH="${PREFIX}"
 
+export SCORES_PATH="/home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_gqa-rell2-fill1-0415-231450.pt"
 # Default grids (edit or override via env)
 # INTRA_METHOD = --intra_method (intra-layer planner); see run_prune_eval_kimi_gqa.sh
-SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform loss_coverage loss_smooth_1 uniform_coverage loss_smooth_2}" # 
+SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform_coverage loss_smooth_2 uniform loss_coverage loss_smooth_1}" # 
 # INTRA_METHOD options (intra-layer planner, 基于 EXPERT_METRICS):
 #   uniform_*
 #   usage_*              # gate_scores.usage
@@ -128,7 +129,8 @@ for INTER_METHOD in ${SWEEP_INTER_METHODS}; do
         echo "========== sweep run ${RUN_IDX}: INTER=${INTER_METHOD} INTRA=${INTRA_METHOD} MODALITY=${MODALITY_AWARE} METRIC=${INTRA_EXPERT_METRIC} =========="
 
         set +e
-        INTER_METHOD="${INTER_METHOD}" \
+        TASK="${TASK:-gqa}" \
+          INTER_METHOD="${INTER_METHOD}" \
           INTRA_METHOD="${INTRA_METHOD}" \
           MODALITY_AWARE="${MODALITY_AWARE}" \
           INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC}" \
