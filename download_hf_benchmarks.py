@@ -26,7 +26,7 @@ DATASETS: Dict[str, DatasetSpec] = {
         "lmms-lab/COCO-Caption2017", "COCO-Caption2017", "COCO2017-Cap (val)"
     ),
     "mvbench": DatasetSpec("OpenGVLab/MVBench", "MVBench", "MVBench"),
-    "egoschema": DatasetSpec("lmms-lab/egoschema", "egoschema", "EgoSchema"),
+#     "egoschema": DatasetSpec("lmms-lab/egoschema", "egoschema", "EgoSchema"),
     "videomme": DatasetSpec("lmms-lab/Video-MME", "Video-MME", "VideoMME"),
     "longvideobench": DatasetSpec(
         "longvideobench/LongVideoBench", "LongVideoBench", "LongVideoBench (val)"

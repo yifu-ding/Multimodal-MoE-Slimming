@@ -85,6 +85,9 @@ def patch_qwen_fused_experts_forward(block: nn.Module):
             self.saved_visual_mask[expert_idx] = visual_mask[token_idx]
             self.saved_router_weights[expert_idx] = routing_weights[token_idx, top_k_pos]
 
+            if current_state.requires_grad:
+                current_state.register_hook(_save_grad_attr(self, expert_idx, "saved_gate_in_grad"))
+                current_state.register_hook(_save_grad_attr(self, expert_idx, "saved_up_in_grad"))
             if gate.requires_grad:
                 gate.register_hook(_save_grad_attr(self, expert_idx, "saved_gate_grad"))
             if up.requires_grad:

@@ -1,3 +1,22 @@
+ACTIVE_CHANNEL_METRICS = (
+    # gate*up activation
+    "gateup_act",
+    "gateup_act_text",
+    "gateup_act_visual",
+    # three proj activation
+    "3proj_act",
+    "3proj_act_text",
+    "3proj_act_visual",
+    # three proj second order
+    "3proj_second_order",
+    "3proj_second_order_text",
+    "3proj_second_order_visual",
+    # three proj saliency
+    "3proj_saliency",
+    "3proj_saliency_text",
+    "3proj_saliency_visual",
+)
+
 CHANNEL_METRICS = (
     # gate*up activation
     "gateup_act",
@@ -56,6 +75,6 @@ EXPERT_METRICS = (
     "router_fillzero",
     "second_attr",
     "second_attr_fillzero",
-    "true_ablate",
-    "true_ablate_fillzero",
+    # "true_ablate",
+    # "true_ablate_fillzero",
 )

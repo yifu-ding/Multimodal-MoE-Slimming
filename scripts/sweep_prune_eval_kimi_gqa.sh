@@ -37,7 +37,7 @@ export PYTHONPATH="${PREFIX}"
 
 # Default grids (edit or override via env)
 # INTRA_METHOD = --intra_method (intra-layer planner); see run_prune_eval_kimi_gqa.sh
-SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform uniform_coverage loss_smooth_2 loss_coverage loss_smooth_1}" # 
+SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform loss_coverage loss_smooth_1 uniform_coverage loss_smooth_2}" # 
 # INTRA_METHOD options (intra-layer planner, 基于 EXPERT_METRICS):
 #   uniform_*
 #   usage_*              # gate_scores.usage
@@ -68,12 +68,12 @@ SMOOTH_FN="${SMOOTH_FN:-sqrt}"
 #   wg
 # 这个 metric 没有双模态版本
 #   weight
-SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act down_second_order_exact 3proj_act 3proj_saliency 3proj_second_order}"
+SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act 3proj_second_order 3proj_act 3proj_saliency down_second_order_exact}"
 # 3proj_act down_second_order 3proj_second_order down_saliency 3proj_saliency 3proj_grad
 
 SWEEP_TS="${SWEEP_TS:-$(date +%m%d%H%M)}"
 MODEL_NAME="${MODEL_NAME:-kimi}"
-SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-gqa-rell2-score-041516"
+SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-gqa-rell2-score-041611"
 export OUTPUT_DIR=$SWEEP_BASE
 
 SUMMARY_FILE="${SUMMARY_FILE:-${SWEEP_BASE}/summary.md}"
