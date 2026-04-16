@@ -115,8 +115,9 @@ def _patch_fused_container_forward(
             hidden_size = hidden_states.shape[-1]
             hidden_states = hidden_states.reshape(-1, hidden_size)
         next_states = torch.zeros_like(hidden_states)
+        num_classes = self.num_experts + 1 if fused_layout == "gpt_oss" else self.num_experts
         expert_mask = torch.nn.functional.one_hot(
-            router_indices, num_classes=self.num_experts
+            router_indices, num_classes=num_classes
         ).permute(2, 1, 0)
         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
         for expert_tensor in expert_hit:

@@ -15,6 +15,8 @@ ACTIVE_CHANNEL_METRICS = (
     "3proj_saliency",
     "3proj_saliency_text",
     "3proj_saliency_visual",
+    # 
+    "weight"
 )
 
 CHANNEL_METRICS = (

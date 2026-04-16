@@ -123,7 +123,7 @@ def main() -> None:
 
     device = next(model.parameters()).device
     print(f"[Run] Model ready. Primary device: {device}")
-    print("[Run] Loading GQA testdev_balanced...")
+    print(f"[Run] Loading dataset for [{args.dataset}]...")
     rows = load_gqa_instruction_rows()
     pool = rows[args.start_idx :]
     if args.num_samples > 0:
@@ -139,7 +139,7 @@ def main() -> None:
     correct = 0
     predictions = []
     with torch.no_grad():
-        for i in tqdm(range(0, total, args.batch_size), desc="Prune+Eval GQA", unit="batch"):
+        for i in tqdm(range(0, total, args.batch_size), desc="Eval", unit="batch"):
             batch_rows = pool[i : i + args.batch_size]
             images = []
             questions = []

@@ -143,11 +143,13 @@ class PrunedGptOssExperts(nn.Module):
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
         next_states = torch.zeros_like(hidden_states)
         expert_mask = torch.nn.functional.one_hot(
-            router_indices, num_classes=self.num_experts
+            router_indices, num_classes=self.num_experts + 1
         ).permute(2, 1, 0)
         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
         for expert_tensor in expert_hit:
             expert_idx = int(expert_tensor[0].item())
+            if expert_idx == self.num_experts:
+                continue
             _, token_idx = torch.where(expert_mask[expert_idx])
             if token_idx.numel() == 0:
                 continue

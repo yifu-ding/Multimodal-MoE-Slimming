@@ -111,8 +111,10 @@ def set_block_modality_masks(bundle, cnt_block: nn.Module, input_ids: torch.Tens
 
     cnt_block.mlp.moe_text_mask = moe_text_mask[:, None]
     cnt_block.mlp.moe_media_mask = moe_media_mask[:, None]
-    if _is_qwen_like_model(bundle.model):
+    if getattr(bundle, "family", None) == "qwen3":
         cnt_block.mlp.moe_padding_mask = (~attn_mask.to(torch.bool)).view(-1, 1)
+    elif hasattr(cnt_block.mlp, "moe_padding_mask"):
+        cnt_block.mlp.moe_padding_mask = None
     return moe_text_mask, moe_media_mask
 
 

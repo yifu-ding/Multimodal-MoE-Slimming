@@ -61,17 +61,20 @@ def patch_qwen_fused_experts_forward(block: nn.Module):
             visual_mask = torch.zeros(hidden_states.shape[0], dtype=torch.bool, device=hidden_states.device)
         else:
             visual_mask = visual_mask.to(hidden_states.device).view(-1)
-        if padding_mask is not None:
+        if padding_mask is not None and fused_layout != "gpt_oss":
             keep = ~padding_mask.to(hidden_states.device).view(-1)
             text_mask = text_mask[keep]
             visual_mask = visual_mask[keep]
 
         next_states = torch.zeros_like(hidden_states)
-        expert_mask = F.one_hot(router_indices, num_classes=self.num_experts).permute(2, 1, 0)
+        num_classes = self.num_experts + 1 if fused_layout == "gpt_oss" else self.num_experts
+        expert_mask = F.one_hot(router_indices, num_classes=num_classes).permute(2, 1, 0)
         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
         for expert_tensor in expert_hit:
             expert_idx = int(expert_tensor[0].item())
+            if expert_idx == self.num_experts:
+                continue
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[token_idx]
             gate_up = fused_linear(current_state, self.gate_up_proj[expert_idx])

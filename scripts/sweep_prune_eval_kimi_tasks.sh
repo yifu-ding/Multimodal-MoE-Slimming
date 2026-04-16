@@ -48,6 +48,7 @@ SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act down_second
 SWEEP_TS="${SWEEP_TS:-$(date +%m%d%H%M)}"
 MODEL_NAME="${MODEL_NAME:-kimi}"
 SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-gqa-rell2-041513-${SWEEP_TS}"
+export OUTPUT_DIR="${SWEEP_BASE}"
 
 SUMMARY_FILE="${SUMMARY_FILE:-${SWEEP_BASE}/summary.md}"
 SWEEP_LOG_DIR="${SWEEP_LOG_DIR:-${SWEEP_BASE}/logs}"

@@ -116,17 +116,20 @@ def loop_1_score_collector(
             )
 
         down_grad_ch = up_out_grad_ch = gate_grad_ch = down_act = None
-        if "3proj_grad" in CHANNEL_METRICS:
+        if "3proj_grad" in CHANNEL_METRICS or "3proj_saliency" in CHANNEL_METRICS or "down_saliency" in CHANNEL_METRICS:
             metrics["3proj_grad"], down_grad_ch, up_out_grad_ch, gate_grad_ch = compute_grad_I(
                 down_in_grad, up_out_grad, gate_grad
             )
+        if "3proj_saliency" in CHANNEL_METRICS:
+            metrics["3proj_saliency"] = compute_3proj_saliency_I(
+                down_input, down_grad_ch, up_output, up_out_grad_ch, gate_output, gate_grad_ch
+            )
+        if "down_saliency" in CHANNEL_METRICS:
+            metrics["down_saliency"] = compute_saliency_I(down_input, down_grad_ch)
+            
         if "3proj_act" in CHANNEL_METRICS:
             metrics["3proj_act"], down_act = compute_activation_I(down_input, up_output, gate_output)
-        if "3proj_second_order" in CHANNEL_METRICS:
-            metrics["3proj_second_order"] = compute_3linear_hessian_diag(
-                W_down, W_up, W_gate, down_input, up_output, gate_output, None
-            )
-        if "wa" in CHANNEL_METRICS:
+        if "wa" in CHANNEL_METRICS or "3proj_act" in CHANNEL_METRICS:
             metrics["wa"] = compute_wa_I(
                 W_down=W_down,
                 W_up=W_up,
@@ -135,17 +138,16 @@ def loop_1_score_collector(
                 up_input=up_input,
                 gate_input=gate_input,
             )
-        if "3proj_saliency" in CHANNEL_METRICS:
-            metrics["3proj_saliency"] = compute_3proj_saliency_I(
-                down_input, down_grad_ch, up_output, up_out_grad_ch, gate_output, gate_grad_ch
+            
+        if "3proj_second_order" in CHANNEL_METRICS:
+            metrics["3proj_second_order"] = compute_3linear_hessian_diag(
+                W_down, W_up, W_gate, down_input, up_output, gate_output, None
             )
         if "gateup_act" in CHANNEL_METRICS:
             metrics["gateup_act"] = compute_gateup_act(activation_owner, gate_output, up_output)
         if "down_second_order_approx" in CHANNEL_METRICS:
             metrics["down_second_order_approx"] = compute_channel_hessian_diag(W_down, down_input, None)
-        if "down_saliency" in CHANNEL_METRICS:
-            metrics["down_saliency"] = compute_saliency_I(down_input, down_grad_ch)
-
+        
         # 算 expertwise 的 usage、router 
         total_tokens = float(down_output.shape[0])
         if attn_mask is not None:
