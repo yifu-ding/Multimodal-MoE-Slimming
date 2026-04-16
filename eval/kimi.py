@@ -540,8 +540,8 @@ class KimiVL(lmms):
         avg_speed = total_tokens / e2e_latency if e2e_latency > 0 else 0
         # Log metrics
         metric_dict = {
-            "total_tokens": total_tokens,
-            "e2e_latency": e2e_latency,
+            "total_gen_tokens": total_tokens,
+            "total_elapsed_time": e2e_latency,
             "avg_speed": avg_speed,
             "additional_metrics": {
                 "rank": self.rank,
@@ -583,7 +583,7 @@ if __name__ == "__main__":
     from lmms_eval.evaluator import EvaluationTracker
     _tracker = EvaluationTracker(output_path=_args.output_path) if _args.output_path else None
 
-    _results, _samples = evaluator.simple_evaluate(
+    _results = evaluator.simple_evaluate(
         model=_model_obj,
         tasks=_args.tasks.split(","),
         batch_size=_args.batch_size,

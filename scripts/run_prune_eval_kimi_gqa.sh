@@ -24,7 +24,7 @@ SCORES_PATH="${SCORES_PATH:-}"
 # -textvqa gqa chartqa mmstar mmbench mmvet mme realworldqa coco2017cap mvbench egoschema videomme longvideobench video_mmmu}"
 TASK="${TASK:-textvqa}"
 
-PRUNE_RATIO="${PRUNE_RATIO:-0.50}"
+PRUNE_RATIO="${PRUNE_RATIO:-0.0}"
 # INTER_METHOD options (inter-layer planner):
 #   uniform
 #   u_shaped
@@ -71,7 +71,7 @@ MIN_PER_EXPERT="${MIN_PER_EXPERT:-256}"
 # THRESHOLDS_PATH="${THRESHOLDS_PATH:-${PREFIX}/storage/prune/thresholds/kimi_gqa/thresholds.pt}"
 THRESHOLDS_PATH="${THRESHOLDS_PATH:-}" 
 
-NUM_SAMPLES="${NUM_SAMPLES:-100}"  # 样本数
+NUM_SAMPLES="${NUM_SAMPLES:-0}"  # 样本数, 0 表示全量
 START_IDX="${START_IDX:-0}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"
