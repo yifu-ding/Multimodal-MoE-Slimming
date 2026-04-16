@@ -10,46 +10,88 @@ from huggingface_hub import snapshot_download
 @dataclass(frozen=True)
 class DatasetSpec:
     repo_id: str
-    local_dir_name: str
+    description: str
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    repo_id: str
     description: str
 
 
 DATASETS: Dict[str, DatasetSpec] = {
-    "textvqa": DatasetSpec("lmms-lab/textvqa", "textvqa", "TextVQA (val)"),
-    "chartqa": DatasetSpec("lmms-lab/ChartQA", "ChartQA", "ChartQA"),
-    "mmstar": DatasetSpec("Lin-Chen/MMStar", "MMStar", "MMStar"),
-    "mmbench": DatasetSpec("lmms-lab/MMBench", "MMBench", "MMBench (dev, EN)"),
-    "mmvet": DatasetSpec("lmms-lab/MMVet", "MMVet", "MMVet"),
-    "mme": DatasetSpec("lmms-lab/MME", "MME", "MME"),
-    "realworldqa": DatasetSpec("lmms-lab/RealWorldQA", "RealWorldQA", "RealWorldQA"),
+    "textvqa": DatasetSpec("lmms-lab/textvqa", "TextVQA (val)"),
+    "chartqa": DatasetSpec("lmms-lab/ChartQA", "ChartQA"),
+    "mmstar": DatasetSpec("Lin-Chen/MMStar", "MMStar"),
+    "mmbench": DatasetSpec("lmms-lab/MMBench", "MMBench (dev, EN)"),
+    "mmvet": DatasetSpec("lmms-lab/MMVet", "MMVet"),
+    "mme": DatasetSpec("lmms-lab/MME", "MME"),
+    "realworldqa": DatasetSpec("lmms-lab/RealWorldQA", "RealWorldQA"),
     "coco2017-cap": DatasetSpec(
-        "lmms-lab/COCO-Caption2017", "COCO-Caption2017", "COCO2017-Cap (val)"
+        "lmms-lab/COCO-Caption2017",
+        "COCO2017-Cap (val)",
     ),
-    "mvbench": DatasetSpec("OpenGVLab/MVBench", "MVBench", "MVBench"),
-#     "egoschema": DatasetSpec("lmms-lab/egoschema", "egoschema", "EgoSchema"),
-    "videomme": DatasetSpec("lmms-lab/Video-MME", "Video-MME", "VideoMME"),
+    "mvbench": DatasetSpec("OpenGVLab/MVBench", "MVBench"),
+    # "egoschema": DatasetSpec("lmms-lab/egoschema", "EgoSchema"),
+    "videomme": DatasetSpec("lmms-lab/Video-MME", "VideoMME"),
     "longvideobench": DatasetSpec(
-        "longvideobench/LongVideoBench", "LongVideoBench", "LongVideoBench (val)"
+        "longvideobench/LongVideoBench",
+        "LongVideoBench (val)",
     ),
-    "video-mmmu": DatasetSpec("lmms-lab/VideoMMMU", "VideoMMMU", "Video-MMMU"),
+    "video-mmmu": DatasetSpec("lmms-lab/VideoMMMU", "Video-MMMU"),
+}
+
+
+MODELS: Dict[str, ModelSpec] = {
+    "deepseek-vl2-small": ModelSpec(
+        "deepseek-ai/deepseek-vl2-small",
+        "DeepSeek-VL2-Small",
+    ),
+    "kimi-vl-a3b-instruct": ModelSpec(
+        "moonshotai/Kimi-VL-A3B-Instruct",
+        "Kimi-VL-A3B-Instruct",
+    ),
+    "qwen3-vl-30b-a3b-instruct": ModelSpec(
+        "Qwen/Qwen3-VL-30B-A3B-Instruct",
+        "Qwen3-VL-30B-A3B-Instruct",
+    ),
+    "internvl3_5-30b-a3b-hf": ModelSpec(
+        "OpenGVLab/InternVL3_5-30B-A3B-HF",
+        "InternVL-3.5-30B-A3B-HF",
+    ),
+    "gemma-4-26b-a4b": ModelSpec(
+        "google/gemma-4-26B-A4B",
+        "Gemma 4 26B A4B",
+    ),
+    "qwen3.5-35b-a3b": ModelSpec(
+        "Qwen/Qwen3.5-35B-A3B",
+        "Qwen3.5-35B-A3B",
+    ),
 }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download multimodal evaluation datasets into $HF_HOME/datasets."
+        description="Download multimodal evaluation datasets and models into Hugging Face default cache."
     )
     parser.add_argument(
         "--benchmarks",
         nargs="+",
-        default=["all"],
+        default=[],
         choices=["all", *sorted(DATASETS.keys())],
-        help="Benchmarks to download.",
+        help="Benchmarks to download. Empty means do not download datasets.",
+    )
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        default=[],
+        choices=["all", *sorted(MODELS.keys())],
+        help="Models to download. Empty means do not download models.",
     )
     parser.add_argument(
         "--hf-home",
         default=os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")),
-        help="Target HF_HOME. Defaults to $HF_HOME or ~/.cache/huggingface.",
+        help="HF_HOME for default cache. Defaults to $HF_HOME or ~/.cache/huggingface.",
     )
     parser.add_argument(
         "--force-download",
@@ -69,35 +111,86 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def select_benchmarks(requested: List[str]) -> List[str]:
+def select_items(requested: List[str], registry: Dict[str, object]) -> List[str]:
+    if not requested:
+        return []
     if "all" in requested:
-        return list(DATASETS.keys())
+        return list(registry.keys())
     return requested
+
+
+def download_datasets(
+    names: List[str],
+    token: str | None,
+    force_download: bool,
+    resume_download: bool,
+) -> None:
+    if not names:
+        return
+
+    for name in names:
+        spec = DATASETS[name]
+        print(f"[dataset:{name}] {spec.description}")
+        print(f"  repo: {spec.repo_id}")
+        snapshot_download(
+            repo_id=spec.repo_id,
+            repo_type="dataset",
+            token=token,
+            force_download=force_download,
+            resume_download=resume_download,
+        )
+
+
+def download_models(
+    names: List[str],
+    token: str | None,
+    force_download: bool,
+    resume_download: bool,
+) -> None:
+    if not names:
+        return
+
+    for name in names:
+        spec = MODELS[name]
+        print(f"[model:{name}] {spec.description}")
+        print(f"  repo: {spec.repo_id}")
+        snapshot_download(
+            repo_id=spec.repo_id,
+            repo_type="model",
+            token=token,
+            force_download=force_download,
+            resume_download=resume_download,
+        )
 
 
 def main() -> None:
     args = parse_args()
-    hf_datasets_root = os.path.join(args.hf_home, "datasets")
-    os.makedirs(hf_datasets_root, exist_ok=True)
+    os.environ["HF_HOME"] = args.hf_home
 
     print(f"HF_HOME={args.hf_home}")
-    print(f"Download root={hf_datasets_root}")
+    print(f"Default cache root={os.path.join(args.hf_home, 'hub')}")
 
-    for name in select_benchmarks(args.benchmarks):
-        spec = DATASETS[name]
-        local_dir = os.path.join(hf_datasets_root, spec.local_dir_name)
-        print(f"[{name}] {spec.description}")
-        print(f"  repo: {spec.repo_id}")
-        print(f"  dst : {local_dir}")
-        snapshot_download(
-            repo_id=spec.repo_id,
-            repo_type="dataset",
-            local_dir=local_dir,
-            local_dir_use_symlinks=False,
-            token=args.token,
-            force_download=args.force_download,
-            resume_download=args.resume_download,
+    selected_benchmarks = select_items(args.benchmarks, DATASETS)
+    selected_models = select_items(args.models, MODELS)
+
+    if not selected_benchmarks and not selected_models:
+        raise SystemExit(
+            "Nothing selected. Use --benchmarks ... and/or --models ... ."
         )
+
+    download_datasets(
+        names=selected_benchmarks,
+        token=args.token,
+        force_download=args.force_download,
+        resume_download=args.resume_download,
+    )
+
+    download_models(
+        names=selected_models,
+        token=args.token,
+        force_download=args.force_download,
+        resume_download=args.resume_download,
+    )
 
 
 if __name__ == "__main__":
