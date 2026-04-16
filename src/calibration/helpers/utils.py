@@ -3,13 +3,53 @@ from typing import Any, List
 import torch
 from torch import nn
 
+def get_fused_expert_layout(experts) -> str | None:
+    if experts is None:
+        return None
+    if not (hasattr(experts, "gate_up_proj") and hasattr(experts, "down_proj")):
+        return None
+    class_name = getattr(experts, "__class__", type(None)).__name__
+    if class_name == "Qwen3VLMoeTextExperts":
+        return "qwen3"
+    if class_name == "GptOssExperts":
+        return "gpt_oss"
+    if hasattr(experts, "gate_up_proj_bias") and hasattr(experts, "down_proj_bias"):
+        return "gpt_oss"
+    return "qwen3"
+
+
 def is_fused_expert_container(experts) -> bool:
-    return (
-        experts is not None
-        and getattr(experts, "__class__", type(None)).__name__ == "Qwen3VLMoeTextExperts"
-        and hasattr(experts, "gate_up_proj")
-        and hasattr(experts, "down_proj")
-    )
+    return get_fused_expert_layout(experts) is not None
+
+
+def get_fused_intermediate_size(experts: nn.Module) -> int:
+    if hasattr(experts, "expert_dim"):
+        return int(experts.expert_dim)
+    if hasattr(experts, "intermediate_dim"):
+        return int(experts.intermediate_dim)
+    if hasattr(experts, "intermediate_size"):
+        return int(experts.intermediate_size)
+    gate_up = experts.gate_up_proj
+    if gate_up.ndim != 3:
+        raise AttributeError("Cannot infer fused expert intermediate size.")
+    return int(gate_up.shape[-1] // 2)
+
+
+def split_fused_gate_up_tensor(experts: nn.Module, gate_up: torch.Tensor):
+    intermediate_size = get_fused_intermediate_size(experts)
+    layout = get_fused_expert_layout(experts)
+    if gate_up.ndim != 2:
+        raise ValueError(f"Expected 2D fused gate_up tensor, got shape={tuple(gate_up.shape)}")
+    if gate_up.shape[0] != intermediate_size * 2:
+        gate_up = gate_up.transpose(0, 1)
+    if gate_up.shape[0] != intermediate_size * 2:
+        raise ValueError(
+            f"Unsupported fused gate_up shape {tuple(gate_up.shape)} "
+            f"for intermediate size {intermediate_size}."
+        )
+    if layout == "gpt_oss":
+        return gate_up[::2, :], gate_up[1::2, :]
+    return gate_up[:intermediate_size, :], gate_up[intermediate_size:, :]
 
 
 def clear_fused_saved_tensors(experts: nn.Module) -> None:

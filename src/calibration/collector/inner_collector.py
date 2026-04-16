@@ -3,6 +3,7 @@ import torch
 from .utils import *
 from .loop_1_score_collector import *
 from .loop_2_score_collector import *
+from src.calibration.helpers.utils import split_fused_gate_up_tensor
 
 def collect_scores_from_moe_module(cnt_block, 
                             ema: float = 0.9, 
@@ -19,16 +20,28 @@ def collect_scores_from_moe_module(cnt_block,
         intermediate_size = doubled_intermediate // 2
 
         gate_up_proj_t = gate_up_proj.detach().transpose(1, 2)  # [E, 2I, H]
-        gate_proj = gate_up_proj_t[:, :intermediate_size, :]
-        up_proj = gate_up_proj_t[:, intermediate_size:, :]
+        gate_proj = torch.empty(
+            (e, intermediate_size, gate_up_proj_t.shape[-1]),
+            dtype=gate_up_proj_t.dtype,
+            device=gate_up_proj_t.device,
+        )
+        up_proj = torch.empty_like(gate_proj)
+        for expert_idx in range(e):
+            gate_proj[expert_idx], up_proj[expert_idx] = split_fused_gate_up_tensor(
+                experts, gate_up_proj_t[expert_idx]
+            )
         down_proj_t = down_proj.detach().transpose(1, 2)  # [E, H, I]
 
         gate_up_grad = gate_up_proj.grad
         down_proj_grad = down_proj.grad
         if gate_up_grad is not None:
             gate_up_grad_t = gate_up_grad.detach().transpose(1, 2)
-            gate_grad_w = gate_up_grad_t[:, :intermediate_size, :]
-            up_grad_w = gate_up_grad_t[:, intermediate_size:, :]
+            gate_grad_w = torch.empty_like(gate_proj)
+            up_grad_w = torch.empty_like(up_proj)
+            for expert_idx in range(e):
+                gate_grad_w[expert_idx], up_grad_w[expert_idx] = split_fused_gate_up_tensor(
+                    experts, gate_up_grad_t[expert_idx]
+                )
         else:
             gate_grad_w = None
             up_grad_w = None

@@ -30,6 +30,7 @@ from tasks.dataset_paths import require_dataset_dir
 from tasks.gqa import gqa_transform, load_gqa_instruction_rows, resolve_gqa_subdir
 from utils import create_mask_after_last_token, create_mask_after_token
 
+from models.internvl import load_model as load_internvl_model
 from models.kimi import load_model as load_kimi_model
 from models.qwen3 import load_model as load_qwen3_model
 
@@ -146,6 +147,8 @@ def infer_model_family(model_name_or_path: str) -> str:
         return "kimi"
     if "Qwen3-VL" in model_name_or_path:
         return "qwen3"
+    if "InternVL" in model_name_or_path:
+        return "internvl"
     raise ValueError(f"Unsupported model family for path: {model_name_or_path}")
 
 
@@ -301,7 +304,7 @@ def load_model_bundle(
                 create_mask_after_token, special_token_id=163588, offset=3
             ),
         }
-    else:
+    elif family == "qwen3":
         model, processor = load_qwen3_model(resolved_name_or_path, 
                                             device_map=device_map, 
                                             attn_implementation=attn_implementation)
@@ -317,6 +320,25 @@ def load_model_bundle(
             "eos_token": "<|im_end|>",
             "create_mask": partial(
                 create_mask_after_last_token, special_token_id=151644, offset=3
+            ),
+        }
+    else:
+        model, processor = load_internvl_model(
+            resolved_name_or_path,
+            device_map=device_map,
+            attn_implementation=attn_implementation,
+        )
+        eos_token = getattr(processor.tokenizer, "eos_token", None) or ""
+        eos_token_id = getattr(model.config.text_config, "eos_token_id", None)
+        model_config = {
+            "family": family,
+            "get_lm": lambda m: m.model.language_model,
+            "is_moe_layer": lambda cfg, idx: getattr(cfg, "num_local_experts", 0) > 0,
+            "eos_token": eos_token,
+            "create_mask": partial(
+                create_mask_after_last_token,
+                special_token_id=eos_token_id if eos_token_id is not None else -1,
+                offset=1,
             ),
         }
     model.eval()
@@ -732,6 +754,25 @@ def discover_layer_structure(bundle: ModelBundle) -> Tuple[Dict[int, int], Dict[
                         "`intermediate_dim` or `intermediate_size` on fused experts."
                     )
                 layer_to_num_channels[layer_idx] = int(intermediate_size)
+        return layer_to_num_experts, layer_to_num_channels
+    if bundle.family == "internvl":
+        config = bundle.model.config.text_config
+        for layer_idx, layer in enumerate(bundle.model.model.language_model.layers):
+            if getattr(config, "num_local_experts", 0) <= 0:
+                continue
+            if not (hasattr(layer.mlp, "router") and hasattr(layer.mlp, "experts")):
+                continue
+            experts = layer.mlp.experts
+            layer_to_num_experts[layer_idx] = int(getattr(experts, "num_experts"))
+            intermediate_size = getattr(experts, "expert_dim", None)
+            if intermediate_size is None:
+                intermediate_size = getattr(experts, "intermediate_size", None)
+            if intermediate_size is None:
+                raise AttributeError(
+                    "Cannot infer InternVL/GPT-OSS expert width: expected "
+                    "`expert_dim` or `intermediate_size` on fused experts."
+                )
+            layer_to_num_channels[layer_idx] = int(intermediate_size)
         return layer_to_num_experts, layer_to_num_channels
     config = bundle.model.config.text_config
     for layer_idx, layer in enumerate(bundle.model.language_model.model.layers):

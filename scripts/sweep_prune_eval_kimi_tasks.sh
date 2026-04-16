@@ -29,22 +29,25 @@ cd "${REPO_ROOT}"
 PREFIX="${PREFIX:-${REPO_ROOT}}"
 export PYTHONPATH="${PREFIX}"
 
+export SCORES_PATH="./storage/prune/scores/kimi-vl-a3b_gqa-rell2-041513.pt"
+
 # ── Task grid ──────────────────────────────────────────────────────────────────
 # All 14 tasks requested; override via SWEEP_TASKS env var.
 SWEEP_TASKS="${SWEEP_TASKS:-textvqa gqa chartqa mmstar mmbench mmvet mme realworldqa coco2017cap mvbench egoschema videomme longvideobench video_mmmu}"
 
 # ── Setting grids (same defaults as sweep_prune_eval_kimi_gqa.sh) ──────────────
-SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-loss_smooth_2 uniform}"
-SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-uniform second_attr_coverage attr_coverage usage}"
+SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-loss_smooth_2 uniform uniform_coverage}"
+SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-uniform second_attr_coverage second_attr_fillzero_coverage}"
 SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-0 1}"
 SMOOTH_FN="${SMOOTH_FN:-sqrt}"
-SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act 3proj_act down_second_order 3proj_second_order down_saliency 3proj_saliency 3proj_grad wg}"
+SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act down_second_order_exact 3proj_second_order}"
+# 3proj_second_order down_saliency 3proj_saliency 3proj_grad wg
 
 # ── Output paths ───────────────────────────────────────────────────────────────
 # Timestamp is fixed at script start so all runs share the same directory.
 SWEEP_TS="${SWEEP_TS:-$(date +%m%d%H%M)}"
 MODEL_NAME="${MODEL_NAME:-kimi}"
-SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-gqa-rell2-${SWEEP_TS}"
+SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-gqa-rell2-041513-${SWEEP_TS}"
 
 SUMMARY_FILE="${SUMMARY_FILE:-${SWEEP_BASE}/summary.md}"
 SWEEP_LOG_DIR="${SWEEP_LOG_DIR:-${SWEEP_BASE}/logs}"

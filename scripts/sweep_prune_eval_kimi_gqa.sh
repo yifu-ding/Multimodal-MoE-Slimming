@@ -65,10 +65,11 @@ SMOOTH_FN="${SMOOTH_FN:-sqrt}"
 #   wa
 #   3proj_grad
 #   down_second_order_exact
+#   down_second_order_approx
 #   wg
 # 这个 metric 没有双模态版本
 #   weight
-SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act 3proj_second_order 3proj_act 3proj_saliency down_second_order_exact}"
+SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act 3proj_act down_second_order_exact down_second_order_approx 3proj_saliency 3proj_second_order}"
 # 3proj_act down_second_order 3proj_second_order down_saliency 3proj_saliency 3proj_grad
 
 SWEEP_TS="${SWEEP_TS:-$(date +%m%d%H%M)}"

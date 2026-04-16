@@ -1,4 +1,4 @@
-"""Structural channel pruning for Kimi-VL MoE experts."""
+"""Structural channel pruning for Kimi-VL and InternVL/GPT-OSS MoE experts."""
 
 from typing import Dict
 
@@ -8,14 +8,23 @@ from tqdm.auto import tqdm
 
 
 # ---------------------------------------------------------------------------
-# MoE layer predicate
+# MoE layer predicate / helpers
 # ---------------------------------------------------------------------------
 
-def _is_moe_layer(layer_idx: int, config) -> bool:
+def _is_kimi_moe_layer(layer_idx: int, config) -> bool:
     return (
         config.n_routed_experts is not None
         and layer_idx >= config.first_k_dense_replace
         and layer_idx % config.moe_layer_freq == 0
+    )
+
+
+def _is_gpt_oss_moe_layer(layer: nn.Module, config) -> bool:
+    return (
+        getattr(config, "num_local_experts", 0) > 0
+        and hasattr(layer, "mlp")
+        and hasattr(layer.mlp, "router")
+        and hasattr(layer.mlp, "experts")
     )
 
 
@@ -62,9 +71,125 @@ def _shrink_kimi_router_for_active_experts(module: nn.Module, keep_mask: torch.T
     return old_num_experts - n_active
 
 
+def _shrink_gpt_oss_router_for_active_experts(module: nn.Module, keep_mask: torch.Tensor) -> int:
+    keep_mask = keep_mask.to(dtype=torch.bool)
+    router = module.router
+    old_num_experts = int(keep_mask.numel())
+    n_active = int(keep_mask.sum().item())
+    if n_active == 0:
+        raise RuntimeError("All experts in this layer were fully pruned.")
+
+    keep_idx = torch.nonzero(keep_mask.to(router.weight.device), as_tuple=False).view(-1)
+    router.weight = nn.Parameter(
+        router.weight.data.index_select(0, keep_idx).contiguous()
+    )
+    router.bias = nn.Parameter(
+        router.bias.data.index_select(0, keep_idx).contiguous()
+    )
+    router.num_experts = n_active
+    router.top_k = min(int(router.top_k), n_active)
+    return old_num_experts - n_active
+
+
+class PrunedGptOssExpert(nn.Module):
+    def __init__(
+        self,
+        *,
+        gate_proj: nn.Linear,
+        up_proj: nn.Linear,
+        down_proj: nn.Linear,
+        alpha: float,
+        limit: float,
+    ) -> None:
+        super().__init__()
+        self.gate_proj = gate_proj
+        self.up_proj = up_proj
+        self.down_proj = down_proj
+        self.alpha = float(alpha)
+        self.limit = float(limit)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        gate = gate.clamp(min=None, max=self.limit)
+        up = up.clamp(min=-self.limit, max=self.limit)
+        glu = gate * torch.sigmoid(gate * self.alpha)
+        return self.down_proj((up + 1) * glu)
+
+
+class PrunedGptOssExperts(nn.Module):
+    def __init__(self, experts: list[PrunedGptOssExpert], hidden_size: int) -> None:
+        super().__init__()
+        self.experts = nn.ModuleList(experts)
+        self.num_experts = len(experts)
+        self.hidden_size = int(hidden_size)
+
+    def __len__(self) -> int:
+        return len(self.experts)
+
+    def __iter__(self):
+        return iter(self.experts)
+
+    def __getitem__(self, idx: int) -> PrunedGptOssExpert:
+        return self.experts[idx]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_indices=None,
+        routing_weights=None,
+    ) -> torch.Tensor:
+        batch_size = hidden_states.shape[0]
+        hidden_states = hidden_states.reshape(-1, self.hidden_size)
+        next_states = torch.zeros_like(hidden_states)
+        expert_mask = torch.nn.functional.one_hot(
+            router_indices, num_classes=self.num_experts
+        ).permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        for expert_tensor in expert_hit:
+            expert_idx = int(expert_tensor[0].item())
+            _, token_idx = torch.where(expert_mask[expert_idx])
+            if token_idx.numel() == 0:
+                continue
+            current_state = hidden_states[token_idx]
+            out = self.experts[expert_idx](current_state)
+            weighted = out * routing_weights[token_idx, expert_idx, None]
+            next_states.index_add_(0, token_idx, weighted.to(next_states.dtype))
+        return next_states.view(batch_size, -1, self.hidden_size)
+
+
+def _make_linear(
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    in_features: int,
+    out_features: int,
+) -> nn.Linear:
+    layer = nn.Linear(
+        in_features,
+        out_features,
+        bias=bias is not None,
+        device=weight.device,
+        dtype=weight.dtype,
+    )
+    layer.weight = nn.Parameter(weight.contiguous())
+    if bias is not None:
+        layer.bias = nn.Parameter(bias.contiguous())
+    return layer
+
+
 # ---------------------------------------------------------------------------
 # Structural pruning
 # ---------------------------------------------------------------------------
+
+def _resolve_model_layout(model: nn.Module, config):
+    if hasattr(model, "language_model") and hasattr(model.language_model, "model"):
+        return "kimi", model.language_model.model.layers
+    if hasattr(model, "model") and hasattr(model.model, "language_model"):
+        if getattr(config, "num_local_experts", 0) > 0:
+            return "gpt_oss", model.model.language_model.layers
+    raise NotImplementedError(
+        f"Unsupported model layout for structural pruning: {type(model)}"
+    )
 
 @torch.no_grad()
 def apply_structural_pruning(
@@ -83,7 +208,7 @@ def apply_structural_pruning(
     """
     if masks is None:
         return
-    layers = model.language_model.model.layers
+    model_layout, layers = _resolve_model_layout(model, config)
     pbar = tqdm(total=len(layers), desc="Pruning experts", unit="layer")
 
     params_removed = 0
@@ -93,55 +218,122 @@ def apply_structural_pruning(
 
     for layer_idx, layer in enumerate(layers):
         pbar.update(1)
-        if not _is_moe_layer(layer_idx, config):
+        if model_layout == "kimi":
+            is_moe_layer = _is_kimi_moe_layer(layer_idx, config)
+        else:
+            is_moe_layer = _is_gpt_oss_moe_layer(layer, config)
+        if not is_moe_layer:
             continue
         if layer_idx not in masks:
             continue
 
         layer_mask = masks[layer_idx]  # [E, I]
-        old_num_experts = len(layer.mlp.experts)
+        if model_layout == "kimi":
+            old_num_experts = len(layer.mlp.experts)
+            if layer_mask.shape[0] != old_num_experts:
+                raise RuntimeError(
+                    f"Layer {layer_idx}: mask expert dim={int(layer_mask.shape[0])} "
+                    f"but model has {old_num_experts} experts."
+                )
+            layer_active_expert = torch.ones(old_num_experts, dtype=torch.bool)
+
+            for eid, expert in enumerate(layer.mlp.experts):
+                m_inter = layer_mask[eid].to(
+                    device=expert.gate_proj.weight.device, dtype=torch.bool
+                )
+                I_prime = int(m_inter.sum().item())
+                if I_prime == 0:
+                    layer_active_expert[eid] = False
+                    I_old = expert.gate_proj.out_features
+                    H = expert.gate_proj.in_features
+                    params_removed += int(I_old * H * 3)
+                    continue
+
+                dtype = expert.gate_proj.weight.dtype
+                device = expert.gate_proj.weight.device
+                H = expert.gate_proj.in_features
+
+                W_gate = expert.gate_proj.weight.data[m_inter, :]
+                W_up = expert.up_proj.weight.data[m_inter, :]
+                W_down = expert.down_proj.weight.data[:, m_inter]
+
+                I_old = expert.gate_proj.out_features
+                params_removed += int((I_old - I_prime) * H * 3)
+                params_kept += int(I_prime * H * 3)
+
+                new_gate = nn.Linear(H, I_prime, bias=False, device=device, dtype=dtype)
+                new_up = nn.Linear(H, I_prime, bias=False, device=device, dtype=dtype)
+                new_down = nn.Linear(I_prime, H, bias=False, device=device, dtype=dtype)
+
+                new_gate.weight = nn.Parameter(W_gate.contiguous())
+                new_up.weight = nn.Parameter(W_up.contiguous())
+                new_down.weight = nn.Parameter(W_down.contiguous())
+
+                expert.gate_proj = new_gate
+                expert.up_proj = new_up
+                expert.down_proj = new_down
+
+            n_active = int(layer_active_expert.sum().item())
+            if n_active == 0:
+                raise RuntimeError(
+                    f"All experts in layer {layer_idx} were fully pruned. "
+                    "Adjust masks to keep at least one expert."
+                )
+            inactive_experts += old_num_experts - n_active
+            if n_active != old_num_experts:
+                keep_eids = torch.nonzero(layer_active_expert, as_tuple=False).view(-1).tolist()
+                layer.mlp.experts = nn.ModuleList([layer.mlp.experts[eid] for eid in keep_eids])
+                shrink_gate_cnt += _shrink_kimi_router_for_active_experts(
+                    layer.mlp, layer_active_expert
+                )
+            continue
+
+        experts = layer.mlp.experts
+        old_num_experts = int(experts.num_experts)
         if layer_mask.shape[0] != old_num_experts:
             raise RuntimeError(
                 f"Layer {layer_idx}: mask expert dim={int(layer_mask.shape[0])} "
                 f"but model has {old_num_experts} experts."
             )
-        layer_active_expert = torch.ones(old_num_experts, dtype=torch.bool)
 
-        for eid, expert in enumerate(layer.mlp.experts):
-            m_inter = layer_mask[eid].to(
-                device=expert.gate_proj.weight.device, dtype=torch.bool
-            )  # [I]
+        new_experts = []
+        layer_active_expert = torch.zeros(old_num_experts, dtype=torch.bool)
+        for eid in range(old_num_experts):
+            m_inter = layer_mask[eid].to(device=experts.gate_up_proj.device, dtype=torch.bool)
+            I_old = int(experts.down_proj.shape[1])
+            H = int(experts.gate_up_proj.shape[1])
             I_prime = int(m_inter.sum().item())
             if I_prime == 0:
-                layer_active_expert[eid] = False
-                I_old = expert.gate_proj.out_features
-                H = expert.gate_proj.in_features
-                params_removed += int(I_old * H * 3)
+                params_removed += int(I_old * H * 3 + 2 * I_old + H)
                 continue
 
-            dtype = expert.gate_proj.weight.dtype
-            device = expert.gate_proj.weight.device
-            H = expert.gate_proj.in_features
+            layer_active_expert[eid] = True
+            keep_idx = torch.nonzero(m_inter, as_tuple=False).view(-1)
+            pair_idx = torch.stack((keep_idx * 2, keep_idx * 2 + 1), dim=1).reshape(-1)
 
-            W_gate = expert.gate_proj.weight.data[m_inter, :]  # [I', H]
-            W_up   = expert.up_proj.weight.data[m_inter, :]    # [I', H]
-            W_down = expert.down_proj.weight.data[:, m_inter]  # [H, I']
+            gate_up_w = experts.gate_up_proj.data[eid][:, pair_idx]
+            gate_up_b = experts.gate_up_proj_bias.data[eid][pair_idx]
+            down_w = experts.down_proj.data[eid][m_inter, :]
+            down_b = experts.down_proj_bias.data[eid]
 
-            I_old = expert.gate_proj.out_features
-            params_removed += int((I_old - I_prime) * H * 2 + H * (I_old - I_prime))
-            params_kept    += int(I_prime * H * 2 + H * I_prime)
+            gate_w = gate_up_w[:, ::2].transpose(0, 1).contiguous()
+            up_w = gate_up_w[:, 1::2].transpose(0, 1).contiguous()
+            gate_b = gate_up_b[::2].contiguous()
+            up_b = gate_up_b[1::2].contiguous()
+            down_w = down_w.transpose(0, 1).contiguous()
 
-            new_gate = nn.Linear(H, I_prime, bias=False, device=device, dtype=dtype)
-            new_up   = nn.Linear(H, I_prime, bias=False, device=device, dtype=dtype)
-            new_down = nn.Linear(I_prime, H, bias=False, device=device, dtype=dtype)
+            params_removed += int((I_old - I_prime) * H * 3 + 2 * (I_old - I_prime))
+            params_kept += int(I_prime * H * 3 + 2 * I_prime + H)
 
-            new_gate.weight = nn.Parameter(W_gate.contiguous())
-            new_up.weight   = nn.Parameter(W_up.contiguous())
-            new_down.weight = nn.Parameter(W_down.contiguous())
-
-            expert.gate_proj = new_gate
-            expert.up_proj   = new_up
-            expert.down_proj = new_down
+            new_experts.append(
+                PrunedGptOssExpert(
+                    gate_proj=_make_linear(gate_w, gate_b, H, I_prime),
+                    up_proj=_make_linear(up_w, up_b, H, I_prime),
+                    down_proj=_make_linear(down_w, down_b, I_prime, H),
+                    alpha=float(experts.alpha),
+                    limit=float(experts.limit),
+                )
+            )
 
         n_active = int(layer_active_expert.sum().item())
         if n_active == 0:
@@ -150,10 +342,11 @@ def apply_structural_pruning(
                 "Adjust masks to keep at least one expert."
             )
         inactive_experts += old_num_experts - n_active
+        layer.mlp.experts = PrunedGptOssExperts(new_experts, hidden_size=H)
         if n_active != old_num_experts:
-            keep_eids = torch.nonzero(layer_active_expert, as_tuple=False).view(-1).tolist()
-            layer.mlp.experts = nn.ModuleList([layer.mlp.experts[eid] for eid in keep_eids])
-            shrink_gate_cnt += _shrink_kimi_router_for_active_experts(layer.mlp, layer_active_expert)
+            shrink_gate_cnt += _shrink_gpt_oss_router_for_active_experts(
+                layer.mlp, layer_active_expert
+            )
 
     pbar.close()
     total = params_removed + params_kept

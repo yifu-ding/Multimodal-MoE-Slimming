@@ -40,7 +40,7 @@ def save_score_artifacts(output_dir: str, accumulator: ScoreAccumulator, args) -
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Collect channel scores for Kimi-VL or Qwen3-VL on multimodal calibration data."
+        description="Collect channel scores for Kimi-VL, Qwen3-VL, or InternVL on multimodal calibration data."
     )
     p.add_argument("--model_name_or_path", type=str, required=True)
     p.add_argument("--output_dir", type=str, required=True)

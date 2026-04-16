@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .utils import is_fused_expert_container
+from .utils import get_fused_expert_layout, is_fused_expert_container
 
 from .helpers import fused_linear
 
@@ -16,6 +16,7 @@ def patch_qwen_fused_experts_forward(block: nn.Module):
         return None
 
     original = experts.forward
+    fused_layout = get_fused_expert_layout(experts)
 
     def _save_grad_attr(obj, index: int, name: str):
         def _hook(grad):
@@ -48,6 +49,10 @@ def patch_qwen_fused_experts_forward(block: nn.Module):
         text_mask = getattr(block.mlp, "moe_text_mask", None)
         visual_mask = getattr(block.mlp, "moe_media_mask", None)
         padding_mask = getattr(block.mlp, "moe_padding_mask", None)
+        if fused_layout == "gpt_oss":
+            batch_size = hidden_states.shape[0]
+            hidden_size = hidden_states.shape[-1]
+            hidden_states = hidden_states.reshape(-1, hidden_size)
         if text_mask is None:
             text_mask = torch.zeros(hidden_states.shape[0], dtype=torch.bool, device=hidden_states.device)
         else:
@@ -70,10 +75,26 @@ def patch_qwen_fused_experts_forward(block: nn.Module):
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[token_idx]
             gate_up = fused_linear(current_state, self.gate_up_proj[expert_idx])
-            gate, up = gate_up.chunk(2, dim=-1)
-            current_hidden_states = self.act_fn(gate) * up
+            if fused_layout == "gpt_oss":
+                gate_up_bias = self.gate_up_proj_bias[expert_idx]
+                gate_up = gate_up + gate_up_bias.to(device=gate_up.device, dtype=gate_up.dtype)
+                gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+                gate = gate.clamp(min=None, max=self.limit)
+                up = up.clamp(min=-self.limit, max=self.limit)
+                current_hidden_states = (up + 1) * (gate * torch.sigmoid(gate * self.alpha))
+            else:
+                gate, up = gate_up.chunk(2, dim=-1)
+                current_hidden_states = self.act_fn(gate) * up
             down_out = fused_linear(current_hidden_states, self.down_proj[expert_idx])
-            weighted = down_out * routing_weights[token_idx, top_k_pos, None]
+            if fused_layout == "gpt_oss":
+                down_out = down_out + self.down_proj_bias[expert_idx].to(
+                    device=down_out.device, dtype=down_out.dtype
+                )
+            if fused_layout == "gpt_oss":
+                expert_routing_weights = routing_weights[token_idx, expert_idx]
+            else:
+                expert_routing_weights = routing_weights[token_idx, top_k_pos]
+            weighted = down_out * expert_routing_weights[:, None]
 
             self.saved_gate_input[expert_idx] = current_state
             self.saved_gate_output[expert_idx] = gate
@@ -83,7 +104,7 @@ def patch_qwen_fused_experts_forward(block: nn.Module):
             self.saved_down_output[expert_idx] = down_out
             self.saved_text_mask[expert_idx] = text_mask[token_idx]
             self.saved_visual_mask[expert_idx] = visual_mask[token_idx]
-            self.saved_router_weights[expert_idx] = routing_weights[token_idx, top_k_pos]
+            self.saved_router_weights[expert_idx] = expert_routing_weights
 
             if current_state.requires_grad:
                 current_state.register_hook(_save_grad_attr(self, expert_idx, "saved_gate_in_grad"))
@@ -101,6 +122,8 @@ def patch_qwen_fused_experts_forward(block: nn.Module):
 
             next_states.index_add_(0, token_idx, weighted.to(next_states.dtype))
 
+        if fused_layout == "gpt_oss":
+            return next_states.view(batch_size, -1, hidden_size)
         return next_states
 
     experts.forward = types.MethodType(_instrumented_forward, experts)
