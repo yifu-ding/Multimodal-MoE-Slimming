@@ -236,6 +236,66 @@ class KimiVL(lmms):
         self.layer_importance_path = layer_importance_path
 
         model, processor = load_model(model_path=pretrained, **model_kwargs)
+
+        # ── Optional structural pruning ──
+        scores_path = kwargs.get("scores_path", None)
+        prune_ratio = float(kwargs.get("prune_ratio", 0) or 0)
+        if scores_path and prune_ratio > 0:
+            from src.generate_mask import generate_masks
+            from src.prune import apply_structural_pruning
+
+            inter_method = kwargs.get("inter_method", "uniform")
+            intra_method = kwargs.get("intra_method", "uniform")
+            intra_expert_metric = kwargs.get("intra_expert_metric", "activation")
+            modality_aware = bool(int(kwargs.get("modality_aware", 0)))
+            smooth_fn = kwargs.get("smooth_fn", "sqrt")
+            align_inter = int(kwargs.get("align_inter", 0))
+            min_per_expert = int(kwargs.get("min_per_expert", 0))
+            thresholds_path = kwargs.get("thresholds_path", None)
+
+            eval_logger.info(
+                f"[KimiVL] Generating masks: ratio={prune_ratio}, "
+                f"inter={inter_method}, intra={intra_method}, metric={intra_expert_metric}"
+            )
+            mask_result = generate_masks(
+                scores_dir=scores_path,
+                prune_kwargs={
+                    "prune_ratio": prune_ratio,
+                    "thresholds_path": thresholds_path,
+                    "mask_method_kwargs": {
+                        "inter_layer_method": inter_method,
+                        "intra_layer_method": intra_method,
+                        "intra_expert_metric": intra_expert_metric,
+                    },
+                    "adjust_masks_kwargs": {
+                        "align_inter": align_inter,
+                        "min_per_expert": min_per_expert,
+                    },
+                    "modality_aware": modality_aware,
+                    "prune_hidden": False,
+                    "prune_gqa": False,
+                    "smooth_fn": smooth_fn,
+                },
+                device="cpu",
+                verbose=True,
+            )
+            mask_tensor = mask_result["intermediate_masks"]
+            layers = [
+                int(l)
+                for l in mask_result.get(
+                    "layers", list(range(mask_tensor.shape[0]))
+                )
+            ]
+            masks = {
+                layer_idx: mask_tensor[pos].detach().cpu().bool()
+                for pos, layer_idx in enumerate(layers)
+            }
+            text_config = model.config.text_config
+            apply_structural_pruning(model, masks, text_config)
+            eval_logger.info(
+                f"[KimiVL] Structural pruning applied: ratio={prune_ratio}"
+            )
+
         self._model = model
         self.processor = processor
         self._tokenizer = processor.tokenizer

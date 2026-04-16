@@ -73,13 +73,10 @@ def _mc_accuracy_evaluate(predictions: List[dict]) -> dict:
     }
 
 
-def _load_hf_dataset_rows(dataset_path: str, split: str = "test", columns: list = None) -> List[dict]:
-    """Generic HF dataset loader."""
+def _load_hf_dataset(dataset_path: str, split: str = "test"):
+    """Generic HF dataset loader. Returns the Dataset object directly (lazy image decoding)."""
     from datasets import load_dataset
-    data = load_dataset(dataset_path, split=split, token=True)
-    if columns:
-        return [{c: row[c] for c in columns if c in row} for row in data]
-    return [dict(row) for row in data]
+    return load_dataset(dataset_path, split=split, token=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -107,7 +104,14 @@ def _load_gqa_rows() -> List[dict]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _build_coco_helpers() -> TaskHelpers:
-    from tasks.coco import coco_doc_to_answer, coco_doc_to_text, coco_doc_to_visual
+    from tasks.coco import coco_doc_to_text
+
+    def coco_doc_to_visual(doc):
+        return [doc["image"].convert("RGB")]
+
+    def coco_doc_to_answer(doc):
+        ans = doc["answer"]
+        return ans[0] if isinstance(ans, list) else ans
     def evaluate(predictions: List[dict]) -> dict:
         try:
             return _coco_cider_eval(predictions)
@@ -133,11 +137,10 @@ def _coco_cider_eval(predictions: List[dict]) -> dict:
     score, _ = Cider().compute_score(gts, res)
     return {"metric_name": "CIDEr", "metric_value": round(score, 6), "detail": f"CIDEr={score:.4f}"}
 
-def _load_coco_rows() -> List[dict]:
+def _load_coco_rows():
     from datasets import load_dataset
     from tasks.dataset_paths import require_dataset_dir
-    data = load_dataset(require_dataset_dir("COCO-Caption2017", "data"), token=True)["validation"]
-    return [{"imageId": row["id"], "answer": row["answer"]} for row in data]
+    return load_dataset(require_dataset_dir("COCO-Caption2017", "data"), token=True)["validation"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -195,7 +198,7 @@ def _build_textvqa_helpers() -> TaskHelpers:
     )
 
 def _load_textvqa_rows() -> List[dict]:
-    return _load_hf_dataset_rows("lmms-lab/textvqa", split="validation")
+    return _load_hf_dataset("lmms-lab/textvqa", split="validation")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -248,7 +251,7 @@ def _relaxed_correctness(prediction: str, target: str, max_relative_change: floa
     return prediction.strip().lower() == target.strip().lower()
 
 def _load_chartqa_rows() -> List[dict]:
-    return _load_hf_dataset_rows("lmms-lab/ChartQA", split="test")
+    return _load_hf_dataset("lmms-lab/ChartQA", split="test")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -275,7 +278,7 @@ def _build_mmstar_helpers() -> TaskHelpers:
     )
 
 def _load_mmstar_rows() -> List[dict]:
-    return _load_hf_dataset_rows("Lin-Chen/MMStar", split="val")
+    return _load_hf_dataset("Lin-Chen/MMStar", split="val")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -311,7 +314,7 @@ def _build_mmbench_helpers() -> TaskHelpers:
     )
 
 def _load_mmbench_rows() -> List[dict]:
-    return _load_hf_dataset_rows("lmms-lab/MMBench", split="dev")
+    return _load_hf_dataset("lmms-lab/MMBench", split="dev")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -338,7 +341,7 @@ def _build_mmvet_helpers() -> TaskHelpers:
     )
 
 def _load_mmvet_rows() -> List[dict]:
-    return _load_hf_dataset_rows("lmms-lab/MMVet", split="test")
+    return _load_hf_dataset("lmms-lab/MMVet", split="test")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -395,7 +398,7 @@ def _parse_yes_no(pred: str) -> str:
     return "other"
 
 def _load_mme_rows() -> List[dict]:
-    return _load_hf_dataset_rows("lmms-lab/MME", split="test")
+    return _load_hf_dataset("lmms-lab/MME", split="test")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -422,7 +425,7 @@ def _build_realworldqa_helpers() -> TaskHelpers:
     )
 
 def _load_realworldqa_rows() -> List[dict]:
-    return _load_hf_dataset_rows("lmms-lab/RealWorldQA", split="test")
+    return _load_hf_dataset("lmms-lab/RealWorldQA", split="test")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -475,18 +478,13 @@ def _build_videommmu_helpers() -> TaskHelpers:
         extra_fields=["question_type", "options"],
     )
 
-def _load_videommmu_rows() -> List[dict]:
+def _load_videommmu_rows():
     from datasets import concatenate_datasets, load_dataset
     from tasks.dataset_paths import require_dataset_dir
     adaptation = load_dataset(require_dataset_dir("VideoMMMU", "Adaptation"), token=True)["test"]
     comprehension = load_dataset(require_dataset_dir("VideoMMMU", "Comprehension"), token=True)["test"]
     perception = load_dataset(require_dataset_dir("VideoMMMU", "Perception"), token=True)["test"]
-    combined = concatenate_datasets([adaptation, comprehension, perception])
-    return [{
-        "id": row["id"], "question": row["question"],
-        "question_type": row["question_type"], "options": row["options"],
-        "answer": row["answer"], "image": row.get("image"),
-    } for row in combined]
+    return concatenate_datasets([adaptation, comprehension, perception])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -517,7 +515,7 @@ def _build_mvbench_helpers() -> TaskHelpers:
     )
 
 def _load_mvbench_rows() -> List[dict]:
-    return _load_hf_dataset_rows("OpenGVLab/MVBench", split="test")
+    return _load_hf_dataset("OpenGVLab/MVBench", split="test")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -548,7 +546,7 @@ def _build_egoschema_helpers() -> TaskHelpers:
     )
 
 def _load_egoschema_rows() -> List[dict]:
-    return _load_hf_dataset_rows("lmms-lab/egoschema", split="test")
+    return _load_hf_dataset("lmms-lab/egoschema", split="test")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -581,7 +579,7 @@ def _build_videomme_helpers() -> TaskHelpers:
     )
 
 def _load_videomme_rows() -> List[dict]:
-    return _load_hf_dataset_rows("lmms-lab/Video-MME", split="test")
+    return _load_hf_dataset("lmms-lab/Video-MME", split="test")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -615,7 +613,7 @@ def _build_longvideobench_helpers() -> TaskHelpers:
     )
 
 def _load_longvideobench_rows() -> List[dict]:
-    return _load_hf_dataset_rows("longvideobench/LongVideoBench", split="test")
+    return _load_hf_dataset("longvideobench/LongVideoBench", split="test")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -665,13 +663,31 @@ def load_eval_task(
         raise ValueError(f"Unknown task: {task_name!r}. Available: {available}")
 
     load_fn, build_helpers_fn = _TASK_REGISTRY[task_name]
-    rows = load_fn()
-    pool = rows[start_idx:]
-    if num_samples > 0:
-        if subset_seed is not None:
-            rng = random.Random(subset_seed)
-            pool = rng.sample(pool, min(num_samples, len(pool)))
-        else:
-            pool = pool[:num_samples]
+    dataset = load_fn()
+
+    # HF Dataset objects need .select() for slicing; plain lists use normal slicing.
+    try:
+        from datasets import Dataset as HFDataset
+        is_hf = isinstance(dataset, HFDataset)
+    except ImportError:
+        is_hf = False
+
+    if is_hf:
+        indices = list(range(start_idx, len(dataset)))
+        if num_samples > 0:
+            if subset_seed is not None:
+                rng = random.Random(subset_seed)
+                indices = rng.sample(indices, min(num_samples, len(indices)))
+            else:
+                indices = indices[:num_samples]
+        pool = dataset.select(indices)
+    else:
+        pool = dataset[start_idx:]
+        if num_samples > 0:
+            if subset_seed is not None:
+                rng = random.Random(subset_seed)
+                pool = rng.sample(pool, min(num_samples, len(pool)))
+            else:
+                pool = pool[:num_samples]
 
     return pool, build_helpers_fn()

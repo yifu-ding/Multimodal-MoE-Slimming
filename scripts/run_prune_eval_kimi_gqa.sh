@@ -77,6 +77,8 @@ BATCH_SIZE="${BATCH_SIZE:-1}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"
 SUBSET_SEED="${SUBSET_SEED:-}"
 
+USE_LMMS_EVAL="${USE_LMMS_EVAL:-0}"
+
 MODEL_NAME="${MODEL_NAME:-}"
 if [[ -z "${MODEL_NAME}" ]]; then
     MODEL_TAG_RAW="${MODEL_PATH##*/}"
@@ -102,38 +104,85 @@ OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/results/prune_eval_${MODEL_NAME}_gqa_${RATIO
 
 EXTRA_ARGS=("$@")
 
-CMD=(
-    python3 scripts/prune_and_eval_kimi_gqa.py
-    --model_path "${MODEL_PATH}"
-    --scores_path "${SCORES_PATH}"
-    --task "${TASK}"
-    --output_dir "${OUTPUT_DIR}"
-    --prune_ratio "${PRUNE_RATIO}"
-    --inter_method "${INTER_METHOD}"
-    --intra_method "${INTRA_METHOD}"
-    --intra_expert_metric "${INTRA_EXPERT_METRIC}"
-    --smooth_fn "${SMOOTH_FN}"
-    --align_inter "${ALIGN_INTER}"
-    --min_per_expert "${MIN_PER_EXPERT}"
-    --num_samples "${NUM_SAMPLES}"
-    --start_idx "${START_IDX}"
-    --batch_size "${BATCH_SIZE}"
-    --max_new_tokens "${MAX_NEW_TOKENS}"
-)
+if [[ "${USE_LMMS_EVAL}" == "1" ]]; then
+    # ── lmms-eval mode: use the eval wrapper with built-in task metrics ──
+    # Auto-select eval script based on model family
+    MODEL_LOWER="${MODEL_PATH,,}"
+    if [[ "${MODEL_LOWER}" == *"qwen3"* ]]; then
+        EVAL_SCRIPT="eval/qwen3.py"
+        MODEL_KEY="qwen3_vl"
+    else
+        EVAL_SCRIPT="eval/kimi.py"
+        MODEL_KEY="kimi_vl"
+    fi
 
-if [[ "${MODALITY_AWARE}" == "1" ]]; then
-    CMD+=(--modality_aware)
+    MODEL_ARGS="pretrained=${MODEL_PATH}"
+    if [[ -n "${SCORES_PATH}" ]]; then
+        MODEL_ARGS+=",scores_path=${SCORES_PATH}"
+        MODEL_ARGS+=",prune_ratio=${PRUNE_RATIO}"
+        MODEL_ARGS+=",inter_method=${INTER_METHOD}"
+        MODEL_ARGS+=",intra_method=${INTRA_METHOD}"
+        MODEL_ARGS+=",intra_expert_metric=${INTRA_EXPERT_METRIC}"
+        MODEL_ARGS+=",modality_aware=${MODALITY_AWARE}"
+        MODEL_ARGS+=",smooth_fn=${SMOOTH_FN}"
+        MODEL_ARGS+=",align_inter=${ALIGN_INTER}"
+        MODEL_ARGS+=",min_per_expert=${MIN_PER_EXPERT}"
+        if [[ -n "${THRESHOLDS_PATH}" ]]; then
+            MODEL_ARGS+=",thresholds_path=${THRESHOLDS_PATH}"
+        fi
+    fi
+
+    LIMIT_ARG=""
+    if [[ "${NUM_SAMPLES}" -gt 0 ]]; then
+        LIMIT_ARG="--limit ${NUM_SAMPLES}"
+    fi
+
+    CMD=(
+        python3 "${EVAL_SCRIPT}"
+        --model "${MODEL_KEY}"
+        --model_args "${MODEL_ARGS}"
+        --tasks "${TASK}"
+        --batch_size "${BATCH_SIZE}"
+        --log_samples
+        --output_path "${OUTPUT_DIR}"
+        ${LIMIT_ARG}
+    )
+    CMD+=("${EXTRA_ARGS[@]}")
+else
+    # ── Legacy mode: use prune_and_eval_kimi_gqa.py ──
+    CMD=(
+        python3 scripts/prune_and_eval_kimi_gqa.py
+        --model_path "${MODEL_PATH}"
+        --scores_path "${SCORES_PATH}"
+        --task "${TASK}"
+        --output_dir "${OUTPUT_DIR}"
+        --prune_ratio "${PRUNE_RATIO}"
+        --inter_method "${INTER_METHOD}"
+        --intra_method "${INTRA_METHOD}"
+        --intra_expert_metric "${INTRA_EXPERT_METRIC}"
+        --smooth_fn "${SMOOTH_FN}"
+        --align_inter "${ALIGN_INTER}"
+        --min_per_expert "${MIN_PER_EXPERT}"
+        --num_samples "${NUM_SAMPLES}"
+        --start_idx "${START_IDX}"
+        --batch_size "${BATCH_SIZE}"
+        --max_new_tokens "${MAX_NEW_TOKENS}"
+    )
+
+    if [[ "${MODALITY_AWARE}" == "1" ]]; then
+        CMD+=(--modality_aware)
+    fi
+
+    if [[ -n "${SUBSET_SEED}" ]]; then
+        CMD+=(--subset_seed "${SUBSET_SEED}")
+    fi
+
+    if [[ -n "${THRESHOLDS_PATH}" ]]; then
+        CMD+=(--thresholds_path "${THRESHOLDS_PATH}")
+    fi
+
+    CMD+=("${EXTRA_ARGS[@]}")
 fi
-
-if [[ -n "${SUBSET_SEED}" ]]; then
-    CMD+=(--subset_seed "${SUBSET_SEED}")
-fi
-
-if [[ -n "${THRESHOLDS_PATH}" ]]; then
-    CMD+=(--thresholds_path "${THRESHOLDS_PATH}")
-fi
-
-CMD+=("${EXTRA_ARGS[@]}")
 
 mkdir -p "${OUTPUT_DIR}"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
@@ -152,6 +201,7 @@ echo "Smooth fn   : ${SMOOTH_FN}"
 echo "Eval output : ${OUTPUT_DIR}"
 echo "Samples     : ${NUM_SAMPLES} (0=full)"
 echo "GPU         : ${CUDA_VISIBLE_DEVICES}"
+echo "Use lmms    : ${USE_LMMS_EVAL}"
 echo "Log file    : ${LOG_FILE}"
 echo ""
 "${CMD[@]}"
