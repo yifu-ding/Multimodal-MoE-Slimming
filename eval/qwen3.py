@@ -520,5 +520,46 @@ class Qwen3_VL(lmms):
 
 
 if __name__ == "__main__":
-    # import ipdb; ipdb.set_trace()
-    cli_evaluate()
+    # Instantiate Qwen3_VL directly (bypasses model registry) and delegate to
+    # lmms-eval's simple_evaluate so all task metrics are computed natively.
+    import argparse as _ap
+    from lmms_eval.utils import simple_parse_args_string
+    from lmms_eval import evaluator
+
+    _parser = _ap.ArgumentParser(description="Qwen3_VL prune + eval via lmms-eval")
+    _parser.add_argument("--model", type=str, default="qwen3_vl")
+    _parser.add_argument("--model_args", type=str, default="")
+    _parser.add_argument("--tasks", type=str, required=True)
+    _parser.add_argument("--batch_size", type=int, default=1)
+    _parser.add_argument("--limit", type=int, default=None)
+    _parser.add_argument("--offset", type=int, default=0)
+    _parser.add_argument("--output_path", type=str, default=None)
+    _parser.add_argument("--log_samples", action="store_true")
+    _parser.add_argument("--gen_kwargs", type=str, default=None)
+    _parser.add_argument("--verbosity", type=str, default="INFO")
+    _args = _parser.parse_args()
+
+    _model_kwargs = simple_parse_args_string(_args.model_args)
+    _pretrained = _model_kwargs.pop("pretrained", "Qwen/Qwen3-VL-30B-A3B-Instruct")
+    _model_obj = Qwen3_VL(pretrained=_pretrained, batch_size=_args.batch_size, **_model_kwargs)
+
+    from lmms_eval.evaluator import EvaluationTracker
+    _tracker = EvaluationTracker(output_path=_args.output_path) if _args.output_path else None
+
+    _results, _samples = evaluator.simple_evaluate(
+        model=_model_obj,
+        tasks=_args.tasks.split(","),
+        batch_size=_args.batch_size,
+        limit=_args.limit,
+        offset=_args.offset,
+        log_samples=_args.log_samples,
+        evaluation_tracker=_tracker,
+        gen_kwargs=_args.gen_kwargs,
+        verbosity=_args.verbosity,
+    )
+
+    if _results is not None:
+        from lmms_eval.utils import make_table
+        print(make_table(_results))
+        if "groups" in _results:
+            print(make_table(_results, "groups"))

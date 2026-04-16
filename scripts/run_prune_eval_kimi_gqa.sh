@@ -15,7 +15,7 @@ set -euo pipefail
 source scripts/select_least_used_gpu.sh # 自动选择显存使用量最少的 gpu
 
 PREFIX="${PREFIX:-$(pwd)}"
-export PYTHONPATH="${PREFIX}"
+export PYTHONPATH="${PREFIX}:${PREFIX}/lmms-eval"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
@@ -71,7 +71,7 @@ MIN_PER_EXPERT="${MIN_PER_EXPERT:-256}"
 # THRESHOLDS_PATH="${THRESHOLDS_PATH:-${PREFIX}/storage/prune/thresholds/kimi_gqa/thresholds.pt}"
 THRESHOLDS_PATH="${THRESHOLDS_PATH:-}" 
 
-NUM_SAMPLES="${NUM_SAMPLES:-1000}"  # 样本数
+NUM_SAMPLES="${NUM_SAMPLES:-100}"  # 样本数
 START_IDX="${START_IDX:-0}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"
@@ -139,14 +139,15 @@ if [[ "${USE_LMMS_EVAL}" == "1" ]]; then
 
     CMD=(
         python3 "${EVAL_SCRIPT}"
-        --model "${MODEL_KEY}"
         --model_args "${MODEL_ARGS}"
         --tasks "${TASK}"
         --batch_size "${BATCH_SIZE}"
         --log_samples
         --output_path "${OUTPUT_DIR}"
-        ${LIMIT_ARG}
     )
+    if [[ "${NUM_SAMPLES}" -gt 0 ]]; then
+        CMD+=(--limit "${NUM_SAMPLES}")
+    fi
     CMD+=("${EXTRA_ARGS[@]}")
 else
     # ── Legacy mode: use prune_and_eval_kimi_gqa.py ──
