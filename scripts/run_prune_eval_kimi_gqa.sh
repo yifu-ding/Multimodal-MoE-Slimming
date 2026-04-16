@@ -22,9 +22,9 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 SCORES_PATH="${SCORES_PATH:-}"
 # -textvqa gqa chartqa mmstar mmbench mmvet mme realworldqa coco2017cap mvbench egoschema videomme longvideobench video_mmmu}"
-TASK="${TASK:-textvqa}"
+TASK="${TASK:-gqa}"
 
-PRUNE_RATIO="${PRUNE_RATIO:-0.0}"
+PRUNE_RATIO="${PRUNE_RATIO:-0.5}"
 # INTER_METHOD options (inter-layer planner):
 #   uniform
 #   u_shaped
@@ -71,7 +71,7 @@ MIN_PER_EXPERT="${MIN_PER_EXPERT:-256}"
 # THRESHOLDS_PATH="${THRESHOLDS_PATH:-${PREFIX}/storage/prune/thresholds/kimi_gqa/thresholds.pt}"
 THRESHOLDS_PATH="${THRESHOLDS_PATH:-}" 
 
-NUM_SAMPLES="${NUM_SAMPLES:-0}"  # 样本数, 0 表示全量
+NUM_SAMPLES="${NUM_SAMPLES:-1000}"  # 样本数, 0 表示全量
 START_IDX="${START_IDX:-0}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"
@@ -186,7 +186,7 @@ else
 fi
 
 mkdir -p "${OUTPUT_DIR}"
-TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 LOG_FILE="${OUTPUT_DIR}/stdout_${TIMESTAMP}.log"
 {
 echo "Model       : ${MODEL_PATH}"

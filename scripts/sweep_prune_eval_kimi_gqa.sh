@@ -75,8 +75,7 @@ SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act 3proj_act d
 
 SWEEP_TS="${SWEEP_TS:-$(date +%m%d%H%M)}"
 MODEL_NAME="${MODEL_NAME:-kimi}"
-SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-gqa-rell2-score-041611"
-export OUTPUT_DIR=$SWEEP_BASE
+SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-gqa-rell2-fill1-0415-231450"
 
 SUMMARY_FILE="${SUMMARY_FILE:-${SWEEP_BASE}/summary.md}"
 SWEEP_LOG_DIR="${SWEEP_LOG_DIR:-${SWEEP_BASE}/logs}"
@@ -136,7 +135,9 @@ for INTER_METHOD in ${SWEEP_INTER_METHODS}; do
           INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC}" \
           SMOOTH_FN="${SMOOTH_FN}" \
           PREFIX="${PREFIX}" \
-          bash "${SCRIPT_DIR}/run_prune_eval_kimi_gqa.sh" 2>&1 | tee "${RUN_LOG}"
+          OUTPUT_DIR="${SWEEP_LOG_DIR}" \
+          TIMESTAMP="${TAG}" \
+          bash "${SCRIPT_DIR}/run_prune_eval_kimi_gqa.sh" # 2>&1 | tee "${RUN_LOG}"
         EXIT_CODE=${PIPESTATUS[0]}
         set -e
 

@@ -39,6 +39,8 @@ DATASETS: Dict[str, DatasetSpec] = {
         "LongVideoBench (val)",
     ),
     "video-mmmu": DatasetSpec("lmms-lab/VideoMMMU", "Video-MMMU"),
+    "gqa": DatasetSpec("lmms-lab/GQA", "GQA"),
+    # "m4-instruct": DatasetSpec("lmms-lab/M4-Instruct-Data", "M4-Instruct"), # too big for calibration, using steaming
 }
 
 
