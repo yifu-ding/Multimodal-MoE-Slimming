@@ -15,8 +15,8 @@ for p in (REPO_PARENT, REPO_ROOT):
 import torch
 from tqdm.auto import tqdm
 
-from observations.common import infer_model_family, resolve_model_name_or_path
 from src.base.load_dataset import load_eval_task
+from src.base.models import auto_load_model
 from src.generate_mask import generate_masks as build_masks_pipeline
 from src.prune import apply_structural_pruning
 
@@ -27,24 +27,6 @@ def _normalize_answer(s: str) -> str:
 
 def move_to_device(inputs: dict, device) -> dict:
     return {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
-
-
-def auto_load_model(model_path: str, device_map="auto", attn_implementation="flash_attention_2"):
-    """Auto-dispatch model loading based on model family."""
-    family = infer_model_family(model_path)
-    resolved = resolve_model_name_or_path(model_path)
-    print(f"[Run] Detected model family: {family}")
-    if family == "kimi":
-        from models.kimi import load_model
-        return load_model(resolved, device_map=device_map, attn_implementation=attn_implementation)
-    elif family == "qwen3":
-        from models.qwen3 import load_model
-        return load_model(resolved, device_map=device_map, attn_implementation=attn_implementation)
-    elif family == "internvl":
-        from models.internvl import load_model
-        return load_model(resolved, device_map=device_map, attn_implementation=attn_implementation)
-    else:
-        raise ValueError(f"Unsupported model family: {family}")
 
 
 def build_parser() -> argparse.ArgumentParser:

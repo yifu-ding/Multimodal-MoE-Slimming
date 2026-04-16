@@ -1,7 +1,7 @@
 import time
 from typing import List, Optional, Tuple, Union, Dict
-from models.kimi import load_model
-import models.kimi
+from src.base.models.kimi import load_model
+import src.base.models.kimi as models_kimi
 from loguru import logger as eval_logger
 from tqdm import tqdm
 import torch

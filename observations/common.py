@@ -30,9 +30,9 @@ from tasks.dataset_paths import require_dataset_dir
 from tasks.gqa import gqa_transform, load_gqa_instruction_rows, resolve_gqa_subdir
 from utils import create_mask_after_last_token, create_mask_after_token
 
-from models.internvl import load_model as load_internvl_model
-from models.kimi import load_model as load_kimi_model
-from models.qwen3 import load_model as load_qwen3_model
+from src.base.models.internvl import load_model as load_internvl_model
+from src.base.models.kimi import load_model as load_kimi_model
+from src.base.models.qwen3 import load_model as load_qwen3_model
 
 
 MODALITIES = ("text", "visual")

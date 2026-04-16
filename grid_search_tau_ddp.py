@@ -1,14 +1,14 @@
 import argparse
-from models.kimi import load_model as load_kimi_model
-from models.qwen3 import load_model as load_qwen3_model
+from src.base.models.kimi import load_model as load_kimi_model
+from src.base.models.qwen3 import load_model as load_qwen3_model
 from datasets import load_dataset, concatenate_datasets
 from tasks.gqa import gqa_transform
 from tasks.coco import coco_transform
 from tasks.dataset_paths import require_dataset_dir
 from tasks.video_mmmu import videommmu_transform
 import torch.nn.functional as F
-import models.kimi as kimi_model
-import models.qwen3 as qwen3_model
+import src.base.models.kimi as kimi_model
+import src.base.models.qwen3 as qwen3_model
 import pickle
 import numpy as np
 import os

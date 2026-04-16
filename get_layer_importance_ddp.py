@@ -13,8 +13,8 @@ from utils import create_mask_after_token, create_mask_after_last_token
 from loguru import logger
 from accelerate import Accelerator
 from torch.utils.data import DataLoader, Subset
-from models.kimi import load_model as load_kimi_model
-from models.qwen3 import load_model as load_qwen_model
+from src.base.models.kimi import load_model as load_kimi_model
+from src.base.models.qwen3 import load_model as load_qwen_model
 
 
 @torch.no_grad()

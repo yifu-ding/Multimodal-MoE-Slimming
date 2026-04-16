@@ -25,8 +25,8 @@ from accelerate import Accelerator, DistributedType
 from loguru import logger as eval_logger
 from PIL import Image
 from tqdm import tqdm
-from models.qwen3 import load_model
-import models.qwen3
+from src.base.models.qwen3 import load_model
+import src.base.models.qwen3 as models_qwen3
 from transformers import AutoConfig
 
 from lmms_eval import utils
