@@ -29,18 +29,19 @@ cd "${REPO_ROOT}"
 PREFIX="${PREFIX:-${REPO_ROOT}}"
 export PYTHONPATH="${PREFIX}"
 
-export SCORES_PATH="./storage/prune/scores/kimi-vl-a3b_gqa-rell2-041513.pt"
+export SCORES_PATH="/home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_gqa-rell2-041513.pt"
 
+USE_LMMS_EVAL=${USE_LMMS_EVAL:-1}
 # ── Task grid ──────────────────────────────────────────────────────────────────
 # All 14 tasks requested; override via SWEEP_TASKS env var.
-SWEEP_TASKS="${SWEEP_TASKS:-textvqa gqa chartqa mmstar mmbench mmvet mme realworldqa coco2017cap mvbench egoschema videomme longvideobench video_mmmu}"
+SWEEP_TASKS="${SWEEP_TASKS:-textvqa chartqa mmstar mmbench mmvet mme realworldqa coco2017cap mvbench egoschema videomme longvideobench video_mmmu}"
 
 # ── Setting grids (same defaults as sweep_prune_eval_kimi_gqa.sh) ──────────────
 SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-loss_smooth_2 uniform uniform_coverage}"
 SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-uniform second_attr_coverage second_attr_fillzero_coverage}"
-SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-0 1}"
+SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-0}"
 SMOOTH_FN="${SMOOTH_FN:-sqrt}"
-SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act down_second_order_exact 3proj_second_order}"
+SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act 3proj_act down_second_order_exact 3proj_second_order}"
 # 3proj_second_order down_saliency 3proj_saliency 3proj_grad wg
 
 # ── Output paths ───────────────────────────────────────────────────────────────
@@ -70,6 +71,7 @@ if [[ ! -f "${SUMMARY_FILE}" ]]; then
     echo "Auto-generated table; new runs are **appended** (this file is not overwritten)."
     echo ""
     echo "Output directory: \`${SWEEP_BASE}\`"
+    echo "Use lmms eval: ${USE_LMMS_EVAL}"
     echo ""
   } >> "${SUMMARY_FILE}"
 fi
@@ -119,6 +121,7 @@ for TASK in ${SWEEP_TASKS}; do
             SMOOTH_FN="${SMOOTH_FN}" \
             MODEL_NAME="${MODEL_NAME}" \
             PREFIX="${PREFIX}" \
+            USE_LMMS_EVAL="${USE_LMMS_EVAL}" \
             bash "${SCRIPT_DIR}/run_prune_eval_kimi_gqa.sh" 2>&1 | tee "${RUN_LOG}"
           EXIT_CODE=${PIPESTATUS[0]}
           set -e
