@@ -32,9 +32,14 @@ from src.calibration.representation_distill.common import ensure_dir
 from src.calibration.representation_distill.runtime.forward_from_hidden import forward_from_hidden
 
 
-def _save_score_artifacts(output_dir: str, accumulator, args) -> None:
+def _save_score_artifacts(output_path: str, accumulator, args) -> None:
     snapshot = copy.deepcopy(accumulator)
-    scores_path = os.path.join(output_dir, "scores.pt")
+    if output_path.endswith(".pt"):
+        scores_path = output_path
+        ensure_dir(os.path.dirname(os.path.abspath(scores_path)))
+    else:
+        ensure_dir(output_path)
+        scores_path = os.path.join(output_path, "scores.pt")
     payload = snapshot.build_scores_payload(args)
     payload["metadata"]["source"] = args.source
     payload["metadata"]["input_hidden_path"] = args.input_hidden_path
@@ -201,7 +206,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         help="Path to either a synthetic hidden payload or a teacher hidden cache payload.",
     )
-    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument(
+        "--output_path",
+        type=str,
+        required=True,
+        help="Output directory (writes scores.pt inside) or a path ending in .pt to write the payload file directly.",
+    )
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--ema", type=float, default=0.9)
     parser.add_argument("--loss_fn", type=str, default="rel_l2", choices=["l2", "rel_l2", "cosine"])
@@ -261,8 +271,7 @@ def main() -> None:
     from observations.common import discover_layer_structure, load_model_bundle
     from src.calibration.score_accumulator import ScoreAccumulator
 
-    ensure_dir(args.output_dir)
-    out_path = os.path.join(args.output_dir, "scores.pt")
+    out_path = args.output_path
     if os.path.exists(out_path) and not args.force:
         print(
             f"[representation_distill] Found existing scores at {out_path}. "
@@ -357,7 +366,7 @@ def main() -> None:
         input_hidden_path=args.input_hidden_path,
         start_layer=start_layer,
     )
-    _save_score_artifacts(args.output_dir, accumulator, payload_args)
+    _save_score_artifacts(args.output_path, accumulator, payload_args)
 
 
 if __name__ == "__main__":

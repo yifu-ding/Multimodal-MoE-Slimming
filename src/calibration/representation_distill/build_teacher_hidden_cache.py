@@ -55,7 +55,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Build a multimodal teacher hidden cache for representation-level calibration distillation."
     )
     parser.add_argument("--model_name_or_path", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--output_path", type=str, required=True)
     parser.add_argument("--teacher_layer", type=int, default=0)
     parser.add_argument("--compressed_length", type=int, default=64)
     parser.add_argument(
@@ -109,7 +109,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_arg_parser().parse_args()
     seed_everything(args.seed)
-    ensure_dir(args.output_dir)
     modality_lengths = None
 
     from observations.common import load_model_bundle, resolve_model_name_or_path
@@ -129,10 +128,9 @@ def main() -> None:
             f"Invalid teacher_layer={args.teacher_layer}; model has {num_layers} decoder layers."
         )
 
-    teacher_pool_dir = os.path.join(args.output_dir, "teacher_pool")
     selected_datasets = list(dict.fromkeys(args.teacher_datasets))
     samples = dump_original_data(
-        output_dir=teacher_pool_dir,
+        output_dir=os.path.dirname(args.output_path),
         samples_per_dataset=args.samples_per_dataset,
         seed=args.seed,
         shuffle_seed=args.shuffle_seed,
@@ -225,7 +223,7 @@ def main() -> None:
             "created_at": utc_now_iso(),
         },
     }
-    out_path = os.path.join(args.output_dir, "teacher_hidden_cache.pt")
+    out_path = args.output_path
     torch.save(payload, out_path)
     print(f"[representation_distill] Saved teacher cache to {out_path}")
 

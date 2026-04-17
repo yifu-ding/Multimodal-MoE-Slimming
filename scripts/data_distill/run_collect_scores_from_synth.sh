@@ -8,7 +8,7 @@ export HF_HOME="${HF_HOME:-/home/data/dyf/hf_cache}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 HIDDEN_PAYLOAD_PATH="${HIDDEN_PAYLOAD_PATH:-${PREFIX}/storage/data_distill/synthetic/synthetic_hidden.pt}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/data_distill/scores}"
+OUTPUT_PATH="${OUTPUT_PATH:-$(dirname "${HIDDEN_PAYLOAD_PATH}")/scores.pt}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 EMA="${EMA:-0.9}"
 LOSS_FN="${LOSS_FN:-rel_l2}"
@@ -21,7 +21,7 @@ CMD=(
     python -m src.calibration.representation_distill.collect_channel_scores_from_synth
     --model_name_or_path "${MODEL_PATH}"
     --input_hidden_path "${HIDDEN_PAYLOAD_PATH}"
-    --output_dir "${OUTPUT_DIR}"
+    --output_path "${OUTPUT_PATH}"
     --batch_size "${BATCH_SIZE}"
     --ema "${EMA}"
     --loss_fn "${LOSS_FN}"
@@ -33,7 +33,7 @@ CMD+=("${EXTRA_ARGS[@]}")
 
 echo "Model          : ${MODEL_PATH}"
 echo "Hidden payload : ${HIDDEN_PAYLOAD_PATH}"
-echo "Output         : ${OUTPUT_DIR}"
+echo "Output         : ${OUTPUT_PATH}"
 echo "Batch size     : ${BATCH_SIZE}"
 echo "HF_HOME        : ${HF_HOME}"
 echo "CMD: ${CMD[*]}"

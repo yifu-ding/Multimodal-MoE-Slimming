@@ -5,6 +5,7 @@ __pycache__
 *.pt
 *.log
 *.DS_Store
+lmms-eval/
 .vscode
 *.idea
 storage/

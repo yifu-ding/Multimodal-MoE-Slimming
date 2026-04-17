@@ -7,7 +7,7 @@ export PYTHONPATH="${PREFIX}"
 export HF_HOME="${HF_HOME:-/home/data/dyf/hf_cache}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/data_distill/teacher_cache-attn_weighted}"
+OUTPUT_PATH="${OUTPUT_PATH:-${PREFIX}/storage/data_distill/attn_weighted-$(date +%m%d%H%M%S)}/teacher_cache.pt"
 TEACHER_LAYER="${TEACHER_LAYER:-0}"
 COMPRESSED_LENGTH="${COMPRESSED_LENGTH:-256}"
 SAMPLES_PER_DATASET="${SAMPLES_PER_DATASET:-2048}"
@@ -37,7 +37,7 @@ EXTRA_ARGS=("$@")
 CMD=(
     python -m src.calibration.representation_distill.build_teacher_hidden_cache
     --model_name_or_path "${MODEL_PATH}"
-    --output_dir "${OUTPUT_DIR}"
+    --output_path "${OUTPUT_PATH}"
     --teacher_layer "${TEACHER_LAYER}"
     --compressed_length "${COMPRESSED_LENGTH}"
     --samples_per_dataset "${SAMPLES_PER_DATASET}"
@@ -57,7 +57,7 @@ CMD=(
 CMD+=("${EXTRA_ARGS[@]}")
 
 echo "Model              : ${MODEL_PATH}"
-echo "Output             : ${OUTPUT_DIR}"
+echo "Output             : ${OUTPUT_PATH}"
 echo "Teacher layer      : ${TEACHER_LAYER}"
 echo "Compressed length  : ${COMPRESSED_LENGTH}"
 echo "Samples/dataset    : ${SAMPLES_PER_DATASET}"

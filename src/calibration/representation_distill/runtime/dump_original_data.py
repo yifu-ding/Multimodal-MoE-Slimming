@@ -233,7 +233,6 @@ def dump_original_data(
     shuffle_seed: int | None = 1234,
     selected_datasets: Sequence[str] | None = None,
 ) -> List[Dict[str, Any]]:
-    ensure_dir(output_dir)
     index_dir = os.path.join(output_dir, "sample_indices")
     ensure_dir(index_dir)
 
