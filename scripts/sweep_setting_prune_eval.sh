@@ -35,7 +35,9 @@ cd "${REPO_ROOT}"
 PREFIX="${PREFIX:-${REPO_ROOT}}"
 export PYTHONPATH="${PREFIX}"
 
-export SCORES_PATH="/home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_gqa-rell2-fill1-0415-231450.pt"
+# export SCORES_PATH="/home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_gqa-rell2-fill1-0415-231450.pt"
+export SCORES_PATH="/home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_coco-rell2-fill1-0416-115847/scores.pt"
+
 # Default grids (edit or override via env)
 # INTRA_METHOD = --intra_method (intra-layer planner); see run_prune_eval_kimi_gqa.sh
 SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform_coverage loss_smooth_2 uniform loss_coverage loss_smooth_1}" # 
@@ -51,7 +53,7 @@ SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform_coverage loss_smooth_2 unifo
 #   second_attr_fillzero
 #   second_attr_fillzero_coverage
 SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-uniform second_attr_coverage second_attr_fillzero_coverage usage usage_coverage first_attr_coverage first_attr_fillzero_coverage}"  # usage usage_coverage router router_coverage attr_coverage 
-SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-1}"  # 0, 1
+SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-0}"  # 0, 1
 # Not swept; passed through to run_prune_eval_kimi_gqa.sh (see SMOOTH_FN there).
 SMOOTH_FN="${SMOOTH_FN:-sqrt}"
 # Default: full list from run_prune_eval_kimi_gqa.sh (long run); override to shorten.
@@ -75,7 +77,7 @@ SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act 3proj_act d
 
 SWEEP_TS="${SWEEP_TS:-$(date +%m%d%H%M)}"
 MODEL_NAME="${MODEL_NAME:-kimi}"
-SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-gqa-rell2-fill1-0415-231450"
+SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-coco-rell2-fill1-0416-115847"
 
 SUMMARY_FILE="${SUMMARY_FILE:-${SWEEP_BASE}/summary.md}"
 SWEEP_LOG_DIR="${SWEEP_LOG_DIR:-${SWEEP_BASE}/logs}"
@@ -89,7 +91,7 @@ SWEEP_ID="$(date +%Y%m%d_%H%M%S)"
 
 if [[ ! -f "${SUMMARY_FILE}" ]]; then
   {
-    echo "# Prune + GQA eval sweep summary"
+    echo "# Prune + Eval sweep summary"
     echo ""
     echo "Auto-generated table; new runs are **appended** (this file is not overwritten)."
     echo ""
@@ -135,7 +137,7 @@ for INTER_METHOD in ${SWEEP_INTER_METHODS}; do
           INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC}" \
           SMOOTH_FN="${SMOOTH_FN}" \
           PREFIX="${PREFIX}" \
-          OUTPUT_DIR="${SWEEP_LOG_DIR}" \
+          OUTPUT_DIR="${SWEEP_BASE}" \
           TIMESTAMP="${TAG}" \
           bash "${SCRIPT_DIR}/run_prune_eval_kimi_gqa.sh" # 2>&1 | tee "${RUN_LOG}"
         EXIT_CODE=${PIPESTATUS[0]}
