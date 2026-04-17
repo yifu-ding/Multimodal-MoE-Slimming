@@ -187,7 +187,8 @@ fi
 
 mkdir -p "${OUTPUT_DIR}"
 TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
-LOG_FILE="${OUTPUT_DIR}/stdout_${TIMESTAMP}.log"
+LOG_FILE="${LOG_FILE:-${OUTPUT_DIR}/stdout_${TIMESTAMP}.log}"
+mkdir -p "$(dirname "${LOG_FILE}")"
 {
 echo "Model       : ${MODEL_PATH}"
 echo "Task        : ${TASK}"

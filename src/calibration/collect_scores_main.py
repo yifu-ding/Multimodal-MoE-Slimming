@@ -125,7 +125,7 @@ def run_collection(args) -> None:
         f"{sum(layer_to_num_experts.values())} experts total."
     )
 
-    dataset = build_dataset(args.dataset, bundle.family)
+    dataset = build_dataset(args.dataset, bundle.family, max_rows=args.num_samples)
     pool = list(range(args.start_idx, len(dataset)))
     if args.subset_seed is not None and args.subset_seed >= 0:
         rng = random.Random(args.subset_seed)

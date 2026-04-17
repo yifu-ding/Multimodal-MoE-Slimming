@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--task", type=str, default="gqa",
                    help="Evaluation task: gqa, coco, video_mmmu")
     p.add_argument("--thresholds_path", type=str, default=None)
-    p.add_argument("--output_dir", type=str, required=True)
+    p.add_argument("--output_dir", type=str, default=None)
     p.add_argument("--prune_ratio", type=float, default=0.30)
     p.add_argument("--inter_method", type=str, default="uniform")
     p.add_argument("--intra_method", type=str, default="uniform")
@@ -75,7 +75,8 @@ def _build_messages_batch(questions, media_type):
 
 def main() -> None:
     args = build_parser().parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
+    if args.output_dir:
+        os.makedirs(args.output_dir, exist_ok=True)
 
     # ── Mask generation ──
     print(f"[Run] Loading scores from: {args.scores_path}")
@@ -236,15 +237,16 @@ def main() -> None:
         if k not in ("metric_name", "metric_value", "detail"):
             summary[k] = v
 
-    summary_path = os.path.join(args.output_dir, "summary.json")
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
-    print(f"[Run] Summary saved: {summary_path}")
+    if args.output_dir:
+        summary_path = os.path.join(args.output_dir, "summary.json")
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"[Run] Summary saved: {summary_path}")
 
-    preds_path = os.path.join(args.output_dir, "predictions.json")
-    with open(preds_path, "w") as f:
-        json.dump(predictions, f, indent=2, ensure_ascii=False)
-    print(f"[Run] Predictions saved: {preds_path}")
+        preds_path = os.path.join(args.output_dir, "predictions.json")
+        with open(preds_path, "w") as f:
+            json.dump(predictions, f, indent=2, ensure_ascii=False)
+        print(f"[Run] Predictions saved: {preds_path}")
 
 
 if __name__ == "__main__":

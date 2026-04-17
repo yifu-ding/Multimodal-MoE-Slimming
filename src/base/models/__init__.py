@@ -1,8 +1,7 @@
-from observations.common import infer_model_family, resolve_model_name_or_path
-
-
 def auto_load_model(model_path: str, device_map="auto", attn_implementation="flash_attention_2"):
     """Auto-dispatch model loading based on model family."""
+    from observations.common import infer_model_family, resolve_model_name_or_path
+
     family = infer_model_family(model_path)
     resolved = resolve_model_name_or_path(model_path)
     print(f"[Run] Detected model family: {family}")

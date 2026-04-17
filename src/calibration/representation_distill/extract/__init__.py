@@ -1,0 +1,2 @@
+"""Teacher hidden-cache extraction."""
+

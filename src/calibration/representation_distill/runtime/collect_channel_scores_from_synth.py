@@ -1,0 +1,292 @@
+import argparse
+import copy
+import os
+import sys
+from types import SimpleNamespace
+
+SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "..", ".."))
+REPO_PARENT = os.path.dirname(REPO_ROOT)
+for _p in (REPO_PARENT, REPO_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
+
+from src.calibration.collector import collect_scores_from_moe_module
+from src.calibration.helpers.hooks import register_copied_block_hooks, register_teacher_block_hook
+from src.calibration.helpers.patches import (
+    patch_grad_enabled_kimi_moe_infer,
+    patch_qwen_fused_experts_forward,
+)
+from src.calibration.helpers.utils import (
+    clear_block_saved_tensors,
+    enable_input_grads,
+    move_to_device_dtype,
+    unwrap_output,
+)
+from src.calibration.helpers.helpers import compute_block_loss
+from src.calibration.representation_distill.common import ensure_dir
+from src.calibration.representation_distill.runtime.forward_from_hidden import forward_from_hidden
+
+
+def _save_score_artifacts(output_dir: str, accumulator, args) -> None:
+    snapshot = copy.deepcopy(accumulator)
+    scores_path = os.path.join(output_dir, "scores.pt")
+    payload = snapshot.build_scores_payload(args)
+    payload["metadata"]["source"] = "synthetic_hidden"
+    payload["metadata"]["synthetic_calib_path"] = args.synthetic_calib_path
+    payload["metadata"]["synthetic_start_layer"] = args.start_layer
+    payload["metadata"]["representation_distillation"] = True
+    torch.save(payload, scores_path)
+    print(f"[representation_distill] Saved scores: {scores_path}")
+
+
+def _set_synthetic_modality_masks(cnt_block, attn_mask: torch.Tensor, bundle) -> None:
+    token_count = attn_mask.numel()
+    device = attn_mask.device
+    cnt_block.mlp.moe_text_mask = torch.zeros(token_count, 1, dtype=torch.bool, device=device)
+    cnt_block.mlp.moe_media_mask = torch.zeros(token_count, 1, dtype=torch.bool, device=device)
+    if bundle.family == "qwen3":
+        cnt_block.mlp.moe_padding_mask = (~attn_mask.to(torch.bool)).view(-1, 1)
+
+
+def _synthetic_block_forward(
+    *,
+    bundle,
+    cnt_block,
+    layer_idx: int,
+    dataloader,
+    saliency_ema: float,
+    start_layer: int,
+    loss_fn: str,
+    dtype: torch.dtype,
+) -> float:
+    model = bundle.model
+    model.eval()
+    teacher_block = (
+        bundle.model.model.language_model.layers[layer_idx]
+        if bundle.family == "qwen3"
+        else bundle.model.language_model.model.layers[layer_idx]
+    )
+    block_device = next(teacher_block.parameters()).device
+    cnt_block = cnt_block.to(device=block_device, dtype=dtype)
+    cnt_block.eval()
+
+    teacher_state = {}
+    teacher_handle = register_teacher_block_hook(teacher_block, teacher_state)
+    copied_handles = register_copied_block_hooks(cnt_block)
+    moe_infer_state = patch_grad_enabled_kimi_moe_infer(cnt_block, layer_idx=layer_idx)
+    fused_expert_state = patch_qwen_fused_experts_forward(cnt_block)
+
+    total_loss = 0.0
+    total_batches = 0
+    device_type = block_device.type
+    autocast_enabled = device_type == "cuda" and dtype in (torch.float16, torch.bfloat16)
+
+    try:
+        iterator = tqdm(dataloader, desc=f"SynthCal L{layer_idx}", leave=False)
+        for hidden_batch, attn_batch in iterator:
+            teacher_state.clear()
+            hidden_batch = hidden_batch.to(device=block_device, dtype=dtype)
+            attn_batch = attn_batch.to(device=block_device)
+            _set_synthetic_modality_masks(cnt_block, attn_batch, bundle)
+
+            with torch.no_grad():
+                forward_from_hidden(
+                    bundle=bundle,
+                    hidden_states=hidden_batch,
+                    attention_mask=attn_batch,
+                    start_layer=start_layer,
+                    end_layer=layer_idx,
+                    apply_final_norm=False,
+                )
+
+            if not teacher_state:
+                raise RuntimeError(f"Teacher block hook did not capture layer {layer_idx} inputs.")
+
+            in_args = enable_input_grads(move_to_device_dtype(teacher_state["in_args"], block_device, dtype))
+            in_kwargs = enable_input_grads(move_to_device_dtype(teacher_state["in_kwargs"], block_device, dtype))
+            teacher_target = move_to_device_dtype(unwrap_output(teacher_state["output"]), block_device, dtype)
+
+            cnt_block.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=device_type, dtype=dtype, enabled=autocast_enabled):
+                pred = unwrap_output(cnt_block(*in_args, **in_kwargs))
+                loss_sum, rel_l2_inv_base_mean = compute_block_loss(
+                    pred=pred,
+                    teacher_target=teacher_target,
+                    attn_mask=attn_batch,
+                    loss_fn=loss_fn,
+                )
+
+            mask_flat = attn_batch.float().view(-1)
+            energy = pred.float().view(-1, pred.size(-1)).pow(2).sum(dim=-1)
+            energy_loss = (energy * mask_flat).sum()
+            energy_loss.backward()
+
+            total_loss += float(loss_sum.detach().float().item())
+            total_batches += 1
+
+            collect_scores_from_moe_module(
+                cnt_block,
+                ema=saliency_ema,
+                _kwargs={
+                    "use_mlp_scores": True,
+                    "use_attn_scores": False,
+                    "attn_mask": attn_batch,
+                    "block_in_args": in_args,
+                    "block_in_kwargs": in_kwargs,
+                    "teacher_target": teacher_target,
+                    "loss_fn": loss_fn,
+                    "loss_reduction": "sum",
+                    "loss_eps": 1e-6,
+                    "rel_l2_inv_base_mean": rel_l2_inv_base_mean,
+                    "second_order_mode": "exact",
+                    "fill_zero_for_unrouted": False,
+                    "autocast_dtype": dtype,
+                    "autocast_device_type": device_type,
+                    "layer_idx": layer_idx,
+                    "debug_batch_idx": total_batches - 1,
+                    "moe_text_mask": torch.zeros_like(attn_batch, dtype=torch.bool),
+                    "moe_media_mask": torch.zeros_like(attn_batch, dtype=torch.bool),
+                },
+            )
+            clear_block_saved_tensors(cnt_block)
+    finally:
+        teacher_handle.remove()
+        for handle in copied_handles:
+            handle.remove()
+        if moe_infer_state is not None:
+            mlp, original_moe_infer = moe_infer_state
+            mlp.moe_infer = original_moe_infer
+        if fused_expert_state is not None:
+            experts, original_forward = fused_expert_state
+            experts.forward = original_forward
+        clear_block_saved_tensors(cnt_block)
+
+    return total_loss / max(total_batches, 1)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Collect channel scores by continuing forward from distilled synthetic hidden states."
+    )
+    parser.add_argument("--model_name_or_path", type=str, required=True)
+    parser.add_argument("--synthetic_calib_path", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--ema", type=float, default=0.9)
+    parser.add_argument("--loss_fn", type=str, default="rel_l2", choices=["l2", "rel_l2", "cosine"])
+    parser.add_argument("--layers", type=int, nargs="+", default=None)
+    parser.add_argument("--device_map", type=str, default=None)
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default="flash_attention_2",
+        choices=["flash_attention_2", "sdpa", "eager"],
+    )
+    parser.add_argument("--force", "-f", action="store_true")
+    return parser
+
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
+    from observations.common import discover_layer_structure, load_model_bundle
+    from src.calibration.score_accumulator import ScoreAccumulator
+
+    ensure_dir(args.output_dir)
+    out_path = os.path.join(args.output_dir, "scores.pt")
+    if os.path.exists(out_path) and not args.force:
+        print(
+            f"[representation_distill] Found existing scores at {out_path}. "
+            "Pass --force or -f to overwrite."
+        )
+        return
+
+    device_map = args.device_map
+    if device_map is None:
+        device_map = "cuda:0" if torch.cuda.is_available() else "auto"
+
+    bundle = load_model_bundle(
+        args.model_name_or_path,
+        device_map=device_map,
+        attn_implementation=args.attn_implementation,
+    )
+    synth_payload = torch.load(args.synthetic_calib_path, map_location="cpu")
+    hidden = synth_payload["synthetic_hidden"]
+    attention_mask = synth_payload.get("attention_mask")
+    if attention_mask is None:
+        attention_mask = torch.ones(hidden.shape[:2], dtype=torch.long)
+
+    teacher_meta = synth_payload["metadata"]["teacher_metadata"]
+    start_layer = int(teacher_meta["teacher_layer"]) + 1
+
+    layer_to_num_experts, layer_to_num_channels = discover_layer_structure(bundle)
+    accumulator = ScoreAccumulator(layer_to_num_experts, layer_to_num_channels)
+    available_layers = [layer for layer in accumulator.layers if layer >= start_layer]
+    if args.layers is not None:
+        requested = []
+        for layer_idx in args.layers:
+            if layer_idx not in available_layers:
+                raise ValueError(
+                    f"Requested layer {layer_idx} cannot be reached from synthetic hidden start_layer={start_layer}. "
+                    f"Available layers: {available_layers}"
+                )
+            if layer_idx not in requested:
+                requested.append(layer_idx)
+        target_layers = requested
+    else:
+        target_layers = available_layers
+    if not target_layers:
+        raise ValueError(
+            f"No target MoE layers remain after synthetic start_layer={start_layer}."
+        )
+
+    loader = DataLoader(
+        TensorDataset(hidden, attention_mask),
+        batch_size=args.batch_size,
+        shuffle=False,
+    )
+
+    for layer_idx in target_layers:
+        teacher_block = (
+            bundle.model.model.language_model.layers[layer_idx]
+            if bundle.family == "qwen3"
+            else bundle.model.language_model.model.layers[layer_idx]
+        )
+        cnt_block = copy.deepcopy(teacher_block)
+        block_dtype = next(teacher_block.parameters()).dtype
+        layer_loss = _synthetic_block_forward(
+            bundle=bundle,
+            cnt_block=cnt_block,
+            layer_idx=layer_idx,
+            dataloader=loader,
+            saliency_ema=args.ema,
+            start_layer=start_layer,
+            loss_fn=args.loss_fn,
+            dtype=block_dtype,
+        )
+        accumulator.layerwise_loss[layer_idx] = float(layer_loss)
+        accumulator.absorb_layer_scores(layer_idx, cnt_block)
+        print(f"[representation_distill] Layer {layer_idx}: layer loss={layer_loss:.6f}")
+
+    payload_args = SimpleNamespace(
+        loss_fn=args.loss_fn,
+        num_samples=int(hidden.shape[0]),
+        batch_size=args.batch_size,
+        dataset="synthetic_hidden",
+        start_idx=0,
+        model_name_or_path=args.model_name_or_path,
+        subset_seed=None,
+        ema=args.ema,
+        fill_zero_for_unrouted=False,
+        synthetic_calib_path=args.synthetic_calib_path,
+        start_layer=start_layer,
+    )
+    _save_score_artifacts(args.output_dir, accumulator, payload_args)
+
+
+if __name__ == "__main__":
+    main()
