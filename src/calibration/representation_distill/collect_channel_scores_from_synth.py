@@ -36,19 +36,32 @@ def _save_score_artifacts(output_dir: str, accumulator, args) -> None:
     snapshot = copy.deepcopy(accumulator)
     scores_path = os.path.join(output_dir, "scores.pt")
     payload = snapshot.build_scores_payload(args)
-    payload["metadata"]["source"] = "synthetic_hidden"
-    payload["metadata"]["synthetic_calib_path"] = args.synthetic_calib_path
-    payload["metadata"]["synthetic_start_layer"] = args.start_layer
+    payload["metadata"]["source"] = args.source
+    payload["metadata"]["input_hidden_path"] = args.input_hidden_path
+    if args.source == "synthetic_hidden":
+        payload["metadata"]["synthetic_start_layer"] = args.start_layer
+    if args.source == "teacher_cache":
+        payload["metadata"]["teacher_cache_start_layer"] = args.start_layer
     payload["metadata"]["representation_distillation"] = True
     torch.save(payload, scores_path)
     print(f"[representation_distill] Saved scores: {scores_path}")
 
 
-def _set_synthetic_modality_masks(cnt_block, attn_mask: torch.Tensor, bundle) -> None:
-    token_count = attn_mask.numel()
+def _set_synthetic_modality_masks(
+    cnt_block,
+    attn_mask: torch.Tensor,
+    modality_labels: torch.Tensor | None,
+    bundle,
+) -> None:
     device = attn_mask.device
-    cnt_block.mlp.moe_text_mask = torch.zeros(token_count, 1, dtype=torch.bool, device=device)
-    cnt_block.mlp.moe_media_mask = torch.zeros(token_count, 1, dtype=torch.bool, device=device)
+    if modality_labels is not None:
+        flat_labels = modality_labels.view(-1).to(device)
+        cnt_block.mlp.moe_text_mask = (flat_labels == 0).unsqueeze(-1)   # (B*S, 1)
+        cnt_block.mlp.moe_media_mask = (flat_labels >= 1).unsqueeze(-1)  # (B*S, 1)
+    else:
+        token_count = attn_mask.numel()
+        cnt_block.mlp.moe_text_mask = torch.zeros(token_count, 1, dtype=torch.bool, device=device)
+        cnt_block.mlp.moe_media_mask = torch.zeros(token_count, 1, dtype=torch.bool, device=device)
     if bundle.family == "qwen3":
         cnt_block.mlp.moe_padding_mask = (~attn_mask.to(torch.bool)).view(-1, 1)
 
@@ -63,6 +76,7 @@ def _synthetic_block_forward(
     start_layer: int,
     loss_fn: str,
     dtype: torch.dtype,
+    has_modality_labels: bool = False,
 ) -> float:
     model = bundle.model
     model.eval()
@@ -87,12 +101,19 @@ def _synthetic_block_forward(
     autocast_enabled = device_type == "cuda" and dtype in (torch.float16, torch.bfloat16)
 
     try:
-        iterator = tqdm(dataloader, desc=f"SynthCal L{layer_idx}", leave=False)
-        for hidden_batch, attn_batch in iterator:
+        iterator = tqdm(dataloader, desc=f"HiddenCal L{layer_idx}", leave=False)
+        for batch_tuple in iterator:
+            if has_modality_labels:
+                hidden_batch, attn_batch, modality_batch = batch_tuple
+            else:
+                hidden_batch, attn_batch = batch_tuple
+                modality_batch = None
             teacher_state.clear()
             hidden_batch = hidden_batch.to(device=block_device, dtype=dtype)
             attn_batch = attn_batch.to(device=block_device)
-            _set_synthetic_modality_masks(cnt_block, attn_batch, bundle)
+            if modality_batch is not None:
+                modality_batch = modality_batch.to(device=block_device)
+            _set_synthetic_modality_masks(cnt_block, attn_batch, modality_batch, bundle)
 
             with torch.no_grad():
                 forward_from_hidden(
@@ -149,8 +170,8 @@ def _synthetic_block_forward(
                     "autocast_device_type": device_type,
                     "layer_idx": layer_idx,
                     "debug_batch_idx": total_batches - 1,
-                    "moe_text_mask": torch.zeros_like(attn_batch, dtype=torch.bool),
-                    "moe_media_mask": torch.zeros_like(attn_batch, dtype=torch.bool),
+                    "moe_text_mask": (modality_batch == 0).to(torch.bool) if modality_batch is not None else torch.zeros_like(attn_batch, dtype=torch.bool),
+                    "moe_media_mask": (modality_batch >= 1).to(torch.bool) if modality_batch is not None else torch.zeros_like(attn_batch, dtype=torch.bool),
                 },
             )
             clear_block_saved_tensors(cnt_block)
@@ -171,10 +192,15 @@ def _synthetic_block_forward(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Collect channel scores by continuing forward from distilled synthetic hidden states."
+        description="Collect channel scores by continuing forward from synthetic hidden states or teacher hidden cache."
     )
     parser.add_argument("--model_name_or_path", type=str, required=True)
-    parser.add_argument("--synthetic_calib_path", type=str, required=True)
+    parser.add_argument(
+        "--input_hidden_path",
+        type=str,
+        required=True,
+        help="Path to either a synthetic hidden payload or a teacher hidden cache payload.",
+    )
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--ema", type=float, default=0.9)
@@ -189,6 +215,45 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--force", "-f", action="store_true")
     return parser
+
+
+def _load_hidden_payload(input_hidden_path: str):
+    payload = torch.load(input_hidden_path, map_location="cpu")
+    metadata = payload.get("metadata", {})
+
+    modality_labels = payload.get("modality_labels", None)
+
+    if "synthetic_hidden" in payload:
+        hidden = payload["synthetic_hidden"]
+        attention_mask = payload.get("attention_mask")
+        if attention_mask is None:
+            attention_mask = torch.ones(hidden.shape[:2], dtype=torch.long)
+        teacher_meta = metadata["teacher_metadata"]
+        return {
+            "hidden": hidden,
+            "attention_mask": attention_mask,
+            "modality_labels": modality_labels,
+            "teacher_meta": teacher_meta,
+            "start_layer": int(teacher_meta["teacher_layer"]) + 1,
+            "source": "synthetic_hidden",
+        }
+
+    if "teacher_cache" in payload:
+        hidden = payload["teacher_cache"]
+        attention_mask = torch.ones(hidden.shape[:2], dtype=torch.long)
+        return {
+            "hidden": hidden,
+            "attention_mask": attention_mask,
+            "modality_labels": modality_labels,
+            "teacher_meta": metadata,
+            "start_layer": int(metadata["teacher_layer"]) + 1,
+            "source": "teacher_cache",
+        }
+
+    raise ValueError(
+        f"Unsupported hidden payload at {input_hidden_path}. "
+        "Expected keys `synthetic_hidden` or `teacher_cache`."
+    )
 
 
 def main() -> None:
@@ -214,14 +279,11 @@ def main() -> None:
         device_map=device_map,
         attn_implementation=args.attn_implementation,
     )
-    synth_payload = torch.load(args.synthetic_calib_path, map_location="cpu")
-    hidden = synth_payload["synthetic_hidden"]
-    attention_mask = synth_payload.get("attention_mask")
-    if attention_mask is None:
-        attention_mask = torch.ones(hidden.shape[:2], dtype=torch.long)
-
-    teacher_meta = synth_payload["metadata"]["teacher_metadata"]
-    start_layer = int(teacher_meta["teacher_layer"]) + 1
+    hidden_payload = _load_hidden_payload(args.input_hidden_path)
+    hidden = hidden_payload["hidden"]
+    attention_mask = hidden_payload["attention_mask"]
+    modality_labels = hidden_payload.get("modality_labels", None)
+    start_layer = hidden_payload["start_layer"]
 
     layer_to_num_experts, layer_to_num_channels = discover_layer_structure(bundle)
     accumulator = ScoreAccumulator(layer_to_num_experts, layer_to_num_channels)
@@ -231,7 +293,7 @@ def main() -> None:
         for layer_idx in args.layers:
             if layer_idx not in available_layers:
                 raise ValueError(
-                    f"Requested layer {layer_idx} cannot be reached from synthetic hidden start_layer={start_layer}. "
+                    f"Requested layer {layer_idx} cannot be reached from hidden start_layer={start_layer}. "
                     f"Available layers: {available_layers}"
                 )
             if layer_idx not in requested:
@@ -241,14 +303,22 @@ def main() -> None:
         target_layers = available_layers
     if not target_layers:
         raise ValueError(
-            f"No target MoE layers remain after synthetic start_layer={start_layer}."
+            f"No target MoE layers remain after hidden start_layer={start_layer}."
         )
 
-    loader = DataLoader(
-        TensorDataset(hidden, attention_mask),
-        batch_size=args.batch_size,
-        shuffle=False,
-    )
+    has_modality_labels = modality_labels is not None
+    if has_modality_labels:
+        loader = DataLoader(
+            TensorDataset(hidden, attention_mask, modality_labels),
+            batch_size=args.batch_size,
+            shuffle=False,
+        )
+    else:
+        loader = DataLoader(
+            TensorDataset(hidden, attention_mask),
+            batch_size=args.batch_size,
+            shuffle=False,
+        )
 
     for layer_idx in target_layers:
         teacher_block = (
@@ -267,6 +337,7 @@ def main() -> None:
             start_layer=start_layer,
             loss_fn=args.loss_fn,
             dtype=block_dtype,
+            has_modality_labels=has_modality_labels,
         )
         accumulator.layerwise_loss[layer_idx] = float(layer_loss)
         accumulator.absorb_layer_scores(layer_idx, cnt_block)
@@ -276,13 +347,14 @@ def main() -> None:
         loss_fn=args.loss_fn,
         num_samples=int(hidden.shape[0]),
         batch_size=args.batch_size,
-        dataset="synthetic_hidden",
+        dataset=hidden_payload["source"],
         start_idx=0,
         model_name_or_path=args.model_name_or_path,
         subset_seed=None,
         ema=args.ema,
         fill_zero_for_unrouted=False,
-        synthetic_calib_path=args.synthetic_calib_path,
+        source=hidden_payload["source"],
+        input_hidden_path=args.input_hidden_path,
         start_layer=start_layer,
     )
     _save_score_artifacts(args.output_dir, accumulator, payload_args)

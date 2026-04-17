@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+source scripts/select_least_used_gpu.sh # 自动选择显存使用量最少的 gpu
 
 PREFIX="${PREFIX:-$(pwd)}"
 export PYTHONPATH="${PREFIX}"
@@ -23,7 +24,7 @@ LOG_INTERVAL="${LOG_INTERVAL:-100}"
 EXTRA_ARGS=("$@")
 
 CMD=(
-    python -m src.calibration.representation_distill.distill.distill_synthetic_hidden
+    python -m src.calibration.representation_distill.distill_synthetic_hidden
     --teacher_cache_path "${TEACHER_CACHE_PATH}"
     --output_path "${OUTPUT_PATH}"
     --synthetic_size "${SYNTHETIC_SIZE}"

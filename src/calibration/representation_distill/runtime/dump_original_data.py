@@ -16,7 +16,7 @@ from tasks.video_mmmu import (
     process_media,
 )
 
-from ..common import dump_json, ensure_dir
+from src.calibration.representation_distill.common import dump_json, ensure_dir
 
 
 SUPPORTED_DATASETS = ("gqa", "coco", "m4_instruct", "video_mmmu")
@@ -223,7 +223,7 @@ def _load_dataset_rows(dataset_name: str, samples_per_dataset: int) -> Sequence[
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
-def build_teacher_pool(
+def dump_original_data(
     *,
     output_dir: str,
     samples_per_dataset: int = 1024,
@@ -231,6 +231,7 @@ def build_teacher_pool(
     num_video_frames: int = 8,
     video_max_long_side: int = 480,
     shuffle_seed: int | None = 1234,
+    selected_datasets: Sequence[str] | None = None,
 ) -> List[Dict[str, Any]]:
     ensure_dir(output_dir)
     index_dir = os.path.join(output_dir, "sample_indices")
@@ -239,8 +240,17 @@ def build_teacher_pool(
     combined_samples: List[Dict[str, Any]] = []
     dataset_summary: Dict[str, Any] = {}
     dataset_ids = {name: idx for idx, name in enumerate(SUPPORTED_DATASETS)}
+    dataset_names = list(selected_datasets) if selected_datasets is not None else list(SUPPORTED_DATASETS)
 
-    for dataset_offset, dataset_name in enumerate(SUPPORTED_DATASETS):
+    invalid = [name for name in dataset_names if name not in dataset_ids]
+    if invalid:
+        raise ValueError(
+            f"Unsupported datasets: {invalid}. Supported datasets: {list(SUPPORTED_DATASETS)}"
+        )
+    if not dataset_names:
+        raise ValueError("selected_datasets must contain at least one dataset name.")
+
+    for dataset_offset, dataset_name in enumerate(dataset_names):
         rows = _load_dataset_rows(dataset_name, samples_per_dataset=samples_per_dataset)
         indices = _sample_indices(
             total_size=len(rows),
@@ -287,14 +297,19 @@ def build_teacher_pool(
         rng.shuffle(combined_samples)
 
     dump_json(
-        os.path.join(output_dir, "teacher_pool_manifest.json"),
+        os.path.join(output_dir, "dump_original_data.json"),
         {
             "samples_per_dataset": samples_per_dataset,
             "total_samples": len(combined_samples),
             "shuffle_seed": shuffle_seed,
             "num_video_frames": num_video_frames,
             "video_max_long_side": video_max_long_side,
+            "selected_datasets": dataset_names,
             "datasets": dataset_summary,
         },
     )
     return combined_samples
+
+
+# Backward compatibility for existing call sites.
+build_teacher_pool = dump_original_data
