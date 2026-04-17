@@ -2,7 +2,7 @@ from pathlib import Path
 import re
 from datetime import datetime
 
-base = Path("/home/dyf/code/distill/MoDES/results/prune_eval_p50/sweep_tasks-kimi-gqa-rell2-fill1-0415-231450")
+base = Path("/home/dyf/code/distill/MoDES/results/prune_eval_p50/sweep_tasks-kimi-coco-rell2-fill1-0416-115847/logs")
 log_root = base / "logs"
 out_path = base / "summary-new.md"
 
