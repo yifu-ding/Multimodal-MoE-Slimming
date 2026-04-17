@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
+source scripts/select_least_used_gpu.sh # 自动选择显存使用量最少的 gpu
 
 PREFIX="${PREFIX:-$(pwd)}"
 export PYTHONPATH="${PREFIX}"
 export HF_HOME="${HF_HOME:-/home/data/dyf/hf_cache}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
-SYNTHETIC_CALIB_PATH="${SYNTHETIC_CALIB_PATH:-${PREFIX}/storage/data_distill/synthetic/synthetic_calib.pt}"
+HIDDEN_PAYLOAD_PATH="${HIDDEN_PAYLOAD_PATH:-${PREFIX}/storage/data_distill/synthetic/synthetic_hidden.pt}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/data_distill/scores}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 EMA="${EMA:-0.9}"
@@ -17,9 +18,9 @@ DEVICE_MAP="${DEVICE_MAP:-cuda:0}"
 EXTRA_ARGS=("$@")
 
 CMD=(
-    python -m src.calibration.representation_distill.runtime.collect_channel_scores_from_synth
+    python -m src.calibration.representation_distill.collect_channel_scores_from_synth
     --model_name_or_path "${MODEL_PATH}"
-    --synthetic_calib_path "${SYNTHETIC_CALIB_PATH}"
+    --input_hidden_path "${HIDDEN_PAYLOAD_PATH}"
     --output_dir "${OUTPUT_DIR}"
     --batch_size "${BATCH_SIZE}"
     --ema "${EMA}"
@@ -31,7 +32,7 @@ CMD=(
 CMD+=("${EXTRA_ARGS[@]}")
 
 echo "Model          : ${MODEL_PATH}"
-echo "Synthetic calib: ${SYNTHETIC_CALIB_PATH}"
+echo "Hidden payload : ${HIDDEN_PAYLOAD_PATH}"
 echo "Output         : ${OUTPUT_DIR}"
 echo "Batch size     : ${BATCH_SIZE}"
 echo "HF_HOME        : ${HF_HOME}"

@@ -33,7 +33,7 @@ PRUNE_RATIO="${PRUNE_RATIO:-0.5}"
 #   loss_smooth_<N>      # e.g. loss_smooth_1, loss_smooth_2
 #   loss_coverage
 #   raw_loss_coverage
-INTER_METHOD="${INTER_METHOD:-loss_smooth_2}"
+INTER_METHOD="${INTER_METHOD:-uniform}"
 # 在 loss_smooth 的时候会读取，可选：sqrt, cbrt, fourth_root, log, ...
 SMOOTH_FN="${SMOOTH_FN:-sqrt}"
 # INTRA_METHOD options (intra-layer planner, 基于 EXPERT_METRICS):
@@ -63,7 +63,7 @@ INTRA_METHOD="${INTRA_METHOD:-second_attr_coverage}"
 # 这个 metric 没有双模态版本
 #   weight
 MODALITY_AWARE="${MODALITY_AWARE:-1}"  # 是否开启双模态
-INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-gateup_act}"
+INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-3proj_second_order}"
 
 ALIGN_INTER="${ALIGN_INTER:-0}"
 MIN_PER_EXPERT="${MIN_PER_EXPERT:-256}"
