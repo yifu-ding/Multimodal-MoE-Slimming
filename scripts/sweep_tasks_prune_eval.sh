@@ -29,9 +29,10 @@ cd "${REPO_ROOT}"
 PREFIX="${PREFIX:-${REPO_ROOT}}"
 export PYTHONPATH="${PREFIX}"
 
-export SCORES_PATH="/home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_gqa-rell2-041513.pt"
+# export SCORES_PATH="/home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_gqa-rell2-041513.pt"
+export SCORES_PATH="/home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_coco-rell2-fill1-0416-115847.pt"
 
-USE_LMMS_EVAL=${USE_LMMS_EVAL:-1}
+USE_LMMS_EVAL=${USE_LMMS_EVAL:-0}
 # ── Task grid ──────────────────────────────────────────────────────────────────
 # All 14 tasks requested; override via SWEEP_TASKS env var.
 SWEEP_TASKS="${SWEEP_TASKS:-textvqa chartqa mmstar mmbench mmvet mme realworldqa coco2017cap mvbench egoschema videomme longvideobench video_mmmu}"
@@ -48,7 +49,7 @@ SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act 3proj_act d
 # Timestamp is fixed at script start so all runs share the same directory.
 SWEEP_TS="${SWEEP_TS:-$(date +%m%d%H%M)}"
 MODEL_NAME="${MODEL_NAME:-kimi}"
-SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-gqa-rell2-041513-${SWEEP_TS}"
+SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-coco-rell2-041513-${SWEEP_TS}"
 export OUTPUT_DIR="${SWEEP_BASE}"
 
 SUMMARY_FILE="${SUMMARY_FILE:-${SWEEP_BASE}/summary.md}"
