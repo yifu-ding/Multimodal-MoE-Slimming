@@ -97,6 +97,23 @@ def loop_1_score_collector(
             gate_in_grad=gate_in_grad,
             gate_grad=gate_grad,
         )
+
+        # Some runtime paths (for example synthetic-hidden calibration smoke tests)
+        # may not populate every backward hook tensor even when the routed expert
+        # has valid forward activations. Treat missing grads as zero contribution
+        # instead of failing the whole collection run.
+        if down_in_grad is None and down_input is not None:
+            down_in_grad = torch.zeros_like(down_input)
+        if down_out_grad is None and down_output is not None:
+            down_out_grad = torch.zeros_like(down_output)
+        if up_in_grad is None and up_input is not None:
+            up_in_grad = torch.zeros_like(up_input)
+        if up_out_grad is None and up_output is not None:
+            up_out_grad = torch.zeros_like(up_output)
+        if gate_in_grad is None and gate_input is not None:
+            gate_in_grad = torch.zeros_like(gate_input)
+        if gate_grad is None and gate_output is not None:
+            gate_grad = torch.zeros_like(gate_output)
         
         metrics = {}
         if "weight" in CHANNEL_METRICS:
@@ -136,6 +153,12 @@ def loop_1_score_collector(
                 gate_input=gate_input,
             )
         if "3proj_saliency" in CHANNEL_METRICS:
+            if down_grad_ch is None:
+                down_grad_ch = channel_rms(down_in_grad).to(torch.float32)
+            if up_out_grad_ch is None:
+                up_out_grad_ch = channel_rms(up_out_grad).to(torch.float32)
+            if gate_grad_ch is None:
+                gate_grad_ch = channel_rms(gate_grad).to(torch.float32)
             metrics["3proj_saliency"] = compute_3proj_saliency_I(
                 down_input, down_grad_ch, up_output, up_out_grad_ch, gate_output, gate_grad_ch
             )

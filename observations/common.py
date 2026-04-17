@@ -236,7 +236,7 @@ def normalize_dataset_name(dataset_name: str) -> str:
     return aliases.get(normalized, normalized)
 
 
-def build_dataset(dataset_name: str, model_family: str):
+def build_dataset(dataset_name: str, model_family: str, **kwargs):
     dataset_name = normalize_dataset_name(dataset_name)
     if dataset_name == "gqa":
         return TransformedListDataset(load_gqa_instruction_rows(), gqa_transform)
@@ -266,7 +266,8 @@ def build_dataset(dataset_name: str, model_family: str):
     if dataset_name == "m4_instruct":
         from tasks.m4_instruct import load_m4_instruct_rows, m4_instruct_transform
 
-        return TransformedListDataset(load_m4_instruct_rows(), m4_instruct_transform)
+        max_rows = kwargs.get("max_rows", 1024)
+        return TransformedListDataset(load_m4_instruct_rows(max_rows=max_rows), m4_instruct_transform)
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
@@ -374,7 +375,7 @@ def prepare_inputs(
             batched_messages[i] + batch["model_input_full_answer"][i]
         )
         batched_messages[i] = batched_messages[i] + bundle.model_config["eos_token"]
-        if dataset_name == "video_mmmu":
+        if dataset_name in ("video_mmmu", "m4_instruct"):
             tmp.extend(batch["model_input_visual"][i])
             frame_num = batch["model_input_frames"][i]
             media_end_idx = batched_messages[i].find(
@@ -386,7 +387,7 @@ def prepare_inputs(
                 * (frame_num - 1)
                 + batched_messages[i][media_end_idx:]
             )
-    if dataset_name == "video_mmmu":
+    if dataset_name in ("video_mmmu", "m4_instruct"):
         batch["model_input_visual"] = tmp
     inputs = processor(
         images=batch["model_input_visual"],
