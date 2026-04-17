@@ -39,3 +39,6 @@ echo "HF_HOME        : ${HF_HOME}"
 echo "CMD: ${CMD[*]}"
 echo ""
 "${CMD[@]}"
+
+
+# /home/dyf/code/distill/MoDES/storage/data_distill/teacher_cache-attn_weighted/distilled/distilled_hidden.pt

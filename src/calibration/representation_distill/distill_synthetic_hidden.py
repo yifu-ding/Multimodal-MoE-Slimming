@@ -90,6 +90,18 @@ def _cov_loss(teacher_flat: torch.Tensor, synth_flat: torch.Tensor) -> torch.Ten
     return (t_cov - s_cov).pow(2).mean()
 
 
+def _mean_var_loss(
+    teacher_flat: torch.Tensor,
+    synth_flat: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-channel 1st/2nd moment MSE, returned as (mean_loss, var_loss)."""
+    t_mean = teacher_flat.mean(dim=0)
+    s_mean = synth_flat.mean(dim=0)
+    t_var = teacher_flat.var(dim=0, unbiased=False)
+    s_var = synth_flat.var(dim=0, unbiased=False)
+    return (t_mean - s_mean).pow(2).mean(), (t_var - s_var).pow(2).mean()
+
+
 def _diversity_loss(synthetic_flat: torch.Tensor) -> torch.Tensor:
     """Mean pairwise cosine similarity (lower = more diverse)."""
     if synthetic_flat.shape[0] <= 1:
@@ -102,75 +114,102 @@ def _diversity_loss(synthetic_flat: torch.Tensor) -> torch.Tensor:
     return off_diag.mean()
 
 
-def _compute_stat_losses(
-    teacher_batch: torch.Tensor,
-    synthetic_hidden: torch.Tensor,
-) -> dict[str, torch.Tensor]:
-    """Legacy moment-matching losses (kept as auxiliaries)."""
-    teacher_flat = teacher_batch.reshape(-1, teacher_batch.shape[-1])
-    synth_flat = synthetic_hidden.reshape(-1, synthetic_hidden.shape[-1])
+def _iter_modality_groups(
+    teacher_flat: torch.Tensor,
+    synth_flat: torch.Tensor,
+    teacher_labels_flat: torch.Tensor | None,
+    synth_labels_flat: torch.Tensor | None,
+    min_tokens: int = 2,
+):
+    """Yield (modality_id, teacher_sub, synth_sub) token groups.
 
-    teacher_mean = teacher_flat.mean(dim=0)
-    synth_mean = synth_flat.mean(dim=0)
-    teacher_var = teacher_flat.var(dim=0, unbiased=False)
-    synth_var = synth_flat.var(dim=0, unbiased=False)
+    When labels are missing, yields a single ``(None, teacher_flat, synth_flat)`` pair
+    so that the caller can fall back to a global (pooled) computation.
+    """
+    if teacher_labels_flat is None or synth_labels_flat is None:
+        yield None, teacher_flat, synth_flat
+        return
 
-    return {
-        "mean": (teacher_mean - synth_mean).pow(2).mean(),
-        "var": (teacher_var - synth_var).pow(2).mean(),
-    }
+    for mod_id in (MODALITY_TEXT, MODALITY_IMAGE, MODALITY_VIDEO):
+        t_mask = teacher_labels_flat == mod_id
+        s_mask = synth_labels_flat == mod_id
+        if int(t_mask.sum()) < min_tokens or int(s_mask.sum()) < min_tokens:
+            continue
+        yield mod_id, teacher_flat[t_mask], synth_flat[s_mask]
 
 
-def _compute_distribution_losses(
+def _compute_losses(
     teacher_batch: torch.Tensor,
     synthetic_hidden: torch.Tensor,
     teacher_labels: torch.Tensor | None,
     synth_labels: torch.Tensor | None,
     mmd_subsample: int,
 ) -> dict[str, torch.Tensor]:
-    """Distribution-aware losses: MMD (modality-conditioned), covariance, diversity."""
+    """All distillation losses, computed per-modality and averaged across modalities.
+
+    Groups covered (MMD / cov / mean / var): text, image, video — whichever are
+    present in *both* teacher and synthetic batches. When no modality labels are
+    available the computation gracefully degrades to a single pooled pair.
+    ``div`` stays pooled on the synthetic tokens (regardless of modality) because
+    diversity should be measured on the whole synthetic set.
+    """
     teacher_flat = teacher_batch.reshape(-1, teacher_batch.shape[-1])
     synth_flat = synthetic_hidden.reshape(-1, synthetic_hidden.shape[-1])
 
-    losses: dict[str, torch.Tensor] = {}
+    teacher_labels_flat = teacher_labels.reshape(-1) if teacher_labels is not None else None
+    synth_labels_flat = synth_labels.reshape(-1) if synth_labels is not None else None
 
-    # --- Modality-conditioned MMD ---
-    if teacher_labels is not None and synth_labels is not None:
-        teacher_labels_flat = teacher_labels.reshape(-1) if teacher_labels is not None else None
-        synth_labels_flat = synth_labels.reshape(-1) if synth_labels is not None else None
+    device = teacher_flat.device
+    zero = torch.tensor(0.0, device=device)
 
-        mmd_total = torch.tensor(0.0, device=teacher_flat.device)
-        n_modalities = 0
-        for mod_id in (MODALITY_TEXT, MODALITY_IMAGE, MODALITY_VIDEO):
-            t_mask = teacher_labels_flat == mod_id
-            s_mask = synth_labels_flat == mod_id
-            if t_mask.any() and s_mask.any():
-                t_sub = _subsample_flat(teacher_flat[t_mask], mmd_subsample)
-                s_sub = _subsample_flat(synth_flat[s_mask], mmd_subsample)
-                mmd_total = mmd_total + _mmd_rbf(t_sub, s_sub)
-                n_modalities += 1
-        if n_modalities > 0:
-            losses["mmd"] = mmd_total / n_modalities
-        else:
-            losses["mmd"] = _mmd_rbf(
-                _subsample_flat(teacher_flat, mmd_subsample),
-                _subsample_flat(synth_flat, mmd_subsample),
-            )
-    else:
-        losses["mmd"] = _mmd_rbf(
-            _subsample_flat(teacher_flat, mmd_subsample),
-            _subsample_flat(synth_flat, mmd_subsample),
-        )
+    mmd_sum = zero.clone()
+    cov_sum = zero.clone()
+    mean_sum = zero.clone()
+    var_sum = zero.clone()
+    n_groups = 0
+    per_group: dict[str, torch.Tensor] = {}
 
-    # --- Covariance matching ---
-    losses["cov"] = _cov_loss(
-        _subsample_flat(teacher_flat, mmd_subsample),
-        synth_flat,
-    )
+    for mod_id, t_group, s_group in _iter_modality_groups(
+        teacher_flat, synth_flat, teacher_labels_flat, synth_labels_flat
+    ):
+        t_sub = _subsample_flat(t_group, mmd_subsample)
+        s_sub = _subsample_flat(s_group, mmd_subsample)
 
-    # --- Diversity regularization ---
-    losses["div"] = _diversity_loss(_subsample_flat(synth_flat, mmd_subsample))
+        mmd_g = _mmd_rbf(t_sub, s_sub)
+        cov_g = _cov_loss(t_sub, s_sub)
+        mean_g, var_g = _mean_var_loss(t_group, s_group)
 
+        mmd_sum = mmd_sum + mmd_g
+        cov_sum = cov_sum + cov_g
+        mean_sum = mean_sum + mean_g
+        var_sum = var_sum + var_g
+        n_groups += 1
+
+        if mod_id is not None:
+            per_group[f"mmd/mod{int(mod_id)}"] = mmd_g.detach()
+            per_group[f"cov/mod{int(mod_id)}"] = cov_g.detach()
+            per_group[f"mean/mod{int(mod_id)}"] = mean_g.detach()
+            per_group[f"var/mod{int(mod_id)}"] = var_g.detach()
+
+    if n_groups == 0:
+        # Nothing matched (e.g. degenerate batch); fall back to pooled.
+        t_sub = _subsample_flat(teacher_flat, mmd_subsample)
+        s_sub = _subsample_flat(synth_flat, mmd_subsample)
+        mmd_sum = _mmd_rbf(t_sub, s_sub)
+        cov_sum = _cov_loss(t_sub, s_sub)
+        mean_sum, var_sum = _mean_var_loss(teacher_flat, synth_flat)
+        n_groups = 1
+
+    div_loss = _diversity_loss(_subsample_flat(synth_flat, mmd_subsample))
+
+    losses: dict[str, torch.Tensor] = {
+        "mmd": mmd_sum / n_groups,
+        "cov": cov_sum / n_groups,
+        "mean": mean_sum / n_groups,
+        "var": var_sum / n_groups,
+        "div": div_loss,
+    }
+    losses.update(per_group)
     return losses
 
 
@@ -190,7 +229,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--init_std", type=float, default=1e-3)
+    parser.add_argument("--init_std", type=float, default=0.0)
     # Distribution-aware loss weights
     parser.add_argument("--lambda_mmd", type=float, default=1.0)
     parser.add_argument("--lambda_cov", type=float, default=0.1)
@@ -198,6 +237,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # Legacy moment-matching (auxiliary, reduced weight)
     parser.add_argument("--lambda_mean", type=float, default=0.5)
     parser.add_argument("--lambda_var", type=float, default=0.5)
+    # Diversity warmup: avoids ``div`` dominating the first few hundred steps
+    # when the other losses are still on the order of 1e-5.
+    parser.add_argument("--div_warmup_steps", type=int, default=200,
+                        help="Linearly ramp ``lambda_div`` from 0 to its full value over "
+                             "this many steps. Set to 0 to disable.")
     # MMD efficiency
     parser.add_argument("--mmd_subsample", type=int, default=2048,
                         help="Max tokens for kernel matrix computation.")
@@ -225,7 +269,7 @@ def main() -> None:
     # Initialize from random teacher samples
     init_indices = torch.randint(0, teacher_cache.shape[0], (args.synthetic_size,), device=device)
     synthetic_hidden = torch.nn.Parameter(teacher_cache.index_select(0, init_indices).clone())
-    if args.init_std > 0:
+    if args.init_std > 0:  # default: 0
         synthetic_hidden.data.add_(torch.randn_like(synthetic_hidden) * args.init_std)
 
     # Modality labels: frozen, copied from init samples
@@ -237,28 +281,32 @@ def main() -> None:
     history = []
     final_losses = None
 
-    for step in trange(args.train_steps, desc="Distilling synthetic hidden", leave=False):
+    for step in trange(args.train_steps, desc="Distilling compact hidden", leave=False):
         # Sample a teacher batch
         batch_indices = torch.randint(0, teacher_cache.shape[0], (args.teacher_batch_size,), device=device)
         teacher_batch = teacher_cache.index_select(0, batch_indices)
         teacher_batch_labels = teacher_labels.index_select(0, batch_indices) if teacher_labels is not None else None
 
-        # Moment-matching losses (auxiliary)
-        stat_losses = _compute_stat_losses(teacher_batch, synthetic_hidden)
-
-        # Distribution-aware losses (primary)
-        dist_losses = _compute_distribution_losses(
+        # Per-modality grouped losses (primary). ``div`` stays pooled.
+        losses = _compute_losses(
             teacher_batch, synthetic_hidden,
             teacher_batch_labels, synth_labels,
             mmd_subsample=args.mmd_subsample,
         )
 
+        # Warmup: ramp ``div`` in linearly so it doesn't dominate at step 0 when
+        # the other losses are tiny (and would be destabilized by a large cosine
+        # regularizer). After ``div_warmup_steps`` the full weight is applied.
+        div_scale = 1.0
+        if args.div_warmup_steps > 0:
+            div_scale = min(1.0, (step + 1) / float(args.div_warmup_steps))
+
         total_loss = (
-            args.lambda_mmd * dist_losses["mmd"]
-            + args.lambda_cov * dist_losses["cov"]
-            + args.lambda_div * dist_losses["div"]
-            + args.lambda_mean * stat_losses["mean"]
-            + args.lambda_var * stat_losses["var"]
+            args.lambda_mmd * losses["mmd"]
+            + args.lambda_cov * losses["cov"]
+            + args.lambda_mean * losses["mean"]
+            + args.lambda_var * losses["var"]
+            + div_scale * args.lambda_div * losses["div"]
         )
 
         optimizer.zero_grad(set_to_none=True)
@@ -267,12 +315,16 @@ def main() -> None:
 
         final_losses = {
             "total": float(total_loss.detach().cpu().item()),
-            "mmd": float(dist_losses["mmd"].detach().cpu().item()),
-            "cov": float(dist_losses["cov"].detach().cpu().item()),
-            "div": float(dist_losses["div"].detach().cpu().item()),
-            "mean": float(stat_losses["mean"].detach().cpu().item()),
-            "var": float(stat_losses["var"].detach().cpu().item()),
+            "mmd": float(losses["mmd"].detach().cpu().item()),
+            "cov": float(losses["cov"].detach().cpu().item()),
+            "div": float(losses["div"].detach().cpu().item()),
+            "mean": float(losses["mean"].detach().cpu().item()),
+            "var": float(losses["var"].detach().cpu().item()),
+            "div_scale": div_scale,
         }
+        for k, v in losses.items():
+            if "/" in k:
+                final_losses[k] = float(v.detach().cpu().item())
         if step % args.log_interval == 0 or step == args.train_steps - 1:
             history.append({"step": step, **final_losses})
 
@@ -304,6 +356,8 @@ def main() -> None:
                 "mean": args.lambda_mean,
                 "var": args.lambda_var,
             },
+            "modality_grouped_losses": ["mmd", "cov", "mean", "var"],
+            "div_warmup_steps": args.div_warmup_steps,
             "mmd_subsample": args.mmd_subsample,
             "final_losses": final_losses,
             "history": history,

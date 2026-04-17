@@ -6,20 +6,6 @@ PREFIX="${PREFIX:-$(pwd)}"
 export PYTHONPATH="${PREFIX}"
 export HF_HOME="${HF_HOME:-/home/data/dyf/hf_cache}"
 
-MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
-OUTPUT_PATH="${OUTPUT_PATH:-${PREFIX}/storage/data_distill/attn_weighted-$(date +%m%d%H%M%S)}/teacher_cache.pt"
-TEACHER_LAYER="${TEACHER_LAYER:-0}"
-COMPRESSED_LENGTH="${COMPRESSED_LENGTH:-256}"
-SAMPLES_PER_DATASET="${SAMPLES_PER_DATASET:-2048}"
-BATCH_SIZE="${BATCH_SIZE:-2}"
-SEED="${SEED:-42}"
-SHUFFLE_SEED="${SHUFFLE_SEED:-1234}"
-NUM_VIDEO_FRAMES="${NUM_VIDEO_FRAMES:-8}"
-VIDEO_MAX_LONG_SIDE="${VIDEO_MAX_LONG_SIDE:-480}"
-SAVE_DTYPE="${SAVE_DTYPE:-float32}"
-DEVICE_MAP="${DEVICE_MAP:-cuda:0}"
-ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
-
 TEACHER_DATASETS="${TEACHER_DATASETS:-gqa}"
 #   使用方式
 #   # 均匀随机采样（默认���
@@ -31,6 +17,22 @@ TEACHER_DATASETS="${TEACHER_DATASETS:-gqa}"
 #   # 旧的 mean pooling
 #   --compression_mode pool
 COMPRESSION_MODE="${COMPRESSION_MODE:-attention_weighted}"
+ATTN_TEMPERATURE="${ATTN_TEMPERATURE:-0.5}"
+
+MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
+OUTPUT_PATH="${OUTPUT_PATH:-${PREFIX}/storage/data_distill_kimi/${TEACHER_DATASETS}-${COMPRESSION_MODE}_at${ATTN_TEMPERATURE}-$(date +%m%d%H%M%S)}/teacher_cache.pt"
+TEACHER_LAYER="${TEACHER_LAYER:-1}"
+COMPRESSED_LENGTH="${COMPRESSED_LENGTH:-256}"
+SAMPLES_PER_DATASET="${SAMPLES_PER_DATASET:-4096}"
+
+BATCH_SIZE="${BATCH_SIZE:-2}"
+SEED="${SEED:-42}"
+SHUFFLE_SEED="${SHUFFLE_SEED:-1234}"
+NUM_VIDEO_FRAMES="${NUM_VIDEO_FRAMES:-8}"
+VIDEO_MAX_LONG_SIDE="${VIDEO_MAX_LONG_SIDE:-480}"
+SAVE_DTYPE="${SAVE_DTYPE:-float32}"
+DEVICE_MAP="${DEVICE_MAP:-cuda:0}"
+ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
 
 EXTRA_ARGS=("$@")
 
@@ -52,6 +54,7 @@ CMD=(
     --teacher_datasets ${TEACHER_DATASETS}
     --compression_mode ${COMPRESSION_MODE}
     --modality_aware_compression
+    --attn_temperature "${ATTN_TEMPERATURE}"
 )
 
 CMD+=("${EXTRA_ARGS[@]}")
