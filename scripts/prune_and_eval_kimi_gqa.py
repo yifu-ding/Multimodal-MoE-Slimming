@@ -29,6 +29,11 @@ def move_to_device(inputs: dict, device) -> dict:
     return {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
 
 
+def _get_batch_rows(pool, start: int, batch_size: int):
+    end = min(start + batch_size, len(pool))
+    return [pool[idx] for idx in range(start, end)]
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Prune a VL-MoE model in memory and evaluate on a task without saving a checkpoint."
@@ -144,7 +149,7 @@ def main() -> None:
     predictions = []
     with torch.no_grad():
         for i in tqdm(range(0, total, args.batch_size), desc=f"Prune+Eval {args.task}", unit="batch"):
-            batch_rows = pool[i : i + args.batch_size]
+            batch_rows = _get_batch_rows(pool, i, args.batch_size)
             visuals = []
             questions = []
             gt_answers = []
