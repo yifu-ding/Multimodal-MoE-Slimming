@@ -102,6 +102,8 @@ fi
   echo ""
   echo "Started: $(date -Iseconds)"
   echo ""
+  echo "SCORES_PATH: \`${SCORES_PATH}\`"
+  echo ""
   echo "| # | inter_method | intra_method | modality_aware | intra_expert_metric | smooth_fn | accuracy | correct/total | status | log |"
   echo "|---|--------------|--------------|----------------|---------------------|-----------|----------|---------------|--------|-----|"
 } >> "${SUMMARY_FILE}"
@@ -137,8 +139,9 @@ for INTER_METHOD in ${SWEEP_INTER_METHODS}; do
           PREFIX="${PREFIX}" \
           OUTPUT_DIR="${SWEEP_LOG_DIR}" \
           TIMESTAMP="${TAG}" \
-          bash "${SCRIPT_DIR}/run_prune_eval_kimi_gqa.sh" # 2>&1 | tee "${RUN_LOG}"
-        EXIT_CODE=${PIPESTATUS[0]}
+          LOG_FILE="${RUN_LOG}" \
+          bash "${SCRIPT_DIR}/run_prune_eval_kimi_gqa.sh"
+        EXIT_CODE=$?
         set -e
 
         ACC_LINE="$(grep '\[Run\] Accuracy:' "${RUN_LOG}" | tail -n 1 || true)"
@@ -157,7 +160,7 @@ for INTER_METHOD in ${SWEEP_INTER_METHODS}; do
           fi
         fi
 
-        REL_LOG="sweep_runs/$(basename "${RUN_LOG}")"
+        REL_LOG="logs/$(basename "${RUN_LOG}")"
         {
           echo "| ${RUN_IDX} | ${INTER_METHOD} | ${INTRA_METHOD} | ${MODALITY_AWARE} | ${INTRA_EXPERT_METRIC} | ${SMOOTH_FN} | ${ACC:-—} | ${DETAIL:-—} | ${STATUS} | \`${REL_LOG}\` |"
         } >> "${SUMMARY_FILE}"
