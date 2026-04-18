@@ -16,12 +16,13 @@ TEACHER_DATASETS="${TEACHER_DATASETS:-gqa}"
 #   --compression_mode attention_weighted --attn_temperature 0.5
 #   # 旧的 mean pooling
 #   --compression_mode pool
-COMPRESSION_MODE="${COMPRESSION_MODE:-attention_weighted}"
-ATTN_TEMPERATURE="${ATTN_TEMPERATURE:-0.5}"
+COMPRESSION_MODE="${COMPRESSION_MODE:-sample}"
+ATTN_TEMPERATURE="${ATTN_TEMPERATURE:-1.0}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 OUTPUT_PATH="${OUTPUT_PATH:-${PREFIX}/storage/data_distill_kimi/${TEACHER_DATASETS}-${COMPRESSION_MODE}_at${ATTN_TEMPERATURE}-$(date +%m%d%H%M%S)}/teacher_hidden.pt"
-TEACHER_LAYER="${TEACHER_LAYER:-1}"
+LATEST_LINK_DIR="${LATEST_LINK_DIR:-${PREFIX}/storage/data_distill_kimi/${TEACHER_DATASETS}-${COMPRESSION_MODE}_at${ATTN_TEMPERATURE}-latest}"
+TEACHER_LAYER="${TEACHER_LAYER:-0}"
 COMPRESSED_LENGTH="${COMPRESSED_LENGTH:-256}"
 SAMPLES_PER_DATASET="${SAMPLES_PER_DATASET:-4096}"
 
@@ -71,3 +72,7 @@ echo "Device map         : ${DEVICE_MAP}"
 echo "CMD: ${CMD[*]}"
 echo ""
 "${CMD[@]}"
+
+mkdir -p "$(dirname "${LATEST_LINK_DIR}")"
+ln -sfn "$(dirname "${OUTPUT_PATH}")" "${LATEST_LINK_DIR}"
+echo "Latest link        : ${LATEST_LINK_DIR}"

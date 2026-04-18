@@ -108,6 +108,37 @@ def build_position_ids_from_attention_mask(attention_mask: torch.Tensor) -> torc
     return position_ids
 
 
+def sort_sequence_by_position_ids(
+    hidden_states: torch.Tensor,
+    position_ids: torch.Tensor,
+    modality_labels: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    if hidden_states.ndim != 3 or position_ids.ndim != 2:
+        raise ValueError(
+            "Expected hidden_states shape [N, L, D] and position_ids shape [N, L], "
+            f"got {tuple(hidden_states.shape)} and {tuple(position_ids.shape)}."
+        )
+    if hidden_states.shape[:2] != position_ids.shape:
+        raise ValueError(
+            f"Position ids shape {tuple(position_ids.shape)} must match hidden prefix "
+            f"{tuple(hidden_states.shape[:2])}."
+        )
+    order = position_ids.argsort(dim=1, stable=True)
+    hidden_states = hidden_states.gather(
+        1,
+        order.unsqueeze(-1).expand(-1, -1, hidden_states.shape[-1]),
+    )
+    position_ids = position_ids.gather(1, order)
+    if modality_labels is not None:
+        if modality_labels.shape != position_ids.shape:
+            raise ValueError(
+                f"Modality labels shape {tuple(modality_labels.shape)} must match position ids "
+                f"{tuple(position_ids.shape)}."
+            )
+        modality_labels = modality_labels.gather(1, order)
+    return hidden_states, position_ids, modality_labels
+
+
 def _pool_single_sequence(hidden: torch.Tensor, target_length: int) -> torch.Tensor:
     seq_len, hidden_size = hidden.shape
     if target_length < 0:
@@ -141,6 +172,47 @@ def _pool_single_sequence(hidden: torch.Tensor, target_length: int) -> torch.Ten
             end = min(start + 1, seq_len)
         pooled.append(hidden[start:end].mean(dim=0))
     return torch.stack(pooled, dim=0)
+
+
+def _pool_single_sequence_with_indices(
+    hidden: torch.Tensor,
+    target_length: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    seq_len, hidden_size = hidden.shape
+    if target_length <= 0:
+        return hidden.new_zeros((0, hidden_size)), torch.zeros(0, dtype=torch.long, device=hidden.device)
+    if seq_len == 0:
+        return hidden.new_zeros((target_length, hidden_size)), torch.zeros(
+            target_length, dtype=torch.long, device=hidden.device
+        )
+    if seq_len == target_length:
+        indices = torch.arange(target_length, device=hidden.device, dtype=torch.long)
+        return hidden, indices
+    if seq_len < target_length:
+        indices = torch.linspace(
+            0,
+            seq_len - 1,
+            steps=target_length,
+            device=hidden.device,
+        ).round().long()
+        return hidden.index_select(0, indices), indices
+
+    boundaries = torch.linspace(
+        0,
+        seq_len,
+        steps=target_length + 1,
+        device=hidden.device,
+    ).floor().long()
+    pooled = []
+    indices = []
+    for bucket_idx in range(target_length):
+        start = int(boundaries[bucket_idx].item())
+        end = int(boundaries[bucket_idx + 1].item())
+        if end <= start:
+            end = min(start + 1, seq_len)
+        pooled.append(hidden[start:end].mean(dim=0))
+        indices.append((start + end - 1) // 2)
+    return torch.stack(pooled, dim=0), torch.tensor(indices, dtype=torch.long, device=hidden.device)
 
 
 def _sample_single_sequence(
@@ -224,6 +296,7 @@ class CompressedResult:
 
     hidden_states: torch.Tensor   # (batch, target_length, H)
     modality_labels: torch.Tensor  # (batch, target_length) int8; 0=text, 1=image, 2=video
+    position_ids: torch.Tensor  # (batch, target_length) long; positions in the original sequence
 
 
 def _resolve_visual_token_masks(bundle, input_ids: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -393,31 +466,44 @@ def compress_hidden_states(
     _modality_id = {"text": MODALITY_TEXT, "image": MODALITY_IMAGE, "video": MODALITY_VIDEO}
     compressed_batch: list[torch.Tensor] = []
     labels_batch: list[torch.Tensor] = []
+    positions_batch: list[torch.Tensor] = []
 
-    def _select(hidden_1d: torch.Tensor, length: int, imp_1d: torch.Tensor | None):
+    def _select(
+        hidden_1d: torch.Tensor,
+        source_positions_1d: torch.Tensor,
+        length: int,
+        imp_1d: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Dispatch to the right selection strategy."""
         if mode == "pool":
-            return _pool_single_sequence(hidden_1d.float(), length)
+            pooled, indices = _pool_single_sequence_with_indices(hidden_1d.float(), length)
+            return pooled, source_positions_1d.index_select(0, indices)
         if mode == "attention_weighted" and imp_1d is not None:
-            sampled, _ = _weighted_sample_single_sequence(
+            sampled, indices = _weighted_sample_single_sequence(
                 hidden_1d.float(), length, imp_1d, temperature=attn_temperature,
             )
-            return sampled
+            return sampled, source_positions_1d.index_select(0, indices)
         # mode == "sample" or fallback
-        sampled, _ = _sample_single_sequence(hidden_1d.float(), length, generator)
-        return sampled
+        sampled, indices = _sample_single_sequence(hidden_1d.float(), length, generator)
+        return sampled, source_positions_1d.index_select(0, indices)
 
     for batch_idx in range(batch_size):
         batch_imp = attn_importance[batch_idx] if attn_importance is not None else None
+        source_positions = torch.arange(mask.shape[1], device=hidden_states.device, dtype=torch.long)
 
         if compression_masks is None:
             valid_mask = mask[batch_idx]
             valid_hidden = hidden_states[batch_idx][valid_mask]
+            valid_positions = source_positions[valid_mask]
             valid_imp = batch_imp[valid_mask] if batch_imp is not None else None
-            compressed_batch.append(_select(valid_hidden, target_length, valid_imp))
+            compressed_hidden, compressed_positions = _select(
+                valid_hidden, valid_positions, target_length, valid_imp,
+            )
+            compressed_batch.append(compressed_hidden)
             labels_batch.append(
                 torch.full((target_length,), MODALITY_TEXT, dtype=torch.int8, device=hidden_states.device)
             )
+            positions_batch.append(compressed_positions)
             continue
 
         eff_lengths = _compute_effective_modality_lengths(
@@ -426,21 +512,36 @@ def compress_hidden_states(
 
         parts: list[torch.Tensor] = []
         label_parts: list[torch.Tensor] = []
+        position_parts: list[torch.Tensor] = []
         for modality_name in ("text", "image", "video"):
             mod_mask = compression_masks[modality_name][batch_idx]
             modality_hidden = hidden_states[batch_idx][mod_mask]
+            modality_positions = source_positions[mod_mask]
             mod_imp = batch_imp[mod_mask] if batch_imp is not None else None
             ml = int(eff_lengths[modality_name])
-            parts.append(_select(modality_hidden, ml, mod_imp))
+            selected_hidden, selected_positions = _select(
+                modality_hidden, modality_positions, ml, mod_imp,
+            )
+            parts.append(selected_hidden)
+            position_parts.append(selected_positions)
             label_parts.append(
                 torch.full((ml,), _modality_id[modality_name], dtype=torch.int8, device=hidden_states.device)
             )
         compressed_batch.append(torch.cat(parts, dim=0))
         labels_batch.append(torch.cat(label_parts, dim=0))
-
+        positions_batch.append(torch.cat(position_parts, dim=0))
+    compressed_hidden = torch.stack(compressed_batch, dim=0)
+    compressed_labels = torch.stack(labels_batch, dim=0)
+    compressed_positions = torch.stack(positions_batch, dim=0)
+    compressed_hidden, compressed_positions, compressed_labels = sort_sequence_by_position_ids(
+        compressed_hidden,
+        compressed_positions,
+        compressed_labels,
+    )
     return CompressedResult(
-        hidden_states=torch.stack(compressed_batch, dim=0),
-        modality_labels=torch.stack(labels_batch, dim=0),
+        hidden_states=compressed_hidden,
+        modality_labels=compressed_labels,
+        position_ids=compressed_positions,
     )
 
 

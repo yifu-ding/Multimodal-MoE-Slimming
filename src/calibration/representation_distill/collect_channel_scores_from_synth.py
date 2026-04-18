@@ -29,6 +29,7 @@ from src.calibration.helpers.utils import (
 )
 from src.calibration.helpers.helpers import compute_block_loss
 from src.calibration.representation_distill.common import ensure_dir
+from src.calibration.representation_distill.common import sort_sequence_by_position_ids
 from src.calibration.representation_distill.runtime.forward_from_hidden import forward_from_hidden
 
 
@@ -82,6 +83,7 @@ def _synthetic_block_forward(
     loss_fn: str,
     dtype: torch.dtype,
     has_modality_labels: bool = False,
+    has_position_ids: bool = False,
 ) -> float:
     model = bundle.model
     model.eval()
@@ -108,16 +110,25 @@ def _synthetic_block_forward(
     try:
         iterator = tqdm(dataloader, desc=f"HiddenCal L{layer_idx}", leave=False)
         for batch_tuple in iterator:
-            if has_modality_labels:
+            if has_modality_labels and has_position_ids:
+                hidden_batch, attn_batch, modality_batch, position_ids_batch = batch_tuple
+            elif has_modality_labels:
                 hidden_batch, attn_batch, modality_batch = batch_tuple
+                position_ids_batch = None
+            elif has_position_ids:
+                hidden_batch, attn_batch, position_ids_batch = batch_tuple
+                modality_batch = None
             else:
                 hidden_batch, attn_batch = batch_tuple
                 modality_batch = None
+                position_ids_batch = None
             teacher_state.clear()
             hidden_batch = hidden_batch.to(device=block_device, dtype=dtype)
             attn_batch = attn_batch.to(device=block_device)
             if modality_batch is not None:
                 modality_batch = modality_batch.to(device=block_device)
+            if position_ids_batch is not None:
+                position_ids_batch = position_ids_batch.to(device=block_device)
             _set_synthetic_modality_masks(cnt_block, attn_batch, modality_batch, bundle)
 
             with torch.no_grad():
@@ -127,6 +138,7 @@ def _synthetic_block_forward(
                     attention_mask=attn_batch,
                     start_layer=start_layer,
                     end_layer=layer_idx,
+                    position_ids=position_ids_batch,
                     apply_final_norm=False,
                 )
 
@@ -232,17 +244,23 @@ def _load_hidden_payload(input_hidden_path: str):
     metadata = payload.get("metadata", {})
 
     modality_labels = payload.get("modality_labels", None)
+    position_ids = payload.get("position_ids", None)
 
     if "synthetic_hidden" in payload:
         hidden = payload["synthetic_hidden"]
         attention_mask = payload.get("attention_mask")
         if attention_mask is None:
             attention_mask = torch.ones(hidden.shape[:2], dtype=torch.long)
+        if position_ids is not None:
+            hidden, position_ids, modality_labels = sort_sequence_by_position_ids(
+                hidden, position_ids, modality_labels,
+            )
         teacher_meta = metadata["teacher_metadata"]
         return {
             "hidden": hidden,
             "attention_mask": attention_mask,
             "modality_labels": modality_labels,
+            "position_ids": position_ids,
             "teacher_meta": teacher_meta,
             "start_layer": int(teacher_meta["teacher_layer"]) + 1,
             "source": "synthetic_hidden",
@@ -251,10 +269,15 @@ def _load_hidden_payload(input_hidden_path: str):
     if "teacher_cache" in payload:
         hidden = payload["teacher_cache"]
         attention_mask = torch.ones(hidden.shape[:2], dtype=torch.long)
+        if position_ids is not None:
+            hidden, position_ids, modality_labels = sort_sequence_by_position_ids(
+                hidden, position_ids, modality_labels,
+            )
         return {
             "hidden": hidden,
             "attention_mask": attention_mask,
             "modality_labels": modality_labels,
+            "position_ids": position_ids,
             "teacher_meta": metadata,
             "start_layer": int(metadata["teacher_layer"]) + 1,
             "source": "teacher_cache",
@@ -292,6 +315,7 @@ def main() -> None:
     hidden = hidden_payload["hidden"]
     attention_mask = hidden_payload["attention_mask"]
     modality_labels = hidden_payload.get("modality_labels", None)
+    position_ids = hidden_payload.get("position_ids", None)
     start_layer = hidden_payload["start_layer"]
 
     layer_to_num_experts, layer_to_num_channels = discover_layer_structure(bundle)
@@ -316,9 +340,22 @@ def main() -> None:
         )
 
     has_modality_labels = modality_labels is not None
-    if has_modality_labels:
+    has_position_ids = position_ids is not None
+    if has_modality_labels and has_position_ids:
+        loader = DataLoader(
+            TensorDataset(hidden, attention_mask, modality_labels, position_ids),
+            batch_size=args.batch_size,
+            shuffle=False,
+        )
+    elif has_modality_labels:
         loader = DataLoader(
             TensorDataset(hidden, attention_mask, modality_labels),
+            batch_size=args.batch_size,
+            shuffle=False,
+        )
+    elif has_position_ids:
+        loader = DataLoader(
+            TensorDataset(hidden, attention_mask, position_ids),
             batch_size=args.batch_size,
             shuffle=False,
         )
@@ -347,6 +384,7 @@ def main() -> None:
             loss_fn=args.loss_fn,
             dtype=block_dtype,
             has_modality_labels=has_modality_labels,
+            has_position_ids=has_position_ids,
         )
         accumulator.layerwise_loss[layer_idx] = float(layer_loss)
         accumulator.absorb_layer_scores(layer_idx, cnt_block)

@@ -1,5 +1,4 @@
 import argparse
-import math
 import os
 import sys
 
@@ -14,14 +13,18 @@ import torch
 import torch.nn.functional as F
 from tqdm import trange
 
+from src.calibration.helpers.helpers import compute_block_loss
 from src.calibration.representation_distill.common import (
     MODALITY_IMAGE,
     MODALITY_TEXT,
     MODALITY_VIDEO,
     ensure_dir,
+    get_decoder_layer,
     seed_everything,
+    sort_sequence_by_position_ids,
     utc_now_iso,
 )
+from src.calibration.representation_distill.runtime.forward_from_hidden import forward_from_hidden
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +44,98 @@ def _subsample_flat(tensor: torch.Tensor, max_tokens: int) -> torch.Tensor:
         return tensor
     indices = torch.randperm(tensor.shape[0], device=tensor.device)[:max_tokens]
     return tensor[indices]
+
+
+def _build_synthetic_banks(
+    init_hidden: torch.Tensor,
+    init_labels: torch.Tensor | None,
+    init_std: float,
+) -> tuple[torch.nn.ParameterDict, torch.Tensor]:
+    flat_hidden = init_hidden.reshape(-1, init_hidden.shape[-1])
+    if init_labels is None:
+        flat_labels = torch.full(
+            (flat_hidden.shape[0],),
+            MODALITY_TEXT,
+            dtype=torch.int8,
+            device=flat_hidden.device,
+        )
+    else:
+        flat_labels = init_labels.reshape(-1).to(torch.int8)
+
+    bank_params: dict[str, torch.nn.Parameter] = {}
+    for mod_id in (MODALITY_TEXT, MODALITY_IMAGE, MODALITY_VIDEO):
+        mod_mask = flat_labels == mod_id
+        if int(mod_mask.sum()) == 0:
+            continue
+        bank_value = flat_hidden[mod_mask].clone()
+        if init_std > 0:
+            bank_value.add_(torch.randn_like(bank_value) * init_std)
+        bank_params[str(int(mod_id))] = torch.nn.Parameter(bank_value)
+    return torch.nn.ParameterDict(bank_params), flat_labels
+
+
+def _assemble_synthetic_hidden(
+    bank_params: torch.nn.ParameterDict,
+    template_labels: torch.Tensor,
+    synthetic_size: int,
+    compressed_length: int,
+    hidden_size: int,
+) -> torch.Tensor:
+    flat_labels = template_labels.reshape(-1)
+    flat_hidden = torch.empty(
+        flat_labels.shape[0],
+        hidden_size,
+        device=flat_labels.device,
+        dtype=next(iter(bank_params.values())).dtype,
+    )
+    for mod_id_str, bank in bank_params.items():
+        flat_hidden[flat_labels == int(mod_id_str)] = bank
+    return flat_hidden.view(synthetic_size, compressed_length, hidden_size)
+
+
+def _compute_next_block_rel_l2(
+    *,
+    bundle,
+    layer_idx: int,
+    teacher_hidden: torch.Tensor,
+    teacher_attention_mask: torch.Tensor,
+    teacher_position_ids: torch.Tensor,
+    synthetic_hidden: torch.Tensor,
+    synthetic_attention_mask: torch.Tensor,
+    synthetic_position_ids: torch.Tensor,
+) -> torch.Tensor:
+    block_layer = get_decoder_layer(bundle, layer_idx)
+    block_dtype = next(block_layer.parameters()).dtype
+    teacher_hidden = teacher_hidden.to(dtype=block_dtype)
+    synthetic_hidden = synthetic_hidden.to(dtype=block_dtype)
+
+    with torch.no_grad():
+        teacher_target = forward_from_hidden(
+            bundle=bundle,
+            hidden_states=teacher_hidden,
+            attention_mask=teacher_attention_mask,
+            start_layer=layer_idx,
+            end_layer=layer_idx,
+            position_ids=teacher_position_ids,
+            apply_final_norm=False,
+        )
+    synth_pred = forward_from_hidden(
+        bundle=bundle,
+        hidden_states=synthetic_hidden,
+        attention_mask=synthetic_attention_mask,
+        start_layer=layer_idx,
+        end_layer=layer_idx,
+        position_ids=synthetic_position_ids,
+        apply_final_norm=False,
+    )
+    loss_sum, _ = compute_block_loss(
+        pred=synth_pred,
+        teacher_target=teacher_target,
+        attn_mask=synthetic_attention_mask,
+        loss_fn="rel_l2",
+    )
+    denom = synthetic_attention_mask.float().sum().clamp_min(1.0)
+    return loss_sum / denom
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +332,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # Legacy moment-matching (auxiliary, reduced weight)
     parser.add_argument("--lambda_mean", type=float, default=0.5)
     parser.add_argument("--lambda_var", type=float, default=0.5)
+    parser.add_argument("--lambda_block", type=float, default=0.0)
+    parser.add_argument("--model_name_or_path", type=str, default=None)
+    parser.add_argument("--device_map", type=str, default=None)
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default="flash_attention_2",
+        choices=["flash_attention_2", "sdpa", "eager"],
+    )
     # Diversity warmup: avoids ``div`` dominating the first few hundred steps
     # when the other losses are still on the order of 1e-5.
     parser.add_argument("--div_warmup_steps", type=int, default=200,
@@ -258,6 +362,7 @@ def main() -> None:
     teacher_cache = cache_payload["teacher_cache"].float()
     teacher_meta = cache_payload["metadata"]
     teacher_labels = cache_payload.get("modality_labels", None)
+    teacher_position_ids = cache_payload.get("position_ids", None)
 
     device = args.device
     if device is None:
@@ -265,23 +370,89 @@ def main() -> None:
     teacher_cache = teacher_cache.to(device)
     if teacher_labels is not None:
         teacher_labels = teacher_labels.to(device)
+    if teacher_position_ids is None:
+        teacher_position_ids = torch.arange(
+            teacher_cache.shape[1], device=device, dtype=torch.long
+        ).unsqueeze(0).expand(teacher_cache.shape[0], -1)
+    else:
+        teacher_position_ids = teacher_position_ids.to(device=device, dtype=torch.long)
+        teacher_cache, teacher_position_ids, teacher_labels = sort_sequence_by_position_ids(
+            teacher_cache,
+            teacher_position_ids,
+            teacher_labels,
+        )
 
     # Initialize from random teacher samples
     init_indices = torch.randint(0, teacher_cache.shape[0], (args.synthetic_size,), device=device)
-    synthetic_hidden = torch.nn.Parameter(teacher_cache.index_select(0, init_indices).clone())
-    if args.init_std > 0:  # default: 0
-        synthetic_hidden.data.add_(torch.randn_like(synthetic_hidden) * args.init_std)
+    init_hidden = teacher_cache.index_select(0, init_indices).clone()
+    init_position_ids = teacher_position_ids.index_select(0, init_indices).clone()
 
     # Modality labels: frozen, copied from init samples
     synth_labels = None
     if teacher_labels is not None:
         synth_labels = teacher_labels.index_select(0, init_indices).clone()  # not a Parameter
 
-    optimizer = torch.optim.Adam([synthetic_hidden], lr=args.lr)
+    bank_params, synth_template_labels_flat = _build_synthetic_banks(
+        init_hidden=init_hidden,
+        init_labels=synth_labels,
+        init_std=args.init_std,
+    )
+    synth_template_labels = (
+        synth_labels
+        if synth_labels is not None
+        else synth_template_labels_flat.view(init_hidden.shape[0], init_hidden.shape[1])
+    )
+    optimizer = torch.optim.Adam(list(bank_params.parameters()), lr=args.lr)
     history = []
     final_losses = None
 
+    block_bundle = None
+    block_constraint_layer = None
+    teacher_anchor_hidden = init_hidden
+    teacher_anchor_attention_mask = torch.ones(init_hidden.shape[:2], dtype=torch.long, device=device)
+    teacher_anchor_position_ids = init_position_ids
+    synth_attention_mask = torch.ones(init_hidden.shape[:2], dtype=torch.long, device=device)
+    synth_position_ids = init_position_ids.clone()
+
+    if args.lambda_block > 0:
+        if not args.model_name_or_path:
+            raise ValueError("--model_name_or_path is required when --lambda_block > 0.")
+        from observations.common import load_model_bundle
+
+        block_bundle = load_model_bundle(
+            args.model_name_or_path,
+            device_map=args.device_map,
+            attn_implementation=args.attn_implementation,
+        )
+        block_constraint_layer = int(teacher_meta["teacher_layer"]) + 1
+        block_layer = get_decoder_layer(block_bundle, block_constraint_layer)
+        block_device = next(block_layer.parameters()).device
+        teacher_anchor_hidden = teacher_anchor_hidden.to(block_device)
+        teacher_anchor_attention_mask = teacher_anchor_attention_mask.to(block_device)
+        teacher_anchor_position_ids = teacher_anchor_position_ids.to(block_device)
+        synth_attention_mask = synth_attention_mask.to(block_device)
+        synth_position_ids = synth_position_ids.to(block_device)
+        if device != str(block_device):
+            teacher_cache = teacher_cache.to(block_device)
+            if teacher_labels is not None:
+                teacher_labels = teacher_labels.to(block_device)
+            if synth_labels is not None:
+                synth_labels = synth_labels.to(block_device)
+                synth_template_labels = synth_labels
+            teacher_position_ids = teacher_position_ids.to(block_device)
+            for _, bank in bank_params.items():
+                bank.data = bank.data.to(block_device)
+            synth_template_labels_flat = synth_template_labels_flat.to(block_device)
+            device = str(block_device)
+
     for step in trange(args.train_steps, desc="Distilling compact hidden", leave=False):
+        synthetic_hidden = _assemble_synthetic_hidden(
+            bank_params=bank_params,
+            template_labels=synth_template_labels,
+            synthetic_size=args.synthetic_size,
+            compressed_length=init_hidden.shape[1],
+            hidden_size=init_hidden.shape[2],
+        )
         # Sample a teacher batch
         batch_indices = torch.randint(0, teacher_cache.shape[0], (args.teacher_batch_size,), device=device)
         teacher_batch = teacher_cache.index_select(0, batch_indices)
@@ -308,6 +479,19 @@ def main() -> None:
             + args.lambda_var * losses["var"]
             + div_scale * args.lambda_div * losses["div"]
         )
+        if args.lambda_block > 0:
+            block_rel_l2 = _compute_next_block_rel_l2(
+                bundle=block_bundle,
+                layer_idx=block_constraint_layer,
+                teacher_hidden=teacher_anchor_hidden,
+                teacher_attention_mask=teacher_anchor_attention_mask,
+                teacher_position_ids=teacher_anchor_position_ids,
+                synthetic_hidden=synthetic_hidden,
+                synthetic_attention_mask=synth_attention_mask,
+                synthetic_position_ids=synth_position_ids,
+            )
+            total_loss = total_loss + args.lambda_block * block_rel_l2
+            losses["block_rel_l2"] = block_rel_l2
 
         optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
@@ -322,12 +506,21 @@ def main() -> None:
             "var": float(losses["var"].detach().cpu().item()),
             "div_scale": div_scale,
         }
+        if "block_rel_l2" in losses:
+            final_losses["block_rel_l2"] = float(losses["block_rel_l2"].detach().cpu().item())
         for k, v in losses.items():
             if "/" in k:
                 final_losses[k] = float(v.detach().cpu().item())
         if step % args.log_interval == 0 or step == args.train_steps - 1:
             history.append({"step": step, **final_losses})
 
+    synthetic_hidden = _assemble_synthetic_hidden(
+        bank_params=bank_params,
+        template_labels=synth_template_labels,
+        synthetic_size=args.synthetic_size,
+        compressed_length=init_hidden.shape[1],
+        hidden_size=init_hidden.shape[2],
+    )
     synthetic_hidden_cpu = synthetic_hidden.detach().cpu().float()
     attention_mask = torch.ones(
         synthetic_hidden_cpu.shape[0],
@@ -337,6 +530,7 @@ def main() -> None:
     payload = {
         "synthetic_hidden": synthetic_hidden_cpu,
         "attention_mask": attention_mask,
+        "position_ids": synth_position_ids.detach().cpu().long(),
         "metadata": {
             "method": "multimodal_representation_level_calibration_distillation",
             "teacher_cache_path": args.teacher_cache_path,
@@ -345,7 +539,7 @@ def main() -> None:
             "compressed_length": int(synthetic_hidden_cpu.shape[1]),
             "hidden_size": int(synthetic_hidden_cpu.shape[2]),
             "dtype": "float32",
-            "position_ids_strategy": "sequential_from_attention_mask",
+            "position_ids_strategy": "frozen_from_init_teacher_samples",
             "train_steps": args.train_steps,
             "teacher_batch_size": args.teacher_batch_size,
             "lr": args.lr,
@@ -355,10 +549,13 @@ def main() -> None:
                 "div": args.lambda_div,
                 "mean": args.lambda_mean,
                 "var": args.lambda_var,
+                "block_rel_l2": args.lambda_block,
             },
             "modality_grouped_losses": ["mmd", "cov", "mean", "var"],
             "div_warmup_steps": args.div_warmup_steps,
             "mmd_subsample": args.mmd_subsample,
+            "synthetic_bank_mode": "independent_per_modality",
+            "block_constraint_layer": block_constraint_layer,
             "final_losses": final_losses,
             "history": history,
             "created_at": utc_now_iso(),
