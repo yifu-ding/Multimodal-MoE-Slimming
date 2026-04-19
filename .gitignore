@@ -16,3 +16,4 @@ transformers/
 *.json
 *.pt
 results/
+wandb/

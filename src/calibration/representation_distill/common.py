@@ -139,6 +139,27 @@ def sort_sequence_by_position_ids(
     return hidden_states, position_ids, modality_labels
 
 
+def make_compact_position_ids(
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if position_ids.ndim != 2:
+        raise ValueError(f"Expected position_ids shape [N, L], got {tuple(position_ids.shape)}.")
+    compact = torch.arange(
+        position_ids.shape[1],
+        device=position_ids.device,
+        dtype=position_ids.dtype,
+    ).unsqueeze(0).expand(position_ids.shape[0], -1).clone()
+    if attention_mask is not None:
+        if attention_mask.shape != position_ids.shape:
+            raise ValueError(
+                f"attention_mask shape {tuple(attention_mask.shape)} must match position_ids "
+                f"{tuple(position_ids.shape)}."
+            )
+        compact = compact.masked_fill(attention_mask == 0, 0)
+    return compact
+
+
 def _pool_single_sequence(hidden: torch.Tensor, target_length: int) -> torch.Tensor:
     seq_len, hidden_size = hidden.shape
     if target_length < 0:

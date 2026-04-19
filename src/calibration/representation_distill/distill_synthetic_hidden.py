@@ -308,6 +308,142 @@ def _compute_losses(
     return losses
 
 
+def _compute_weighted_total_loss(
+    *,
+    args,
+    losses: dict[str, torch.Tensor],
+    div_scale: float,
+    ema_state: dict[str, torch.Tensor] | None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    base_device = losses["mmd"].device
+    raw_terms = {
+        "mmd": losses["mmd"],
+        "cov": losses["cov"],
+        "mean": losses["mean"],
+        "var": losses["var"],
+        "div": losses["div"],
+    }
+    if "block_rel_l2" in losses:
+        raw_terms["block_rel_l2"] = losses["block_rel_l2"]
+
+    weights = {
+        "mmd": torch.tensor(args.lambda_mmd, device=base_device),
+        "cov": torch.tensor(args.lambda_cov, device=base_device),
+        "mean": torch.tensor(args.lambda_mean, device=base_device),
+        "var": torch.tensor(args.lambda_var, device=base_device),
+        "div": torch.tensor(div_scale * args.lambda_div, device=base_device),
+    }
+    if "block_rel_l2" in raw_terms:
+        weights["block_rel_l2"] = torch.tensor(args.lambda_block, device=base_device)
+
+    total_loss = torch.tensor(0.0, device=base_device)
+    weighted_terms: dict[str, torch.Tensor] = {}
+    normalized_terms: dict[str, torch.Tensor] = {}
+    for name, raw in raw_terms.items():
+        term = raw
+        if args.use_ema_normalized_losses:
+            if ema_state is None:
+                raise ValueError("EMA state is required when EMA-normalized losses are enabled.")
+            ema_value = ema_state.get(name)
+            if ema_value is None:
+                ema_value = raw.detach().float()
+            else:
+                ema_value = args.loss_ema_decay * ema_value + (1.0 - args.loss_ema_decay) * raw.detach().float()
+            ema_state[name] = ema_value
+            term = raw / ema_value.clamp_min(1e-8).to(device=raw.device, dtype=raw.dtype)
+            normalized_terms[name] = term.detach()
+        weighted = weights[name] * term
+        weighted_terms[name] = weighted.detach()
+        total_loss = total_loss + weighted
+    return total_loss, weighted_terms, normalized_terms
+
+
+def _build_output_payload(
+    *,
+    synthetic_hidden_cpu: torch.Tensor,
+    synth_position_ids_cpu: torch.Tensor,
+    synth_labels_cpu: torch.Tensor | None,
+    teacher_meta: dict,
+    args,
+    final_losses: dict[str, float] | None,
+    history: list[dict],
+    block_constraint_layer: int | None,
+) -> dict:
+    attention_mask = torch.ones(
+        synthetic_hidden_cpu.shape[0],
+        synthetic_hidden_cpu.shape[1],
+        dtype=torch.long,
+    )
+    payload = {
+        "synthetic_hidden": synthetic_hidden_cpu,
+        "attention_mask": attention_mask,
+        "position_ids": synth_position_ids_cpu,
+        "metadata": {
+            "method": "multimodal_representation_level_calibration_distillation",
+            "teacher_cache_path": args.teacher_cache_path,
+            "teacher_metadata": teacher_meta,
+            "synthetic_size": args.synthetic_size,
+            "compressed_length": int(synthetic_hidden_cpu.shape[1]),
+            "hidden_size": int(synthetic_hidden_cpu.shape[2]),
+            "dtype": "float32",
+            "position_ids_strategy": "frozen_from_init_teacher_samples",
+            "train_steps": args.train_steps,
+            "teacher_batch_size": args.teacher_batch_size,
+            "lr": args.lr,
+            "loss_weights": {
+                "mmd": args.lambda_mmd,
+                "cov": args.lambda_cov,
+                "div": args.lambda_div,
+                "mean": args.lambda_mean,
+                "var": args.lambda_var,
+                "block_rel_l2": args.lambda_block,
+            },
+            "modality_grouped_losses": ["mmd", "cov", "mean", "var"],
+            "div_warmup_steps": args.div_warmup_steps,
+            "mmd_subsample": args.mmd_subsample,
+            "use_ema_normalized_losses": args.use_ema_normalized_losses,
+            "loss_ema_decay": args.loss_ema_decay,
+            "synthetic_bank_mode": "independent_per_modality",
+            "block_constraint_layer": block_constraint_layer,
+            "final_losses": final_losses,
+            "history": history,
+            "created_at": utc_now_iso(),
+        },
+    }
+    if synth_labels_cpu is not None:
+        payload["modality_labels"] = synth_labels_cpu
+    return payload
+
+
+def _save_payload(
+    *,
+    output_path: str,
+    synthetic_hidden: torch.Tensor,
+    synth_position_ids: torch.Tensor,
+    synth_labels: torch.Tensor | None,
+    teacher_meta: dict,
+    args,
+    final_losses: dict[str, float] | None,
+    history: list[dict],
+    block_constraint_layer: int | None,
+) -> dict:
+    synthetic_hidden_cpu = synthetic_hidden.detach().cpu().float()
+    synth_position_ids_cpu = synth_position_ids.detach().cpu().long()
+    synth_labels_cpu = synth_labels.cpu() if synth_labels is not None else None
+    payload = _build_output_payload(
+        synthetic_hidden_cpu=synthetic_hidden_cpu,
+        synth_position_ids_cpu=synth_position_ids_cpu,
+        synth_labels_cpu=synth_labels_cpu,
+        teacher_meta=teacher_meta,
+        args=args,
+        final_losses=final_losses,
+        history=history,
+        block_constraint_layer=block_constraint_layer,
+    )
+    torch.save(payload, output_path)
+    return payload
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -350,6 +486,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mmd_subsample", type=int, default=2048,
                         help="Max tokens for kernel matrix computation.")
     parser.add_argument("--log_interval", type=int, default=100)
+    parser.add_argument("--wandb_project", type=str, default=None)
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
+    parser.add_argument("--use_ema_normalized_losses", action="store_true")
+    parser.add_argument("--loss_ema_decay", type=float, default=0.99)
+    parser.add_argument("--checkpoint_interval", type=int, default=0)
     return parser
 
 
@@ -357,6 +499,47 @@ def main() -> None:
     args = build_arg_parser().parse_args()
     seed_everything(args.seed)
     ensure_dir(os.path.dirname(args.output_path))
+
+    wandb_run = None
+    if args.wandb_project and args.wandb_mode != "disabled":
+        try:
+            import wandb
+        except ImportError as exc:
+            raise ImportError(
+                "wandb is required when --wandb_project is set. "
+                "Install it with `pip install wandb` or disable logging with "
+                "`--wandb_mode disabled`."
+            ) from exc
+
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            mode=args.wandb_mode,
+            config={
+                "teacher_cache_path": args.teacher_cache_path,
+                "output_path": args.output_path,
+                "synthetic_size": args.synthetic_size,
+                "teacher_batch_size": args.teacher_batch_size,
+                "train_steps": args.train_steps,
+                "lr": args.lr,
+                "seed": args.seed,
+                "init_std": args.init_std,
+                "lambda_mmd": args.lambda_mmd,
+                "lambda_cov": args.lambda_cov,
+                "lambda_div": args.lambda_div,
+                "lambda_mean": args.lambda_mean,
+                "lambda_var": args.lambda_var,
+                "lambda_block": args.lambda_block,
+                "use_ema_normalized_losses": args.use_ema_normalized_losses,
+                "loss_ema_decay": args.loss_ema_decay,
+                "checkpoint_interval": args.checkpoint_interval,
+                "div_warmup_steps": args.div_warmup_steps,
+                "mmd_subsample": args.mmd_subsample,
+                "log_interval": args.log_interval,
+                "model_name_or_path": args.model_name_or_path,
+                "device": args.device,
+            },
+        )
 
     cache_payload = torch.load(args.teacher_cache_path, map_location="cpu")
     teacher_cache = cache_payload["teacher_cache"].float()
@@ -405,6 +588,7 @@ def main() -> None:
     optimizer = torch.optim.Adam(list(bank_params.parameters()), lr=args.lr)
     history = []
     final_losses = None
+    loss_ema_state: dict[str, torch.Tensor] | None = {} if args.use_ema_normalized_losses else None
 
     block_bundle = None
     block_constraint_layer = None
@@ -472,13 +656,6 @@ def main() -> None:
         if args.div_warmup_steps > 0:
             div_scale = min(1.0, (step + 1) / float(args.div_warmup_steps))
 
-        total_loss = (
-            args.lambda_mmd * losses["mmd"]
-            + args.lambda_cov * losses["cov"]
-            + args.lambda_mean * losses["mean"]
-            + args.lambda_var * losses["var"]
-            + div_scale * args.lambda_div * losses["div"]
-        )
         if args.lambda_block > 0:
             block_rel_l2 = _compute_next_block_rel_l2(
                 bundle=block_bundle,
@@ -490,8 +667,14 @@ def main() -> None:
                 synthetic_attention_mask=synth_attention_mask,
                 synthetic_position_ids=synth_position_ids,
             )
-            total_loss = total_loss + args.lambda_block * block_rel_l2
             losses["block_rel_l2"] = block_rel_l2
+
+        total_loss, weighted_terms, normalized_terms = _compute_weighted_total_loss(
+            args=args,
+            losses=losses,
+            div_scale=div_scale,
+            ema_state=loss_ema_state,
+        )
 
         optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
@@ -508,11 +691,61 @@ def main() -> None:
         }
         if "block_rel_l2" in losses:
             final_losses["block_rel_l2"] = float(losses["block_rel_l2"].detach().cpu().item())
+        for k, v in weighted_terms.items():
+            final_losses[f"weighted/{k}"] = float(v.detach().cpu().item())
+        for k, v in normalized_terms.items():
+            final_losses[f"normalized/{k}"] = float(v.detach().cpu().item())
         for k, v in losses.items():
             if "/" in k:
                 final_losses[k] = float(v.detach().cpu().item())
+        if wandb_run is not None:
+            wandb_payload = {
+                "step": step,
+                "loss/total": final_losses["total"],
+                "loss/raw/mmd": final_losses["mmd"],
+                "loss/raw/cov": final_losses["cov"],
+                "loss/raw/mean": final_losses["mean"],
+                "loss/raw/var": final_losses["var"],
+                "loss/raw/div": final_losses["div"],
+                "loss/weighted/mmd": final_losses["weighted/mmd"],
+                "loss/weighted/cov": final_losses["weighted/cov"],
+                "loss/weighted/mean": final_losses["weighted/mean"],
+                "loss/weighted/var": final_losses["weighted/var"],
+                "loss/weighted/div": final_losses["weighted/div"],
+                "schedule/div_scale": div_scale,
+                "meta/lr": args.lr,
+                "meta/use_ema_normalized_losses": int(args.use_ema_normalized_losses),
+            }
+            if "block_rel_l2" in final_losses:
+                wandb_payload["loss/raw/block_rel_l2"] = final_losses["block_rel_l2"]
+                wandb_payload["loss/weighted/block_rel_l2"] = final_losses["weighted/block_rel_l2"]
+            for k, v in final_losses.items():
+                if "/" in k:
+                    wandb_payload[f"loss/{k}"] = v
+            wandb_run.log(wandb_payload, step=step)
         if step % args.log_interval == 0 or step == args.train_steps - 1:
             history.append({"step": step, **final_losses})
+        if (
+            args.checkpoint_interval > 0
+            and (step + 1) % args.checkpoint_interval == 0
+            and step != args.train_steps - 1
+        ):
+            checkpoint_path = os.path.join(
+                os.path.dirname(args.output_path),
+                f"{os.path.splitext(os.path.basename(args.output_path))[0]}-step{step + 1}.pt",
+            )
+            _save_payload(
+                output_path=checkpoint_path,
+                synthetic_hidden=synthetic_hidden,
+                synth_position_ids=synth_position_ids,
+                synth_labels=synth_labels,
+                teacher_meta=teacher_meta,
+                args=args,
+                final_losses=final_losses,
+                history=history,
+                block_constraint_layer=block_constraint_layer,
+            )
+            print(f"[representation_distill] Saved checkpoint: {checkpoint_path}")
 
     synthetic_hidden = _assemble_synthetic_hidden(
         bank_params=bank_params,
@@ -521,51 +754,27 @@ def main() -> None:
         compressed_length=init_hidden.shape[1],
         hidden_size=init_hidden.shape[2],
     )
-    synthetic_hidden_cpu = synthetic_hidden.detach().cpu().float()
-    attention_mask = torch.ones(
-        synthetic_hidden_cpu.shape[0],
-        synthetic_hidden_cpu.shape[1],
-        dtype=torch.long,
+    payload = _save_payload(
+        output_path=args.output_path,
+        synthetic_hidden=synthetic_hidden,
+        synth_position_ids=synth_position_ids,
+        synth_labels=synth_labels,
+        teacher_meta=teacher_meta,
+        args=args,
+        final_losses=final_losses,
+        history=history,
+        block_constraint_layer=block_constraint_layer,
     )
-    payload = {
-        "synthetic_hidden": synthetic_hidden_cpu,
-        "attention_mask": attention_mask,
-        "position_ids": synth_position_ids.detach().cpu().long(),
-        "metadata": {
-            "method": "multimodal_representation_level_calibration_distillation",
-            "teacher_cache_path": args.teacher_cache_path,
-            "teacher_metadata": teacher_meta,
-            "synthetic_size": args.synthetic_size,
-            "compressed_length": int(synthetic_hidden_cpu.shape[1]),
-            "hidden_size": int(synthetic_hidden_cpu.shape[2]),
-            "dtype": "float32",
-            "position_ids_strategy": "frozen_from_init_teacher_samples",
-            "train_steps": args.train_steps,
-            "teacher_batch_size": args.teacher_batch_size,
-            "lr": args.lr,
-            "loss_weights": {
-                "mmd": args.lambda_mmd,
-                "cov": args.lambda_cov,
-                "div": args.lambda_div,
-                "mean": args.lambda_mean,
-                "var": args.lambda_var,
-                "block_rel_l2": args.lambda_block,
-            },
-            "modality_grouped_losses": ["mmd", "cov", "mean", "var"],
-            "div_warmup_steps": args.div_warmup_steps,
-            "mmd_subsample": args.mmd_subsample,
-            "synthetic_bank_mode": "independent_per_modality",
-            "block_constraint_layer": block_constraint_layer,
-            "final_losses": final_losses,
-            "history": history,
-            "created_at": utc_now_iso(),
-        },
-    }
-    if synth_labels is not None:
-        payload["modality_labels"] = synth_labels.cpu()
-
-    torch.save(payload, args.output_path)
     print(f"[representation_distill] Saved synthetic calibration hidden to {args.output_path}")
+    if wandb_run is not None:
+        wandb_run.summary.update(
+            {
+                "output_path": args.output_path,
+                "created_at": payload["metadata"]["created_at"],
+                **{f"final/{k}": v for k, v in (final_losses or {}).items()},
+            }
+        )
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

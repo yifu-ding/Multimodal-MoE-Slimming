@@ -1,10 +1,17 @@
 """Unified dataset loading and evaluation for prune-and-eval tasks."""
 
+import json
+import os
 import random
 import re
 import statistics
+import tarfile
+import zipfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+
+import pyarrow.parquet as pq
 
 
 @dataclass
@@ -73,10 +80,151 @@ def _mc_accuracy_evaluate(predictions: List[dict]) -> dict:
     }
 
 
-def _load_hf_dataset(dataset_path: str, split: str = "test"):
+def _load_hf_dataset(dataset_path: str, config_name: Optional[str] = None, split: str = "test"):
     """Generic HF dataset loader. Returns the Dataset object directly (lazy image decoding)."""
     from datasets import load_dataset
-    return load_dataset(dataset_path, split=split, token=True)
+    if config_name is None:
+        return load_dataset(dataset_path, split=split, token=True)
+    return load_dataset(dataset_path, config_name, split=split, token=True)
+
+
+def _hf_home() -> str:
+    return os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+
+
+def _tmp_media_root() -> str:
+    root = os.path.join("/tmp", "modes_media_cache")
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _load_dataset_from_parquet(parquet_path: str):
+    from datasets import Dataset
+
+    table = pq.read_table(parquet_path)
+    return Dataset(table)
+
+
+def _load_dataset_from_arrow(arrow_path: str):
+    from datasets import Dataset
+
+    return Dataset.from_file(arrow_path)
+
+
+def _extract_zip_member(archive_paths: List[str], member_name: str, target_root: str) -> Optional[str]:
+    target_path = os.path.join(target_root, member_name)
+    if os.path.exists(target_path):
+        return target_path
+
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    for archive_path in archive_paths:
+        if not os.path.exists(archive_path):
+            continue
+        with zipfile.ZipFile(archive_path) as zf:
+            names = zf.namelist()
+            if member_name in names:
+                zf.extract(member_name, path=target_root)
+                return target_path
+
+            basename = os.path.basename(member_name)
+            basename_hits = [name for name in names if os.path.basename(name) == basename]
+            if len(basename_hits) == 1:
+                extracted_name = basename_hits[0]
+                zf.extract(extracted_name, path=target_root)
+                return os.path.join(target_root, extracted_name)
+    return None
+
+
+def _find_existing_media_path(candidates: List[str]) -> Optional[str]:
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _resolve_egoschema_video_path(video_idx: str) -> str:
+    dataset_root = os.path.join(_hf_home(), "datasets", "egoschema")
+    extracted = _find_existing_media_path(
+        [
+            os.path.join(dataset_root, "videos", f"{video_idx}.mp4"),
+            os.path.join(dataset_root, "videos", f"{video_idx}.MP4"),
+        ]
+    )
+    if extracted:
+        return extracted
+
+    archive_paths = sorted(str(p) for p in Path(dataset_root).glob("videos_chunked_*.zip"))
+    for suffix in ("mp4", "MP4"):
+        member = f"videos/{video_idx}.{suffix}"
+        extracted = _extract_zip_member(archive_paths, member, os.path.join(_tmp_media_root(), "egoschema"))
+        if extracted:
+            return extracted
+    raise FileNotFoundError(f"EgoSchema video not found for {video_idx}")
+
+
+def _resolve_videomme_video_path(video_id: str) -> str:
+    dataset_root = os.path.join(_hf_home(), "datasets", "Video-MME")
+    extracted = _find_existing_media_path(
+        [
+            os.path.join(dataset_root, "data", f"{video_id}.mp4"),
+            os.path.join(dataset_root, "data", f"{video_id}.MP4"),
+            os.path.join(dataset_root, "data", f"{video_id}.mkv"),
+        ]
+    )
+    if extracted:
+        return extracted
+
+    archive_paths = sorted(str(p) for p in Path(dataset_root).glob("videos_chunked_*.zip"))
+    for suffix in ("mp4", "MP4", "mkv"):
+        member = f"data/{video_id}.{suffix}"
+        extracted = _extract_zip_member(archive_paths, member, os.path.join(_tmp_media_root(), "videomme"))
+        if extracted:
+            return extracted
+    raise FileNotFoundError(f"Video-MME video not found for {video_id}")
+
+
+def _resolve_mvbench_video_path(sub_task: str, video_name: str) -> str:
+    from lmms_eval.tasks.mvbench.utils import DATA_LIST
+
+    dataset_root = os.path.join(_hf_home(), "datasets", "MVBench")
+    dataset_folder = DATA_LIST[sub_task]
+    candidates = [
+        os.path.join(dataset_root, "video", dataset_folder, video_name),
+        os.path.join(dataset_root, "video", "data0613", dataset_folder, video_name),
+    ]
+    extracted = _find_existing_media_path(candidates)
+    if extracted:
+        return extracted
+
+    archive_paths = sorted(str(p) for p in Path(dataset_root, "video").glob("*.zip"))
+    for member in (dataset_folder + "/" + video_name, "data0613/" + dataset_folder + "/" + video_name):
+        extracted = _extract_zip_member(archive_paths, member, os.path.join(_tmp_media_root(), "mvbench"))
+        if extracted:
+            return extracted
+    raise FileNotFoundError(f"MVBench video not found for sub_task={sub_task}, video={video_name}")
+
+
+def _resolve_longvideobench_video_path(video_path: str) -> str:
+    candidates = [
+        os.path.join(_hf_home(), "datasets", "longvideobench", "videos", video_path),
+        os.path.join(_hf_home(), "datasets", "longvideobench___long_video_bench", "videos", video_path),
+        os.path.join(
+            _hf_home(),
+            "hub",
+            "datasets--longvideobench--LongVideoBench",
+            "snapshots",
+            "60d1c89c1919a198b73be39c2babb213b29d6a5c",
+            "videos",
+            video_path,
+        ),
+    ]
+    extracted = _find_existing_media_path(candidates)
+    if extracted:
+        return extracted
+    raise FileNotFoundError(
+        f"LongVideoBench video not found for {video_path}. "
+        "Expected extracted videos under $HF_HOME/datasets/longvideobench or the hub snapshot."
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -314,7 +462,10 @@ def _build_mmbench_helpers() -> TaskHelpers:
     )
 
 def _load_mmbench_rows() -> List[dict]:
-    return _load_hf_dataset("lmms-lab/MMBench", split="dev")
+    local_parquet = os.path.join(_hf_home(), "datasets", "MMBench", "en", "dev-00000-of-00001.parquet")
+    if os.path.exists(local_parquet):
+        return _load_dataset_from_parquet(local_parquet)
+    return _load_hf_dataset("lmms-lab/MMBench", "en", split="dev")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -492,13 +643,14 @@ def _load_videommmu_rows():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _build_mvbench_helpers() -> TaskHelpers:
-    from lmms_eval.tasks.mvbench.utils import mvbench_doc_to_visual, mvbench_doc_to_text
+    from lmms_eval.tasks.mvbench.utils import mvbench_doc_to_text
 
     def doc_to_visual(doc):
-        return mvbench_doc_to_visual(doc)
+        return [_resolve_mvbench_video_path(doc["sub_task"], doc["video"])]
 
     def doc_to_text(doc):
         return mvbench_doc_to_text(doc, lmms_eval_specific_kwargs={
+            "sub_task": doc["sub_task"],
             "post_prompt": "\nAnswer with the option's letter from the given choices directly.",
         })
 
@@ -515,7 +667,49 @@ def _build_mvbench_helpers() -> TaskHelpers:
     )
 
 def _load_mvbench_rows() -> List[dict]:
-    return _load_hf_dataset("OpenGVLab/MVBench", split="test")
+    mvbench_json_root = os.path.join(_hf_home(), "datasets", "MVBench", "json")
+    if os.path.isdir(mvbench_json_root):
+        rows: List[dict] = []
+        for json_path in sorted(Path(mvbench_json_root).glob("*.json")):
+            sub_task = json_path.stem
+            with open(json_path, "r") as f:
+                task_rows = json.load(f)
+            for row in task_rows:
+                row["sub_task"] = sub_task
+                rows.append(row)
+        return rows
+
+    # Fallback: build a merged list from all configs if local json cache is absent.
+    from datasets import concatenate_datasets, load_dataset
+
+    config_names = [
+        "action_sequence",
+        "moving_count",
+        "action_prediction",
+        "episodic_reasoning",
+        "action_antonym",
+        "action_count",
+        "scene_transition",
+        "object_shuffle",
+        "object_existence",
+        "fine_grained_pose",
+        "unexpected_action",
+        "moving_direction",
+        "state_change",
+        "object_interaction",
+        "character_order",
+        "action_localization",
+        "counterfactual_inference",
+        "fine_grained_action",
+        "moving_attribute",
+        "egocentric_navigation",
+    ]
+    datasets = []
+    for config_name in config_names:
+        ds = load_dataset("OpenGVLab/MVBench", config_name, split="test", token=True)
+        ds = ds.add_column("sub_task", [config_name] * len(ds))
+        datasets.append(ds)
+    return concatenate_datasets(datasets)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -523,10 +717,10 @@ def _load_mvbench_rows() -> List[dict]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _build_egoschema_helpers() -> TaskHelpers:
-    from lmms_eval.tasks.egoschema.utils import egoschema_doc_to_visual, egoschema_doc_to_text
+    from lmms_eval.tasks.egoschema.utils import egoschema_doc_to_text
 
     def doc_to_visual(doc):
-        return egoschema_doc_to_visual(doc)
+        return [_resolve_egoschema_video_path(doc["video_idx"])]
 
     def doc_to_text(doc):
         return egoschema_doc_to_text(doc, lmms_eval_specific_kwargs={
@@ -546,7 +740,10 @@ def _build_egoschema_helpers() -> TaskHelpers:
     )
 
 def _load_egoschema_rows() -> List[dict]:
-    return _load_hf_dataset("lmms-lab/egoschema", split="test")
+    local_parquet = os.path.join(_hf_home(), "datasets", "egoschema", "GENERATION", "test-00000-of-00001.parquet")
+    if os.path.exists(local_parquet):
+        return _load_dataset_from_parquet(local_parquet)
+    return _load_hf_dataset("lmms-lab/egoschema", "GENERATION", split="test")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -554,10 +751,8 @@ def _load_egoschema_rows() -> List[dict]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _build_videomme_helpers() -> TaskHelpers:
-    from lmms_eval.tasks.videomme.utils import videomme_doc_to_visual
-
     def doc_to_visual(doc):
-        return videomme_doc_to_visual(doc)
+        return [_resolve_videomme_video_path(doc["videoID"])]
 
     def doc_to_text(doc):
         question = doc["question"]
@@ -579,7 +774,18 @@ def _build_videomme_helpers() -> TaskHelpers:
     )
 
 def _load_videomme_rows() -> List[dict]:
-    return _load_hf_dataset("lmms-lab/Video-MME", split="test")
+    local_arrow = os.path.join(
+        _hf_home(),
+        "datasets",
+        "lmms-lab___video-mme",
+        "videomme",
+        "0.0.0",
+        "ead1408f75b618502df9a1d8e0950166bf0a2a0b",
+        "video-mme-test.arrow",
+    )
+    if os.path.exists(local_arrow):
+        return _load_dataset_from_arrow(local_arrow)
+    return _load_hf_dataset("lmms-lab/Video-MME", "videomme", split="test")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -588,15 +794,15 @@ def _load_videomme_rows() -> List[dict]:
 
 def _build_longvideobench_helpers() -> TaskHelpers:
     from lmms_eval.tasks.longvideobench.utils import (
-        longvideobench_doc_to_visual_v as lvb_doc_to_visual,
         longvideobench_doc_to_text as lvb_doc_to_text,
     )
 
     def doc_to_visual(doc):
-        return lvb_doc_to_visual(doc)
+        return [_resolve_longvideobench_video_path(doc["video_path"])]
 
     def doc_to_text(doc):
         return lvb_doc_to_text(doc, lmms_eval_specific_kwargs={
+            "pre_prompt": "",
             "post_prompt": "\nAnswer with the option's letter from the given choices directly.",
         })
 
@@ -613,7 +819,18 @@ def _build_longvideobench_helpers() -> TaskHelpers:
     )
 
 def _load_longvideobench_rows() -> List[dict]:
-    return _load_hf_dataset("longvideobench/LongVideoBench", split="test")
+    local_arrow = os.path.join(
+        _hf_home(),
+        "datasets",
+        "longvideobench___long_video_bench",
+        "default",
+        "0.0.0",
+        "60d1c89c1919a198b73be39c2babb213b29d6a5c",
+        "long_video_bench-validation.arrow",
+    )
+    if os.path.exists(local_arrow):
+        return _load_dataset_from_arrow(local_arrow)
+    return _load_hf_dataset("longvideobench/LongVideoBench", split="validation")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

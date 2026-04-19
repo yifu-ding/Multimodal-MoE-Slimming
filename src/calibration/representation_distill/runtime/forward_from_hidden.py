@@ -7,6 +7,7 @@ from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_m
 from src.calibration.representation_distill.common import (
     build_position_ids_from_attention_mask,
     get_final_norm,
+    make_compact_position_ids,
 )
 
 
@@ -77,6 +78,8 @@ def _kimi_forward_from_hidden(
     lm = bundle.model.language_model.model
     if position_ids is None:
         position_ids = build_position_ids_from_attention_mask(attention_mask)
+    else:
+        position_ids = make_compact_position_ids(position_ids, attention_mask)
 
     if lm._use_flash_attention_2:
         layer_attention_mask = (
@@ -145,4 +148,3 @@ def forward_from_hidden(
     raise NotImplementedError(
         f"`forward_from_hidden` currently supports qwen3/kimi only, got family={bundle.family}."
     )
-
