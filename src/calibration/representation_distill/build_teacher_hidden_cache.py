@@ -171,6 +171,7 @@ def main() -> None:
     save_dtype = _parse_dtype(args.save_dtype)
     cache_chunks = []
     label_chunks = []
+    position_id_chunks = []
     dataset_ids = []
     sample_manifest = []
     teacher_dtype = None
@@ -208,18 +209,21 @@ def main() -> None:
         )
         cache_chunks.append(result.hidden_states.to(dtype=save_dtype).cpu())
         label_chunks.append(result.modality_labels.cpu())
+        position_id_chunks.append(result.position_ids.cpu())
         dataset_ids.extend(int(sample["dataset_id"]) for sample in batch)
         sample_manifest.extend(build_sample_manifest(batch))
 
     # 3) 拼成完整张量与侧车信息, 写入 payload
     teacher_cache = torch.cat(cache_chunks, dim=0)
     modality_labels = torch.cat(label_chunks, dim=0)
+    position_ids = torch.cat(position_id_chunks, dim=0)
     _mode_suffix = "modality_aware_" if args.modality_aware_compression else "uniform_"
     compression_mode_label = _mode_suffix + args.compression_mode
 
     payload = {
         "teacher_cache": teacher_cache,
         "modality_labels": modality_labels,
+        "position_ids": position_ids,
         "dataset_ids": torch.tensor(dataset_ids, dtype=torch.long),
         "sample_manifest": sample_manifest,
         "metadata": {

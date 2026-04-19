@@ -30,7 +30,24 @@ TEACHER_DATASETS="${TEACHER_DATASETS:-gqa}"
 #   --compression_mode attention_weighted --attn_temperature 0.5
 #   # 旧的 mean pooling
 #   --compression_mode pool
-COMPRESSION_MODE="${COMPRESSION_MODE:-attention_weighted}"
+COMPRESSION_MODE="${COMPRESSION_MODE:-sample}"
+ATTN_TEMPERATURE="${ATTN_TEMPERATURE:-1.0}"
+
+MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
+OUTPUT_PATH="${OUTPUT_PATH:-${PREFIX}/storage/data_distill_kimi/${TEACHER_DATASETS}-${COMPRESSION_MODE}_at${ATTN_TEMPERATURE}-$(date +%m%d%H%M%S)}/teacher_hidden.pt"
+LATEST_LINK_DIR="${LATEST_LINK_DIR:-${PREFIX}/storage/data_distill_kimi/${TEACHER_DATASETS}-${COMPRESSION_MODE}_at${ATTN_TEMPERATURE}-latest}"
+TEACHER_LAYER="${TEACHER_LAYER:-0}"
+COMPRESSED_LENGTH="${COMPRESSED_LENGTH:-256}"
+SAMPLES_PER_DATASET="${SAMPLES_PER_DATASET:-4096}"
+
+BATCH_SIZE="${BATCH_SIZE:-2}"
+SEED="${SEED:-42}"
+SHUFFLE_SEED="${SHUFFLE_SEED:-1234}"
+NUM_VIDEO_FRAMES="${NUM_VIDEO_FRAMES:-8}"
+VIDEO_MAX_LONG_SIDE="${VIDEO_MAX_LONG_SIDE:-480}"
+SAVE_DTYPE="${SAVE_DTYPE:-float32}"
+DEVICE_MAP="${DEVICE_MAP:-cuda:0}"
+ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
 
 EXTRA_ARGS=("$@")
 
@@ -52,6 +69,7 @@ CMD=(
     --teacher_datasets ${TEACHER_DATASETS}
     --compression_mode ${COMPRESSION_MODE}
     --modality_aware_compression
+    --attn_temperature "${ATTN_TEMPERATURE}"
 )
 
 CMD+=("${EXTRA_ARGS[@]}")
@@ -68,3 +86,7 @@ echo "Device map         : ${DEVICE_MAP}"
 echo "CMD: ${CMD[*]}"
 echo ""
 "${CMD[@]}"
+
+mkdir -p "$(dirname "${LATEST_LINK_DIR}")"
+ln -sfn "$(dirname "${OUTPUT_PATH}")" "${LATEST_LINK_DIR}"
+echo "Latest link        : ${LATEST_LINK_DIR}"
