@@ -190,6 +190,7 @@ def _weighted_sample_single_sequence(
 
     Returns (sampled_hidden, selected_indices) sorted by position.
     """
+    # 按 importance 做 softmax 采样 target_length 个位置 (无放回), 再按原序列位置排序返回.
     seq_len, hidden_size = hidden.shape
     if target_length <= 0:
         return hidden.new_zeros((0, hidden_size)), torch.zeros(0, dtype=torch.long, device=hidden.device)
@@ -197,14 +198,16 @@ def _weighted_sample_single_sequence(
         return hidden.new_zeros((target_length, hidden_size)), torch.zeros(
             target_length, dtype=torch.long, device=hidden.device,
         )
+    # 有效 token 不足或刚好: 循环取位置填满长度.
     if seq_len <= target_length:
         indices = torch.arange(target_length, device=hidden.device) % seq_len
         return hidden[indices], indices
 
-    # Build sampling probabilities from importance scores
+    # 由 importance 构造分布, temperature 越大分布越平, 越小越贴近 top importance.
     imp = importance.float().clamp(min=0)
     if temperature <= 0 or imp.sum() == 0:
         # Degenerate: fall back to top-k or uniform
+        # 权重全 0: 退化为均匀随机; 否则退化为 importance 最大的 top-k 个下标.
         if imp.sum() == 0:
             indices = torch.randperm(seq_len, device=hidden.device)[:target_length]
         else:
@@ -214,6 +217,7 @@ def _weighted_sample_single_sequence(
         probs = torch.softmax(log_probs, dim=-1)
         indices = torch.multinomial(probs, num_samples=target_length, replacement=False)
 
+    # 与 _sample_single_sequence 一致: 按原序列下标排序, 保证输出 token 随位置递增.
     indices, _ = indices.sort()
     return hidden[indices], indices
 
@@ -368,6 +372,7 @@ def compress_hidden_states(
 
     Returns a :class:`CompressedResult` with *hidden_states* and *modality_labels*.
     """
+    # 将每条样本的 seq 维压到 target_length, 可选按模态分别压缩再拼接, 并输出逐 token 模态标签.
     valid_modes = ("pool", "sample", "attention_weighted")
     if mode not in valid_modes:
         raise ValueError(f"Unsupported compression mode: {mode!r}")
@@ -377,6 +382,7 @@ def compress_hidden_states(
     batch_size = hidden_states.shape[0]
     mask = attention_mask.to(torch.bool)
 
+    # 模态感知路径: 需提供 text/image/video 掩码, 若给 modality_lengths 则三模态长度之和须等于 target_length.
     if compression_masks is not None:
         for required_key in ("text", "image", "video"):
             if required_key not in compression_masks:
@@ -396,6 +402,7 @@ def compress_hidden_states(
 
     def _select(hidden_1d: torch.Tensor, length: int, imp_1d: torch.Tensor | None):
         """Dispatch to the right selection strategy."""
+        # 单段序列 (已按掩码取出的有效 token) 上执行 pool / 均匀采样 / 注意力加权采样之一.
         if mode == "pool":
             return _pool_single_sequence(hidden_1d.float(), length)
         if mode == "attention_weighted" and imp_1d is not None:
@@ -411,6 +418,7 @@ def compress_hidden_states(
         batch_imp = attn_importance[batch_idx] if attn_importance is not None else None
 
         if compression_masks is None:
+            # 非模态感知: 仅用 attention_mask 取有效 token, 整段压到 target_length, 标签全标为 TEXT.
             valid_mask = mask[batch_idx]
             valid_hidden = hidden_states[batch_idx][valid_mask]
             valid_imp = batch_imp[valid_mask] if batch_imp is not None else None
@@ -420,6 +428,7 @@ def compress_hidden_states(
             )
             continue
 
+        # 模态感知: 为各模态分配长度预算, 再分别压缩后沿 seq 维拼接.
         eff_lengths = _compute_effective_modality_lengths(
             compression_masks, batch_idx, target_length, modality_lengths,
         )

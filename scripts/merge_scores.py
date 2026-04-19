@@ -293,6 +293,6 @@ if __name__ == "__main__":
 
 
 ############# take notes ###############
-# /home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_coco-rell2-04142126/scores.pt  
-# /home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_coco-rell2-04142125/scores.pt
-# merged -> /home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_coco-rell2-041421.pt
+# /home/dyf/code/distill/MAES/storage/prune/scores/kimi-vl-a3b_coco-rell2-04142126/scores.pt  
+# /home/dyf/code/distill/MAES/storage/prune/scores/kimi-vl-a3b_coco-rell2-04142125/scores.pt
+# merged -> /home/dyf/code/distill/MAES/storage/prune/scores/kimi-vl-a3b_coco-rell2-041421.pt

@@ -9,9 +9,9 @@ export HF_HOME="${HF_HOME:-/home/data/dyf/hf_cache}"
 HIDDEN_PAYLOAD_PATH="${HIDDEN_PAYLOAD_PATH:-${PREFIX}/storage/data_distill/teacher_cache/teacher_hidden_cache.pt}"
 OUTPUT_PATH="${OUTPUT_PATH:-$(dirname "${HIDDEN_PAYLOAD_PATH}")/distilled/distilled_hidden.pt}"
 
-SYNTHETIC_SIZE="${SYNTHETIC_SIZE:-256}"
-TEACHER_BATCH_SIZE="${TEACHER_BATCH_SIZE:-1024}"
-TRAIN_STEPS="${TRAIN_STEPS:-2000}"
+SYNTHETIC_SIZE="${SYNTHETIC_SIZE:-1024}"  # 合成 hidden 的 token 数
+TEACHER_BATCH_SIZE="${TEACHER_BATCH_SIZE:-2048}"  # 每步多少条教师序列作为样本参与 loss 计算
+TRAIN_STEPS="${TRAIN_STEPS:-6000}"  # 训练多少步
 LR="${LR:-1e-2}"
 SEED="${SEED:-42}"
 DEVICE="${DEVICE:-cuda}"

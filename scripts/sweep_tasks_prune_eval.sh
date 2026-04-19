@@ -29,8 +29,8 @@ cd "${REPO_ROOT}"
 PREFIX="${PREFIX:-${REPO_ROOT}}"
 export PYTHONPATH="${PREFIX}"
 
-# export SCORES_PATH="/home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_gqa-rell2-041513.pt"
-export SCORES_PATH="/home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_coco-rell2-fill1-0416-115847.pt"
+# export SCORES_PATH="/home/dyf/code/distill/MAES/storage/prune/scores/kimi-vl-a3b_gqa-rell2-041513.pt"
+export SCORES_PATH="/home/dyf/code/distill/MAES/storage/prune/scores/kimi-vl-a3b_coco-rell2-fill1-0416-115847.pt"
 
 USE_LMMS_EVAL=${USE_LMMS_EVAL:-0}
 # ── Task grid ──────────────────────────────────────────────────────────────────
