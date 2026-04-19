@@ -35,9 +35,9 @@ cd "${REPO_ROOT}"
 PREFIX="${PREFIX:-${REPO_ROOT}}"
 export PYTHONPATH="${PREFIX}"
 
-# export SCORES_PATH="/home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_gqa-rell2-fill1-0415-231450.pt"
-# export SCORES_PATH="/home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_coco-rell2-fill1-0416-115847/scores.pt"
-export SCORES_PATH="/home/dyf/code/distill/MoDES/storage/prune/scores/kimi-vl-a3b_gqa-rell2-041513.pt"
+# export SCORES_PATH="/home/dyf/code/distill/MAES/storage/prune/scores/kimi-vl-a3b_gqa-rell2-fill1-0415-231450.pt"
+# export SCORES_PATH="/home/dyf/code/distill/MAES/storage/prune/scores/kimi-vl-a3b_coco-rell2-fill1-0416-115847/scores.pt"
+export SCORES_PATH="/home/dyf/code/distill/MAES/storage/prune/scores/kimi-vl-a3b_gqa-rell2-041513.pt"
 
 # Default grids (edit or override via env)
 # INTRA_METHOD = --intra_method (intra-layer planner); see run_prune_eval_kimi_gqa.sh

@@ -6,6 +6,20 @@ PREFIX="${PREFIX:-$(pwd)}"
 export PYTHONPATH="${PREFIX}"
 export HF_HOME="${HF_HOME:-/home/data/dyf/hf_cache}"
 
+MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
+OUTPUT_PATH="${OUTPUT_PATH:-${PREFIX}/storage/data_distill/attn_weighted-$(date +%m%d%H%M%S)}/teacher_cache.pt"
+TEACHER_LAYER="${TEACHER_LAYER:-0}"
+COMPRESSED_LENGTH="${COMPRESSED_LENGTH:-256}"  # sequence length  # 只压缩 seqlen
+SAMPLES_PER_DATASET="${SAMPLES_PER_DATASET:-4096}"  # 多少条，这个在cache过程中是不变的（不压缩条数）
+BATCH_SIZE="${BATCH_SIZE:-2}"
+SEED="${SEED:-42}"
+SHUFFLE_SEED="${SHUFFLE_SEED:-1234}"
+NUM_VIDEO_FRAMES="${NUM_VIDEO_FRAMES:-8}"
+VIDEO_MAX_LONG_SIDE="${VIDEO_MAX_LONG_SIDE:-480}"
+SAVE_DTYPE="${SAVE_DTYPE:-float32}"
+DEVICE_MAP="${DEVICE_MAP:-cuda:0}"
+ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
+
 TEACHER_DATASETS="${TEACHER_DATASETS:-gqa}"
 #   使用方式
 #   # 均匀随机采样（默认���

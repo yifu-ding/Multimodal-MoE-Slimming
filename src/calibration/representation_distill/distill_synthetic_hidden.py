@@ -1,7 +1,12 @@
+"""从教师模型 hidden 缓存中优化出一小份合成 hidden, 用于表征级校准.
+
+训练目标: 用 MMD, 协方差, 多样性等分布损失, 辅以均值与方差矩匹配, 使合成样本在统计上逼近教师缓存.
+"""
 import argparse
 import os
 import sys
 
+# 将仓库根与父目录加入 sys.path, 以便以包形式导入 src.*
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "..", ".."))
 REPO_PARENT = os.path.dirname(REPO_ROOT)
@@ -28,10 +33,11 @@ from src.calibration.representation_distill.runtime.forward_from_hidden import f
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers (行采样与下采样等工具函数)
 # ---------------------------------------------------------------------------
 
 def _sample_rows(tensor: torch.Tensor, count: int) -> torch.Tensor:
+    # 从首维随机抽 count 行, 若不足则全取
     if count >= tensor.shape[0]:
         return tensor
     indices = torch.randint(0, tensor.shape[0], (count,), device=tensor.device)
@@ -40,6 +46,7 @@ def _sample_rows(tensor: torch.Tensor, count: int) -> torch.Tensor:
 
 def _subsample_flat(tensor: torch.Tensor, max_tokens: int) -> torch.Tensor:
     """Subsample rows for efficient kernel computation."""
+    # 对行做随机下采样, 控制核矩阵规模, 降低 MMD 等计算开销
     if tensor.shape[0] <= max_tokens:
         return tensor
     indices = torch.randperm(tensor.shape[0], device=tensor.device)[:max_tokens]
@@ -139,7 +146,7 @@ def _compute_next_block_rel_l2(
 
 
 # ---------------------------------------------------------------------------
-# Loss functions
+# Loss functions (MMD, 协方差, 多样性, 矩匹配)
 # ---------------------------------------------------------------------------
 
 def _mmd_rbf(
@@ -157,15 +164,17 @@ def _mmd_rbf(
     if X.shape[0] == 0 or Y.shape[0] == 0:
         return torch.tensor(0.0, device=X.device)
 
+    # 成对欧氏距离平方, 用于 RBF 核
     XX = torch.cdist(X, X).pow(2)
     YY = torch.cdist(Y, Y).pow(2)
     XY = torch.cdist(X, Y).pow(2)
 
-    # Median heuristic for bandwidth
+    # 带宽: 用全体距离的中位数启发式, 再乘多组 multiplier
     with torch.no_grad():
         all_dists = torch.cat([XX.view(-1), YY.view(-1), XY.view(-1)])
         median_dist = all_dists.median().clamp(min=1e-6)
 
+    # 多带宽 RBF 下无偏 MMD^2 估计, 各带宽结果相加
     mmd = torch.tensor(0.0, device=X.device)
     for mult in bandwidth_multipliers:
         bw_sq = 2.0 * (mult * median_dist)
@@ -178,6 +187,7 @@ def _mmd_rbf(
 
 def _cov_loss(teacher_flat: torch.Tensor, synth_flat: torch.Tensor) -> torch.Tensor:
     """MSE between cross-channel covariance matrices."""
+    # 通道维协方差矩阵的逐元素 MSE, 对齐二阶结构
     t_centered = teacher_flat - teacher_flat.mean(dim=0, keepdim=True)
     s_centered = synth_flat - synth_flat.mean(dim=0, keepdim=True)
     t_cov = (t_centered.T @ t_centered) / max(teacher_flat.shape[0] - 1, 1)
@@ -204,7 +214,7 @@ def _diversity_loss(synthetic_flat: torch.Tensor) -> torch.Tensor:
     normed = F.normalize(synthetic_flat, dim=-1)
     sim = normed @ normed.T
     n = sim.shape[0]
-    # Exclude diagonal
+    # 非对角线余弦相似度均值, 越小表示样本间越分散
     off_diag = sim.masked_select(~torch.eye(n, dtype=torch.bool, device=sim.device))
     return off_diag.mean()
 
@@ -445,7 +455,7 @@ def _save_payload(
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# CLI (命令行参数)
 # ---------------------------------------------------------------------------
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -465,7 +475,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda_mmd", type=float, default=1.0)
     parser.add_argument("--lambda_cov", type=float, default=0.1)
     parser.add_argument("--lambda_div", type=float, default=0.1)
-    # Legacy moment-matching (auxiliary, reduced weight)
+    # 辅助矩匹配: 均值与方差
     parser.add_argument("--lambda_mean", type=float, default=0.5)
     parser.add_argument("--lambda_var", type=float, default=0.5)
     parser.add_argument("--lambda_block", type=float, default=0.0)
@@ -547,6 +557,7 @@ def main() -> None:
     teacher_labels = cache_payload.get("modality_labels", None)
     teacher_position_ids = cache_payload.get("position_ids", None)
 
+    # 2) 设备与张量迁移
     device = args.device
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -565,12 +576,12 @@ def main() -> None:
             teacher_labels,
         )
 
-    # Initialize from random teacher samples
+    # 3) 初始化: 从教师缓存随机抽 synthetic_size 条序列作为可学习参数, 可选加高斯噪声
     init_indices = torch.randint(0, teacher_cache.shape[0], (args.synthetic_size,), device=device)
     init_hidden = teacher_cache.index_select(0, init_indices).clone()
     init_position_ids = teacher_position_ids.index_select(0, init_indices).clone()
 
-    # Modality labels: frozen, copied from init samples
+    # 合成样本的模态标签与初始化样本一致, 训练过程中不更新
     synth_labels = None
     if teacher_labels is not None:
         synth_labels = teacher_labels.index_select(0, init_indices).clone()  # not a Parameter
@@ -676,6 +687,7 @@ def main() -> None:
             ema_state=loss_ema_state,
         )
 
+        # 反传并更新合成 hidden
         optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
         optimizer.step()
