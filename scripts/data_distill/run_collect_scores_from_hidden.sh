@@ -8,7 +8,7 @@ export HF_HOME="${HF_HOME:-/home/data/dyf/hf_cache}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 HIDDEN_PAYLOAD_PATH="${HIDDEN_PAYLOAD_PATH:-${PREFIX}/storage/data_distill_kimi/gqa-sample_at1.0-latest/distilled-latest/distilled_hidden.pt}"
-OUTPUT_PATH="${OUTPUT_PATH:-$(dirname "${HIDDEN_PAYLOAD_PATH}")/scores.pt}"
+OUTPUT_PATH="${OUTPUT_PATH:-${HIDDEN_PAYLOAD_PATH%.pt}-scores.pt}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 EMA="${EMA:-0.9}"
 LOSS_FN="${LOSS_FN:-rel_l2}"

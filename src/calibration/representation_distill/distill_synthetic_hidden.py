@@ -484,6 +484,25 @@ def _save_payload(
     return payload
 
 
+def _assemble_full_synthetic_hidden(
+    *,
+    bank_params,
+    synth_template_labels: torch.Tensor,
+    synth_template_bank_indices: torch.Tensor,
+    synthetic_size: int,
+    compressed_length: int,
+    hidden_size: int,
+) -> torch.Tensor:
+    return _assemble_synthetic_hidden(
+        bank_params=bank_params,
+        template_labels=synth_template_labels,
+        template_bank_indices=synth_template_bank_indices,
+        synthetic_size=synthetic_size,
+        compressed_length=compressed_length,
+        hidden_size=hidden_size,
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI (命令行参数)
 # ---------------------------------------------------------------------------
@@ -799,13 +818,21 @@ def main() -> None:
             and (step + 1) % args.checkpoint_interval == 0
             and step != args.train_steps - 1
         ):
+            checkpoint_hidden = _assemble_full_synthetic_hidden(
+                bank_params=bank_params,
+                synth_template_labels=synth_template_labels,
+                synth_template_bank_indices=synth_template_bank_indices,
+                synthetic_size=args.synthetic_size,
+                compressed_length=init_hidden.shape[1],
+                hidden_size=init_hidden.shape[2],
+            )
             checkpoint_path = os.path.join(
                 os.path.dirname(args.output_path),
                 f"{os.path.splitext(os.path.basename(args.output_path))[0]}-step{step + 1}.pt",
             )
             _save_payload(
                 output_path=checkpoint_path,
-                synthetic_hidden=synthetic_hidden,
+                synthetic_hidden=checkpoint_hidden,
                 synth_position_ids=synth_position_ids,
                 synth_labels=synth_labels,
                 teacher_meta=teacher_meta,
@@ -816,10 +843,10 @@ def main() -> None:
             )
             print(f"[representation_distill] Saved checkpoint: {checkpoint_path}")
 
-    synthetic_hidden = _assemble_synthetic_hidden(
+    synthetic_hidden = _assemble_full_synthetic_hidden(
         bank_params=bank_params,
-        template_labels=synth_template_labels,
-        template_bank_indices=synth_template_bank_indices,
+        synth_template_labels=synth_template_labels,
+        synth_template_bank_indices=synth_template_bank_indices,
         synthetic_size=args.synthetic_size,
         compressed_length=init_hidden.shape[1],
         hidden_size=init_hidden.shape[2],

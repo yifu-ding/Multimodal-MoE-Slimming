@@ -843,7 +843,10 @@ def _build_longvideobench_helpers() -> TaskHelpers:
         })
 
     def doc_to_answer(doc):
-        return doc.get("correct_choice", doc.get("answer", ""))
+        answer = doc.get("correct_choice", doc.get("answer", ""))
+        if isinstance(answer, int) and 0 <= answer < 26:
+            return chr(ord("A") + answer)
+        return str(answer)
 
     return TaskHelpers(
         task_name="longvideobench",

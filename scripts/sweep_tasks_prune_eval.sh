@@ -30,7 +30,10 @@ PREFIX="${PREFIX:-${REPO_ROOT}}"
 export PYTHONPATH="${PREFIX}"
 
 # export SCORES_PATH="/home/dyf/code/distill/MAES/storage/prune/scores/kimi-vl-a3b_gqa-rell2-041513.pt"
-export SCORES_PATH="/home/dyf/code/distill/MAES/storage/prune/scores/kimi-vl-a3b_coco-rell2-fill1-0416-115847.pt"
+# export SCORES_PATH="/home/dyf/code/distill/MAES/storage/prune/scores/kimi-vl-a3b_coco-rell2-fill1-0416-115847.pt"
+# export SCORES_PATH="storage/data_distill_kimi/gqa-sample_at1.0-0418234400/distilled-0419142618/scores-step4000.pt"
+export SCORES_PATH="storage/data_distill_kimi/gqa-sample_at1.0-0418234400/distilled-0419182016/distilled_hidden-scores.pt"
+# export SCORES_PATH="storage/data_distill_kimi/gqa-sample_at1.0-0418234400/distilled-0419164811/distilled_hidden-step7000-scores.pt"
 
 USE_LMMS_EVAL=${USE_LMMS_EVAL:-0}
 # ── Task grid ──────────────────────────────────────────────────────────────────
@@ -38,19 +41,35 @@ USE_LMMS_EVAL=${USE_LMMS_EVAL:-0}
 SWEEP_TASKS="${SWEEP_TASKS:-textvqa chartqa mmstar mmbench mmvet mme realworldqa coco2017cap mvbench egoschema videomme longvideobench video_mmmu}"
 
 # ── Setting grids (same defaults as sweep_prune_eval_kimi_gqa.sh) ──────────────
-SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-loss_smooth_2 uniform uniform_coverage}"
-SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-uniform second_attr_coverage second_attr_fillzero_coverage}"
+SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform uniform_coverage}"
+SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-uniform second_attr_coverage}"
 SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-0}"
 SMOOTH_FN="${SMOOTH_FN:-sqrt}"
-SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act 3proj_act down_second_order_exact 3proj_second_order}"
+SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act 3proj_second_order down_second_order_exact}"
 # 3proj_second_order down_saliency 3proj_saliency 3proj_grad wg
 
 # ── Output paths ───────────────────────────────────────────────────────────────
 # Timestamp is fixed at script start so all runs share the same directory.
 SWEEP_TS="${SWEEP_TS:-$(date +%m%d%H%M)}"
 MODEL_NAME="${MODEL_NAME:-kimi}"
-SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-coco-rell2-041513-${SWEEP_TS}"
+SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-distilled-0419182016-distilled_hidden-scores"  # -${SWEEP_TS}
 export OUTPUT_DIR="${SWEEP_BASE}"
+
+if [[ -d "${SWEEP_BASE}" ]]; then
+  echo "warning: SWEEP_BASE already exists: ${SWEEP_BASE}" >&2
+  if [[ ! -t 0 ]]; then
+    echo "error: need interactive confirmation but stdin is not a terminal; exiting." >&2
+    exit 1
+  fi
+  while true; do
+    read -r -p "Continue reusing this directory? [y/n]: " reply
+    case "${reply}" in
+      [yY]) break ;;
+      [nN]) echo "Aborted." >&2; exit 1 ;;
+      *) echo "Please enter y or n." >&2 ;;
+    esac
+  done
+fi
 
 SUMMARY_FILE="${SUMMARY_FILE:-${SWEEP_BASE}/summary.md}"
 SWEEP_LOG_DIR="${SWEEP_LOG_DIR:-${SWEEP_BASE}/logs}"
@@ -77,11 +96,15 @@ if [[ ! -f "${SUMMARY_FILE}" ]]; then
   } >> "${SUMMARY_FILE}"
 fi
 
+echo "SUMMARY_FILE has been created: ${SUMMARY_FILE}"
+
 {
   echo ""
   echo "## Sweep batch \`${SWEEP_ID}\`"
   echo ""
   echo "Started: $(date -Iseconds)"
+  echo ""
+  echo "SCORES_PATH: \`${SCORES_PATH}\`"
   echo ""
   echo "| # | task | inter_method | intra_method | modality_aware | intra_expert_metric | smooth_fn | metric | detail | status | log |"
   echo "|---|------|--------------|--------------|----------------|---------------------|-----------|--------|--------|--------|-----|"
