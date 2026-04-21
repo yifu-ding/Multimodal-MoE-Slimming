@@ -4,7 +4,6 @@ set -euo pipefail
 source scripts/select_least_used_gpu.sh # 自动选择显存使用量最少的 gpu
 PREFIX="${PREFIX:-$(pwd)}"
 export PYTHONPATH="${PREFIX}"
-export HF_HOME="${HF_HOME:-/home/data/dyf/hf_cache}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 TEACHER_LAYER="${TEACHER_LAYER:-0}"
