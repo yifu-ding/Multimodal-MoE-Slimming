@@ -12,15 +12,27 @@ ACTIVE_CHANNEL_METRICS = (
     "3proj_second_order_text",
     "3proj_second_order_visual",
     # three proj saliency
-    "3proj_saliency",
-    "3proj_saliency_text",
-    "3proj_saliency_visual",
+    # "3proj_saliency",
+    # "3proj_saliency_text",
+    # "3proj_saliency_visual",
     # down second order (exact)
-    "down_second_order_exact",
-    "down_second_order_exact_text",
-    "down_second_order_exact_visual",
-     # 
-    "weight"
+    # "down_second_order_exact",
+    # "down_second_order_exact_text",
+    # "down_second_order_exact_visual",
+    # down proj second order (approx)
+    "down_second_order_approx",
+    "down_second_order_approx_text",
+    "down_second_order_approx_visual",
+    # 
+    "weight",
+    # weight*grad
+    "wg",
+    "wg_text",
+    "wg_visual",
+    # weight*activation
+    "wa",
+    "wa_text",
+    "wa_visual",
 )
 
 CHANNEL_METRICS = (

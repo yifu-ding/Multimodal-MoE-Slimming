@@ -1,10 +1,32 @@
 from pathlib import Path
+import argparse
 import re
 from datetime import datetime
 
-base = Path("/home/dyf/code/distill/MAES/results/prune_eval_p50/sweep_tasks-kimi-coco-rell2-fill1-0416-115847/logs")
+
+def parse_args():
+    repo_root = Path(__file__).resolve().parent.parent
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "base",
+        nargs="?",
+        default=repo_root / "results" / "prune_eval_p50" / "sweep_tasks-kimi-coco-rell2-fill1-0416-115847",
+        type=Path,
+        help="Sweep directory that contains logs/ and summary output.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optional output path for the generated markdown summary.",
+    )
+    return parser.parse_args()
+
+
+args = parse_args()
+base = args.base.resolve()
 log_root = base / "logs"
-out_path = base / "summary-new.md"
+out_path = args.output.resolve() if args.output else base / "summary-new.md"
 
 logs = sorted(log_root.glob("stdout_*.log")) + sorted((log_root / "logs").glob("stdout_*.log"))
 
