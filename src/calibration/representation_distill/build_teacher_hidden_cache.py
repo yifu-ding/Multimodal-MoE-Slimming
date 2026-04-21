@@ -5,7 +5,8 @@
 import argparse
 import os
 import sys
-from typing import List
+import random
+from typing import Dict, List
 
 # 将仓库根与父目录加入 sys.path, 以便以包形式导入 src.* 与 observations.*
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -60,6 +61,60 @@ def _parse_dtype(name: str) -> torch.dtype:
     return mapping[name]
 
 
+def _count_sample_tokens(bundle, sample: Dict) -> int:
+    inputs = prepare_raw_batch_inputs(bundle, [sample])
+    attention_mask = inputs.get("attention_mask")
+    if attention_mask is None:
+        raise KeyError("prepare_raw_batch_inputs did not return `attention_mask`.")
+    return int(attention_mask[0].sum().item())
+
+
+def _select_teacher_samples(samples: List[Dict], bundle, args) -> List[Dict]:
+    if not samples:
+        print("[representation_distill] Warning: empty teacher sample pool. Continuing with zero samples.")
+        return []
+
+    scan_indices = list(range(len(samples)))
+    rng = None
+    if args.subset_seed is not None and args.subset_seed >= 0:
+        rng = random.Random(args.subset_seed)
+        rng.shuffle(scan_indices)
+
+    qualified_indices: List[int] = []
+    fallback_indices: List[int] = []
+    for sample_idx in scan_indices:
+        token_count = _count_sample_tokens(bundle, samples[sample_idx])
+        if token_count >= args.token_per_sample:
+            qualified_indices.append(sample_idx)
+        else:
+            fallback_indices.append(sample_idx)
+
+    target_size = len(samples)
+    selected_indices = qualified_indices[:target_size]
+    if len(selected_indices) < target_size and fallback_indices:
+        deficit = target_size - len(selected_indices)
+        if rng is None:
+            rng = random.Random()
+        supplement = rng.sample(fallback_indices, min(deficit, len(fallback_indices)))
+        selected_indices.extend(supplement)
+        print(
+            f"[representation_distill] Qualified samples are insufficient for token_per_sample={args.token_per_sample}. "
+            f"Supplemented {len(supplement)} sample(s) from shorter candidates."
+        )
+
+    print(
+        f"[representation_distill] Teacher sample subset prepared from {len(samples)} candidates: "
+        f"qualified={len(qualified_indices)}, short={len(fallback_indices)}, "
+        f"selected={len(selected_indices)}/{target_size}."
+    )
+    if len(selected_indices) < target_size:
+        print(
+            f"[representation_distill] Warning: requested {target_size} samples, but only "
+            f"{len(selected_indices)} are available after fallback. Continuing extraction."
+        )
+    return [samples[idx] for idx in selected_indices]
+
+
 # ---------------------------------------------------------------------------
 # CLI (命令行参数)
 # ---------------------------------------------------------------------------
@@ -109,6 +164,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     # 前向时的 DataLoader batch, 与蒸馏里的 teacher_batch_size 含义不同
     parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--token_per_sample", type=int, default=2048)
+    parser.add_argument("--subset_seed", type=int, default=42)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shuffle_seed", type=int, default=1234)
     parser.add_argument("--num_video_frames", type=int, default=8)
@@ -160,6 +217,7 @@ def main() -> None:
         video_max_long_side=args.video_max_long_side,
         selected_datasets=selected_datasets,
     )
+    samples = _select_teacher_samples(samples, bundle, args)
     # shuffle=False: 样本顺序由 dump_original_data 决定, 可复现
     loader = DataLoader(
         samples,
@@ -242,6 +300,8 @@ def main() -> None:
             "teacher_model_output_dtype": teacher_dtype,
             "samples_per_dataset": args.samples_per_dataset,
             "total_samples": int(teacher_cache.shape[0]),
+            "token_per_sample": args.token_per_sample,
+            "subset_seed": args.subset_seed,
             "dataset_id_to_name": {
                 idx: name
                 for idx, name in enumerate(SUPPORTED_DATASETS)

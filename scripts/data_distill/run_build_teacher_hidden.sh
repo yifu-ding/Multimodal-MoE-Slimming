@@ -7,10 +7,9 @@ export PYTHONPATH="${PREFIX}"
 export HF_HOME="${HF_HOME:-/home/data/dyf/hf_cache}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
-OUTPUT_PATH="${OUTPUT_PATH:-${PREFIX}/storage/data_distill/attn_weighted-$(date +%m%d%H%M%S)}/teacher_cache.pt"
 TEACHER_LAYER="${TEACHER_LAYER:-0}"
-COMPRESSED_LENGTH="${COMPRESSED_LENGTH:-256}"  # sequence length  # 只压缩 seqlen
-SAMPLES_PER_DATASET="${SAMPLES_PER_DATASET:-4096}"  # 多少条，这个在cache过程中是不变的（不压缩条数）
+COMPRESSED_LENGTH="${COMPRESSED_LENGTH:-2048}"  # sequence length  # 只压缩 seqlen
+SAMPLES_PER_DATASET="${SAMPLES_PER_DATASET:-342}"  # 多少条，这个在cache过程中是不变的（不压缩条数）
 BATCH_SIZE="${BATCH_SIZE:-2}"
 SEED="${SEED:-42}"
 SHUFFLE_SEED="${SHUFFLE_SEED:-1234}"
@@ -20,9 +19,9 @@ SAVE_DTYPE="${SAVE_DTYPE:-float32}"
 DEVICE_MAP="${DEVICE_MAP:-cuda:0}"
 ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
 
-TEACHER_DATASETS="${TEACHER_DATASETS:-gqa}"
+TEACHER_DATASETS="${TEACHER_DATASETS:-gqa coco m4_instruct}"
 #   使用方式
-#   # 均匀随机采样（默认���
+#   # 均匀随机采样（默认）
 #   --compression_mode sample
 #   # Attention 加权采样
 #   --compression_mode attention_weighted --attn_temperature 1.0
@@ -33,9 +32,16 @@ TEACHER_DATASETS="${TEACHER_DATASETS:-gqa}"
 COMPRESSION_MODE="${COMPRESSION_MODE:-sample}"
 ATTN_TEMPERATURE="${ATTN_TEMPERATURE:-1.0}"
 
+read -r -a _teacher_ds_arr <<< "${TEACHER_DATASETS}"
+if (( ${#_teacher_ds_arr[@]} > 1 )); then
+    TEACHER_DATASETS_PATH_LABEL=mixed
+else
+    TEACHER_DATASETS_PATH_LABEL="${TEACHER_DATASETS}"
+fi
+
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
-OUTPUT_PATH="${OUTPUT_PATH:-${PREFIX}/storage/data_distill_kimi/${TEACHER_DATASETS}-${COMPRESSION_MODE}_at${ATTN_TEMPERATURE}-$(date +%m%d%H%M%S)}/teacher_hidden.pt"
-LATEST_LINK_DIR="${LATEST_LINK_DIR:-${PREFIX}/storage/data_distill_kimi/${TEACHER_DATASETS}-${COMPRESSION_MODE}_at${ATTN_TEMPERATURE}-latest}"
+OUTPUT_PATH="${OUTPUT_PATH:-${PREFIX}/storage/data_distill_kimi/${TEACHER_DATASETS_PATH_LABEL}-num_${SAMPLES_PER_DATASET}-token_${COMPRESSED_LENGTH}-${COMPRESSION_MODE}_at${ATTN_TEMPERATURE}-$(date +%m%d%H%M%S)}/teacher_hidden.pt"
+LATEST_LINK_DIR="${LATEST_LINK_DIR:-${PREFIX}/storage/data_distill_kimi/${TEACHER_DATASETS_PATH_LABEL}-num_${SAMPLES_PER_DATASET}-token_${COMPRESSED_LENGTH}-${COMPRESSION_MODE}_at${ATTN_TEMPERATURE}-latest}"
 TEACHER_LAYER="${TEACHER_LAYER:-0}"
 COMPRESSED_LENGTH="${COMPRESSED_LENGTH:-256}"
 SAMPLES_PER_DATASET="${SAMPLES_PER_DATASET:-4096}"

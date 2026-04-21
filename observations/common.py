@@ -1,4 +1,5 @@
 import argparse
+import importlib.util
 import json
 import math
 import os
@@ -29,11 +30,6 @@ from tasks.coco import coco_transform
 from tasks.dataset_paths import require_dataset_dir
 from tasks.gqa import gqa_transform, load_gqa_instruction_rows, resolve_gqa_subdir
 from utils import create_mask_after_last_token, create_mask_after_token
-
-from src.base.models.deepseek_vl import load_model as load_deepseek_vl_model
-from src.base.models.internvl import load_model as load_internvl_model
-from src.base.models.kimi import load_model as load_kimi_model
-from src.base.models.qwen3 import load_model as load_qwen3_model
 
 
 MODALITIES = ("text", "visual")
@@ -247,6 +243,19 @@ def normalize_dataset_name(dataset_name: str) -> str:
     return aliases.get(normalized, normalized)
 
 
+def _resolve_attn_implementation(attn_implementation: str | None) -> str | None:
+    if attn_implementation != "flash_attention_2":
+        return attn_implementation
+    if importlib.util.find_spec("flash_attn") is not None:
+        return attn_implementation
+    print(
+        "[model-load] `flash_attn` is unavailable in the current environment; "
+        "falling back from `flash_attention_2` to `sdpa`.",
+        flush=True,
+    )
+    return "sdpa"
+
+
 def _get_deepseek_decoder_layers(model):
     candidates = [
         ("language", "model", "layers"),
@@ -339,6 +348,7 @@ def load_model_bundle(
 ) -> ModelBundle:
     resolved_name_or_path = resolve_model_name_or_path(model_name_or_path)
     family = infer_model_family(model_name_or_path)
+    attn_implementation = _resolve_attn_implementation(attn_implementation)
     text_to_message = lambda text: [
         {
             "role": "user",
@@ -349,6 +359,8 @@ def load_model_bundle(
         }
     ]
     if family == "kimi":
+        from src.base.models.kimi import load_model as load_kimi_model
+
         model, processor = load_kimi_model(resolved_name_or_path,
                                             device_map=device_map,
                                             attn_implementation=attn_implementation,
@@ -364,6 +376,8 @@ def load_model_bundle(
             ),
         }
     elif family == "qwen3":
+        from src.base.models.qwen3 import load_model as load_qwen3_model
+
         model, processor = load_qwen3_model(resolved_name_or_path, 
                                             device_map=device_map, 
                                             attn_implementation=attn_implementation)
@@ -382,6 +396,8 @@ def load_model_bundle(
             ),
         }
     elif family == "deepseek_vl":
+        from src.base.models.deepseek_vl import load_model as load_deepseek_vl_model
+
         model, processor = load_deepseek_vl_model(
             resolved_name_or_path,
             device_map=device_map,
@@ -404,6 +420,8 @@ def load_model_bundle(
             ),
         }
     else:
+        from src.base.models.internvl import load_model as load_internvl_model
+
         model, processor = load_internvl_model(
             resolved_name_or_path,
             device_map=device_map,

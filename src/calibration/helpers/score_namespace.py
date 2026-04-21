@@ -16,9 +16,9 @@ ACTIVE_CHANNEL_METRICS = (
     # "3proj_saliency_text",
     # "3proj_saliency_visual",
     # down second order (exact)
-    # "down_second_order_exact",
-    # "down_second_order_exact_text",
-    # "down_second_order_exact_visual",
+    "down_second_order_exact",
+    "down_second_order_exact_text",
+    "down_second_order_exact_visual",
     # down proj second order (approx)
     "down_second_order_approx",
     "down_second_order_approx_text",
@@ -93,6 +93,6 @@ EXPERT_METRICS = (
     "router_fillzero",
     "second_attr",
     "second_attr_fillzero",
-    # "true_ablate",
-    # "true_ablate_fillzero",
+    "true_ablate",
+    "true_ablate_fillzero",
 )

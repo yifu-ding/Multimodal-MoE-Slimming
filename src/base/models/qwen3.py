@@ -1,7 +1,11 @@
 import torch
 from loguru import logger
-from transformers.processing_utils import Unpack
 from typing import Any, Optional, Union
+
+try:
+    from typing import Unpack
+except ImportError:
+    from typing_extensions import Unpack
 
 try:
     from transformers import Qwen3VLMoeForConditionalGeneration, AutoProcessor
