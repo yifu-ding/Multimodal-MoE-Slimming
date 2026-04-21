@@ -116,6 +116,7 @@ class ScoreAccumulator:
             "metadata": {
                 "loss_fn": args.loss_fn,
                 "num_samples": args.num_samples,
+                "selected_num_samples": getattr(args, "selected_num_samples", args.num_samples),
                 "batch_size": args.batch_size,
                 "dataset": args.dataset,
                 "start_idx": args.start_idx,

@@ -28,12 +28,13 @@ export PYTHONPATH="${PREFIX}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
-# MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
-MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-VL-30B-A3B-Instruct}"
+MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
+# MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-VL-30B-A3B-Instruct}"
 # MODEL_PATH="${MODEL_PATH:-OpenGVLab/InternVL3_5-GPT-OSS-20B-A4B-Preview-HF}"
 
 DATASET="${DATASET:-gqa}"
 NUM_SAMPLES="${NUM_SAMPLES:-1024}"
+TOKEN_PER_SAMPLE="${TOKEN_PER_SAMPLE:-2048}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 START_IDX="${START_IDX:-0}"
 SUBSET_SEED="${SUBSET_SEED:-42}"
@@ -44,7 +45,7 @@ LAYERS="${LAYERS:-}"  # 默认不传值，全部层calibration
 # LAYERS="${LAYERS:-20-26}"
 
 EMA="${EMA:-0.9}"
-FILL_ZERO_FOR_UNROUTED="${FILL_ZERO_FOR_UNROUTED:-1}"
+FILL_ZERO_FOR_UNROUTED="${FILL_ZERO_FOR_UNROUTED:-0}"
 
 case "${DATASET,,}" in
     gqa)
@@ -86,8 +87,7 @@ case "${MODEL_TAG}" in
         ;;
 esac
 
-# OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/${MODEL_TAG}_${DATASET_TAG}-second_order}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/prune/scores/${MODEL_TAG}_${DATASET_TAG}-rell2-fill${FILL_ZERO_FOR_UNROUTED}-$(date +%m%d-%H%M%S)}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/scores/${MODEL_TAG}_${DATASET_TAG}-num_${NUM_SAMPLES}-token_${TOKEN_PER_SAMPLE}-fill_${FILL_ZERO_FOR_UNROUTED}-$(date +%m%d-%H%M%S)}"
 
 EXTRA_ARGS=("$@")
 
@@ -97,6 +97,7 @@ CMD=(
     --output_dir         "${OUTPUT_DIR}"
     --dataset            "${DATASET}"
     --num_samples        "${NUM_SAMPLES}"
+    --token_per_sample   "${TOKEN_PER_SAMPLE}"
     --batch_size         "${BATCH_SIZE}"
     --start_idx          "${START_IDX}"
     --subset_seed        "${SUBSET_SEED}"
@@ -144,7 +145,7 @@ fi
 CMD+=("${EXTRA_ARGS[@]}")
 
 echo "Model      : ${MODEL_PATH}"
-echo "Dataset    : ${DATASET} (${NUM_SAMPLES} samples)"
+echo "Dataset    : ${DATASET} (${NUM_SAMPLES} samples, ${TOKEN_PER_SAMPLE} tokens per sample)"
 echo "Layers     : ${LAYERS:-<all MoE layers>}"
 echo "Output     : ${OUTPUT_DIR}"
 echo "Fill zero for unrouted: ${FILL_ZERO_FOR_UNROUTED}"

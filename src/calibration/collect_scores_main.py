@@ -1,10 +1,9 @@
 import argparse
 import copy
-import json
 import os
 import random
 import sys
-from typing import Dict
+from typing import Dict, List
 
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
@@ -23,6 +22,7 @@ from observations.common import (
     ensure_dir,
     load_model_bundle,
     normalize_dataset_name,
+    prepare_inputs,
 )
 from src.calibration.helpers.helpers import teacher_block
 from src.calibration.block_forward import block_forward
@@ -46,6 +46,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--output_dir", type=str, required=True)
     p.add_argument("--dataset", type=str, default="gqa")
     p.add_argument("--num_samples", type=int, default=128)
+    p.add_argument("--token_per_sample", type=int, default=2048)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--start_idx", type=int, default=0)
     p.add_argument("--subset_seed", type=int, default=42)
@@ -84,6 +85,74 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--force", "-f", action="store_true")
     return p
+
+
+def _count_sample_tokens(bundle, dataset_name: str, sample: Dict) -> int:
+    batch = custom_collate_fn([sample])
+    inputs = prepare_inputs(bundle, batch, dataset_name)
+    attention_mask = inputs.get("attention_mask")
+    if attention_mask is None:
+        raise KeyError("prepare_inputs did not return `attention_mask`.")
+    return int(attention_mask[0].sum().item())
+
+
+def _select_calibration_indices(dataset, bundle, args) -> List[int]:
+    pool = list(range(args.start_idx, len(dataset)))
+    if not pool:
+        print(
+            f"[calibration] Warning: empty candidate pool for start_idx={args.start_idx}. "
+            "Continuing with zero samples."
+        )
+        return []
+
+    scan_indices = pool[:]
+    rng = None
+    if args.subset_seed is not None and args.subset_seed >= 0:
+        rng = random.Random(args.subset_seed)
+        rng.shuffle(scan_indices)
+
+    qualified_indices: List[int] = []
+    fallback_indices: List[int] = []
+    for sample_idx in scan_indices:
+        token_count = _count_sample_tokens(bundle, args.dataset, dataset[sample_idx])
+        if token_count >= args.token_per_sample:
+            qualified_indices.append(sample_idx)
+        else:
+            fallback_indices.append(sample_idx)
+
+    selected = qualified_indices[: args.num_samples]
+    if len(selected) < args.num_samples and fallback_indices:
+        deficit = args.num_samples - len(selected)
+        if rng is None:
+            rng = random.Random()
+        supplement = rng.sample(fallback_indices, min(deficit, len(fallback_indices)))
+        selected.extend(supplement)
+        print(
+            f"[calibration] Qualified samples are insufficient for token_per_sample={args.token_per_sample}. "
+            f"Supplemented {len(supplement)} sample(s) from shorter candidates."
+        )
+
+    print(
+        f"[calibration] Calibration subset prepared from {len(pool)} candidates: "
+        f"qualified={len(qualified_indices)}, short={len(fallback_indices)}, "
+        f"selected={len(selected)}/{args.num_samples}."
+    )
+    if len(selected) < args.num_samples:
+        print(
+            f"[calibration] Warning: requested {args.num_samples} samples, but only "
+            f"{len(selected)} are available after fallback. Continuing collection."
+        )
+    return selected
+
+
+def _build_calibration_dataset(bundle, args):
+    dataset_kwargs = {}
+    if args.dataset == "m4_instruct":
+        # M4 rows are pre-materialized in a Python list before token filtering.
+        # Keep a larger candidate pool than `num_samples` so token-length filtering
+        # can still backfill from remaining rows.
+        dataset_kwargs["max_rows"] = max(args.start_idx + args.num_samples * 4, 4096)
+    return build_dataset(args.dataset, bundle.family, **dataset_kwargs)
 
 
 def run_collection(args) -> None:
@@ -125,13 +194,9 @@ def run_collection(args) -> None:
         f"{sum(layer_to_num_experts.values())} experts total."
     )
 
-    dataset = build_dataset(args.dataset, bundle.family, max_rows=args.num_samples)
-    pool = list(range(args.start_idx, len(dataset)))
-    if args.subset_seed is not None and args.subset_seed >= 0:
-        rng = random.Random(args.subset_seed)
-        indices = rng.sample(pool, min(args.num_samples, len(pool)))
-    else:
-        indices = pool[: args.num_samples]
+    dataset = _build_calibration_dataset(bundle, args)
+    indices = _select_calibration_indices(dataset, bundle, args)
+    args.selected_num_samples = len(indices)
 
     subset = Subset(dataset, indices)
     loader = DataLoader(

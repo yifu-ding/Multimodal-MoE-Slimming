@@ -121,7 +121,13 @@ class TransformedListDataset:
         row = self.rows[idx]
         batch = {key: [value] for key, value in row.items()}
         transformed = self.transform(batch)
-        return {key: value[0] for key, value in transformed.items()}
+        item = {}
+        for key, value in transformed.items():
+            if isinstance(value, list) and len(value) == 1:
+                item[key] = value[0]
+            else:
+                item[key] = value
+        return item
 
 
 def ensure_writable_datasets_cache() -> None:
