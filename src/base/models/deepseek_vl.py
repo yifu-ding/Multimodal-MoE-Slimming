@@ -11,8 +11,10 @@ except Exception:
 
 try:
     from deepseek_vl2.models import DeepseekVLV2Processor
-except Exception:
+    _DEEPSEEK_VL2_IMPORT_ERROR = None
+except Exception as exc:
     DeepseekVLV2Processor = None
+    _DEEPSEEK_VL2_IMPORT_ERROR = exc
 
 
 def _set_special_token_tensor(model, processor) -> None:
@@ -36,6 +38,19 @@ def load_model(
         raise ImportError("DeepSeek-VL loading requires transformers AutoModel/AutoProcessor support.")
 
     load_errors = []
+
+    # DeepSeek-VL2 checkpoints require the official deepseek_vl2 package.
+    # Falling back to AutoModel is not reliable because transformers may not
+    # recognize `deepseek_vl_v2` model_type.
+    model_path_lower = str(model_path).lower()
+    looks_like_vl2 = "deepseek-vl2" in model_path_lower or "deepseek_vl2" in model_path_lower
+    if looks_like_vl2 and DeepseekVLV2Processor is None:
+        raise RuntimeError(
+            "DeepSeek-VL2 model loading requires `deepseek_vl2` in the current Python environment, "
+            "but importing `deepseek_vl2.models.DeepseekVLV2Processor` failed. "
+            f"Import error: {_DEEPSEEK_VL2_IMPORT_ERROR!r}. "
+            "Please install DeepSeek-VL2 dependencies into the same env used by this script."
+        )
 
     if DeepseekVLV2Processor is not None:
         try:

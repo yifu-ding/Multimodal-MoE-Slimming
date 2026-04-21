@@ -1,5 +1,6 @@
 import argparse
 import importlib.util
+import inspect
 import json
 import math
 import os
@@ -296,6 +297,28 @@ def _get_deepseek_language_model(model):
     raise AttributeError(f"Cannot resolve DeepSeek language model from model type {type(model)}")
 
 
+def _get_deepseek_text_config(model):
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        raise AttributeError(f"Model {type(model)} has no `config` for DeepSeek text config resolution.")
+    candidates = [
+        getattr(cfg, "text_config", None),
+        getattr(cfg, "language_config", None),
+        getattr(cfg, "lang_config", None),
+        getattr(cfg, "llm_config", None),
+        cfg,
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if any(
+            hasattr(candidate, attr)
+            for attr in ("first_k_dense_replace", "moe_layer_freq", "n_routed_experts", "eos_token_id")
+        ):
+            return candidate
+    return cfg
+
+
 def build_dataset(dataset_name: str, model_family: str, **kwargs):
     dataset_name = normalize_dataset_name(dataset_name)
     if dataset_name == "gqa":
@@ -404,7 +427,10 @@ def load_model_bundle(
             attn_implementation=attn_implementation,
         )
         eos_token = getattr(processor.tokenizer, "eos_token", None) or ""
-        eos_token_id = getattr(model.config.text_config, "eos_token_id", None)
+        text_config = _get_deepseek_text_config(model)
+        eos_token_id = getattr(text_config, "eos_token_id", None)
+        if eos_token_id is None:
+            eos_token_id = getattr(processor.tokenizer, "eos_token_id", None)
         model_config = {
             "family": family,
             "get_lm": _get_deepseek_language_model,
@@ -478,37 +504,15 @@ def prepare_inputs(
             prepared = processor(
                 conversations=conversation,
                 images=visuals,
-                force_batchify=True,
+                force_batchify=False,
                 system_prompt="",
             )
             packed.append(prepared)
 
-        if len(packed) == 1:
-            return packed[0]
-
-        merged = {}
-        keys = packed[0].keys() if hasattr(packed[0], "keys") else packed[0].dict.keys()
-        for key in keys:
-            values = [item[key] for item in packed]
-            first = values[0]
-            if hasattr(first, "ndim") and first.ndim >= 1:
-                if key in ("input_ids", "attention_mask", "labels"):
-                    max_len = max(v.shape[-1] for v in values)
-                    pad_value = 0
-                    if key == "labels":
-                        pad_value = -100
-                    padded = []
-                    for value in values:
-                        pad_len = max_len - value.shape[-1]
-                        if pad_len > 0:
-                            value = F.pad(value, (0, pad_len), value=pad_value)
-                        padded.append(value)
-                    merged[key] = torch.cat(padded, dim=0)
-                else:
-                    merged[key] = torch.cat(values, dim=0)
-            else:
-                merged[key] = values
-        return merged
+        batched = processor.batchify(packed)
+        if hasattr(batched, "images_seq_mask"):
+            batched.images_seq_mask = batched.images_seq_mask.bool()
+        return batched
 
     batched_messages = [
         bundle.text_to_message(text) for text in batch["model_input_org_text"]
@@ -549,13 +553,33 @@ def prepare_inputs(
 
 def move_inputs_to_model_device(model, inputs: Dict[str, Any]) -> Dict[str, Any]:
     device = next(model.parameters()).device
+    model_dtype = next(model.parameters()).dtype
+    if hasattr(inputs, "to") and hasattr(inputs, "keys") and not hasattr(inputs, "items"):
+        inputs = inputs.to(device=device, dtype=model_dtype)
     moved = {}
-    for key, value in inputs.items():
+    if hasattr(inputs, "items"):
+        iterator = inputs.items()
+    else:
+        iterator = ((key, inputs[key]) for key in inputs.keys())
+    for key, value in iterator:
         if hasattr(value, "to"):
             moved[key] = value.to(device)
         else:
             moved[key] = value
     return moved
+
+
+def filter_model_forward_inputs(model, inputs: Dict[str, Any]) -> Dict[str, Any]:
+    if hasattr(inputs, "items"):
+        items = dict(inputs.items())
+    else:
+        items = {key: inputs[key] for key in inputs.keys()}
+    try:
+        signature = inspect.signature(model.forward)
+    except (TypeError, ValueError):
+        return items
+    allowed = set(signature.parameters.keys())
+    return {key: value for key, value in items.items() if key in allowed}
 
 
 def resolve_activation_fn(obj: Any) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -930,7 +954,7 @@ def discover_layer_structure(bundle: ModelBundle) -> Tuple[Dict[int, int], Dict[
             layer_to_num_channels[layer_idx] = int(intermediate_size)
         return layer_to_num_experts, layer_to_num_channels
     if bundle.family == "deepseek_vl":
-        config = bundle.model.config.text_config
+        config = _get_deepseek_text_config(bundle.model)
         for layer_idx, layer in enumerate(_get_deepseek_decoder_layers(bundle.model)):
             if layer_idx < getattr(config, "first_k_dense_replace", 0):
                 continue
@@ -1043,7 +1067,7 @@ def collect_observation_stats(args) -> Dict[str, Any]:
         for batch_idx, batch in enumerate(progress, start=1):
             inputs = prepare_inputs(bundle, batch, args.dataset)
             inputs = move_inputs_to_model_device(bundle.model, inputs)
-            bundle.model(**inputs, use_cache=False, return_dict=True)
+            bundle.model(**filter_model_forward_inputs(bundle.model, inputs), use_cache=False, return_dict=True)
             progress.set_postfix_str(
                 f"samples={min(batch_idx * args.batch_size, len(subset_indices))}/{len(subset_indices)}"
             )

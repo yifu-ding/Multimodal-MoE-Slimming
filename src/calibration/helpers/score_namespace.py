@@ -12,9 +12,9 @@ ACTIVE_CHANNEL_METRICS = (
     "3proj_second_order_text",
     "3proj_second_order_visual",
     # three proj saliency
-    # "3proj_saliency",
-    # "3proj_saliency_text",
-    # "3proj_saliency_visual",
+    "3proj_saliency",
+    "3proj_saliency_text",
+    "3proj_saliency_visual",
     # down second order (exact)
     "down_second_order_exact",
     "down_second_order_exact_text",

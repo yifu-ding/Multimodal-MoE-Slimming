@@ -14,6 +14,7 @@ for _p in (REPO_PARENT, REPO_ROOT):
 
 import torch
 from torch.utils.data import DataLoader, Subset
+from tqdm import tqdm
 
 from observations.common import (
     build_dataset,
@@ -47,6 +48,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--dataset", type=str, default="gqa")
     p.add_argument("--num_samples", type=int, default=128)
     p.add_argument("--token_per_sample", type=int, default=2048)
+    p.add_argument(
+        "--max_filter_multiplier",
+        type=float,
+        default=4.0,
+        help="Cap token-filter scanning pool to at most num_samples * multiplier (<=0 disables the cap).",
+    )
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--start_idx", type=int, default=0)
     p.add_argument("--subset_seed", type=int, default=42)
@@ -90,20 +97,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def _count_sample_tokens(bundle, dataset_name: str, sample: Dict) -> int:
     batch = custom_collate_fn([sample])
     inputs = prepare_inputs(bundle, batch, dataset_name)
-    attention_mask = inputs.get("attention_mask")
+    attention_mask = None
+    if hasattr(inputs, "get"):
+        attention_mask = inputs.get("attention_mask")
+    if attention_mask is None:
+        attention_mask = getattr(inputs, "attention_mask", None)
+    if attention_mask is None and hasattr(inputs, "__getitem__"):
+        try:
+            attention_mask = inputs["attention_mask"]
+        except Exception:
+            attention_mask = None
     if attention_mask is None:
         raise KeyError("prepare_inputs did not return `attention_mask`.")
     return int(attention_mask[0].sum().item())
 
 
 def _select_calibration_indices(dataset, bundle, args) -> List[int]:
-    pool = list(range(args.start_idx, len(dataset)))
+    pool_end = len(dataset)
+    if args.max_filter_multiplier is not None and args.max_filter_multiplier > 0:
+        max_candidates = max(args.num_samples, int(args.num_samples * args.max_filter_multiplier))
+        pool_end = min(pool_end, args.start_idx + max_candidates)
+    pool = list(range(args.start_idx, pool_end))
     if not pool:
         print(
             f"[calibration] Warning: empty candidate pool for start_idx={args.start_idx}. "
             "Continuing with zero samples."
         )
         return []
+    if pool_end < len(dataset):
+        print(
+            f"[calibration] Candidate pool capped to {len(pool)} samples "
+            f"(start_idx={args.start_idx}, max_filter_multiplier={args.max_filter_multiplier})."
+        )
 
     scan_indices = pool[:]
     rng = None
@@ -113,12 +138,19 @@ def _select_calibration_indices(dataset, bundle, args) -> List[int]:
 
     qualified_indices: List[int] = []
     fallback_indices: List[int] = []
-    for sample_idx in scan_indices:
+    progress = tqdm(scan_indices, desc="Filtering samples", leave=False)
+    for sample_idx in progress:
         token_count = _count_sample_tokens(bundle, args.dataset, dataset[sample_idx])
         if token_count >= args.token_per_sample:
             qualified_indices.append(sample_idx)
         else:
             fallback_indices.append(sample_idx)
+        progress.set_postfix(
+            qualified=len(qualified_indices),
+            short=len(fallback_indices),
+            refresh=False,
+        )
+    progress.close()
 
     selected = qualified_indices[: args.num_samples]
     if len(selected) < args.num_samples and fallback_indices:
@@ -155,6 +187,32 @@ def _build_calibration_dataset(bundle, args):
     return build_dataset(args.dataset, bundle.family, **dataset_kwargs)
 
 
+def _assert_cuda_runtime_compat(device_map: str) -> None:
+    if not isinstance(device_map, str):
+        return
+    lowered = device_map.lower()
+    if lowered != "auto" and not lowered.startswith("cuda"):
+        return
+    if not torch.cuda.is_available():
+        return
+    try:
+        device_idx = torch.cuda.current_device()
+        major, minor = torch.cuda.get_device_capability(device_idx)
+        runtime_arch = f"sm_{major}{minor}"
+        built_arches = set(torch.cuda.get_arch_list())
+    except Exception:
+        return
+    if runtime_arch in built_arches:
+        return
+    raise RuntimeError(
+        "Current PyTorch CUDA build does not support this GPU architecture: "
+        f"runtime device requires `{runtime_arch}`, but torch was built for {sorted(built_arches)}. "
+        "This causes `no kernel image is available for execution on the device`. "
+        "Please install a torch build that supports your GPU (for H20/sm_90, use a modern CUDA12 torch), "
+        "or run with `--device_map cpu` as a fallback."
+    )
+
+
 def run_collection(args) -> None:
     args.dataset = normalize_dataset_name(args.dataset)
     supported_datasets = {"gqa", "coco", "video_mmmu", "m4_instruct"}
@@ -176,6 +234,7 @@ def run_collection(args) -> None:
     device_map = args.device_map
     if device_map is None:
         device_map = "cuda:0" if torch.cuda.is_available() else "auto"
+    _assert_cuda_runtime_compat(device_map)
 
     bundle = load_model_bundle(
         args.model_name_or_path,

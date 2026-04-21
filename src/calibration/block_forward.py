@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from tqdm import tqdm
 
-from observations.common import move_inputs_to_model_device, prepare_inputs
+from observations.common import filter_model_forward_inputs, move_inputs_to_model_device, prepare_inputs
 from src.calibration.collector import collect_scores_from_moe_module
 
 from .helpers.helpers import compute_block_loss, set_block_modality_masks, teacher_blocks
@@ -79,7 +79,7 @@ def block_forward(
                 moe_media_mask = flat_media_mask.view_as(attn_mask)
 
             with torch.no_grad():
-                model(**inputs, use_cache=False, return_dict=True)
+                model(**filter_model_forward_inputs(model, inputs), use_cache=False, return_dict=True)
 
             if not teacher_state:
                 raise RuntimeError(f"Teacher block hook did not capture layer {layer_idx} inputs.")

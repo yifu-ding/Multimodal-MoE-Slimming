@@ -8,7 +8,7 @@ export PYTHONPATH="${PREFIX}"
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 TEACHER_LAYER="${TEACHER_LAYER:-0}"
 COMPRESSED_LENGTH="${COMPRESSED_LENGTH:-2048}"  # sequence length  # 只压缩 seqlen
-SAMPLES_PER_DATASET="${SAMPLES_PER_DATASET:-342}"  # 多少条，这个在cache过程中是不变的（不压缩条数）
+SAMPLES_PER_DATASET="${SAMPLES_PER_DATASET:-1024}"  # 多少条，这个在cache过程中是不变的（不压缩条数）
 BATCH_SIZE="${BATCH_SIZE:-2}"
 SEED="${SEED:-42}"
 SHUFFLE_SEED="${SHUFFLE_SEED:-1234}"
@@ -95,3 +95,4 @@ echo ""
 mkdir -p "$(dirname "${LATEST_LINK_DIR}")"
 ln -sfn "$(dirname "${OUTPUT_PATH}")" "${LATEST_LINK_DIR}"
 echo "Latest link        : ${LATEST_LINK_DIR}"
+echo "HIDDEN_PAYLOAD_PATH=${OUTPUT_PATH}"

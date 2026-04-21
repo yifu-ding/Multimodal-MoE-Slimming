@@ -63,7 +63,16 @@ def _parse_dtype(name: str) -> torch.dtype:
 
 def _count_sample_tokens(bundle, sample: Dict) -> int:
     inputs = prepare_raw_batch_inputs(bundle, [sample])
-    attention_mask = inputs.get("attention_mask")
+    attention_mask = None
+    if hasattr(inputs, "get"):
+        attention_mask = inputs.get("attention_mask")
+    if attention_mask is None:
+        attention_mask = getattr(inputs, "attention_mask", None)
+    if attention_mask is None and hasattr(inputs, "__getitem__"):
+        try:
+            attention_mask = inputs["attention_mask"]
+        except Exception:
+            attention_mask = None
     if attention_mask is None:
         raise KeyError("prepare_raw_batch_inputs did not return `attention_mask`.")
     return int(attention_mask[0].sum().item())
@@ -113,6 +122,32 @@ def _select_teacher_samples(samples: List[Dict], bundle, args) -> List[Dict]:
             f"{len(selected_indices)} are available after fallback. Continuing extraction."
         )
     return [samples[idx] for idx in selected_indices]
+
+
+def _assert_cuda_runtime_compat(device_map: str) -> None:
+    if not isinstance(device_map, str):
+        return
+    lowered = device_map.lower()
+    if lowered != "auto" and not lowered.startswith("cuda"):
+        return
+    if not torch.cuda.is_available():
+        return
+    try:
+        device_idx = torch.cuda.current_device()
+        major, minor = torch.cuda.get_device_capability(device_idx)
+        runtime_arch = f"sm_{major}{minor}"
+        built_arches = set(torch.cuda.get_arch_list())
+    except Exception:
+        return
+    if runtime_arch in built_arches:
+        return
+    raise RuntimeError(
+        "Current PyTorch CUDA build does not support this GPU architecture: "
+        f"runtime device requires `{runtime_arch}`, but torch was built for {sorted(built_arches)}. "
+        "This causes `no kernel image is available for execution on the device`. "
+        "Please install a torch build that supports your GPU (for H20/sm_90, use a modern CUDA12 torch), "
+        "or run with `--device_map cpu` as a fallback."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +229,7 @@ def main() -> None:
     device_map = args.device_map
     if device_map is None:
         device_map = "cuda:0" if torch.cuda.is_available() else "auto"
+    _assert_cuda_runtime_compat(device_map)
 
     bundle = load_model_bundle(
         args.model_name_or_path,
