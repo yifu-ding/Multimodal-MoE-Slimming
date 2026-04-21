@@ -80,15 +80,15 @@ def loop_2_score_collector(
                 if down_second_order_exact_visual is not None:
                     safe_add_with_ema(expert, ema, down_second_order_exact_visual, "down_second_order_exact_visual")
 
-        # true_ablate = compute_true_ablate_attr(
-        #     cnt_block=cnt_block,
-        #     expert=expert_proxy,
-        #     _kwargs=_kwargs,
-        # )
-        # if true_ablate is not None:
-        #     if is_fused:
-        #         fused_metric_stacks.setdefault("true_ablate", []).append(
-        #             true_ablate.detach()
-        #         )
-        #     else:
-        #         safe_add_with_ema(expert, ema, true_ablate, "true_ablate")
+        true_ablate = compute_true_ablate_attr(
+            cnt_block=cnt_block,
+            expert=expert_proxy,
+            _kwargs=_kwargs,
+        )
+        if true_ablate is not None:
+            if is_fused:
+                fused_metric_stacks.setdefault("true_ablate", []).append(
+                    true_ablate.detach()
+                )
+            else:
+                safe_add_with_ema(expert, ema, true_ablate, "true_ablate")
