@@ -50,6 +50,12 @@ def compute_block_loss(
 def teacher_blocks(bundle) -> Iterable[nn.Module]:
     if _is_qwen_like_model(bundle.model):
         return bundle.model.model.language_model.layers
+    if hasattr(bundle.model, "language") and hasattr(bundle.model.language, "model") and hasattr(bundle.model.language.model, "layers"):
+        return bundle.model.language.model.layers
+    if hasattr(bundle.model, "language") and hasattr(bundle.model.language, "layers"):
+        return bundle.model.language.layers
+    if hasattr(bundle.model, "language_model") and hasattr(bundle.model.language_model, "layers"):
+        return bundle.model.language_model.layers
     return bundle.model.language_model.model.layers
 
 
@@ -61,6 +67,10 @@ def resolve_special_token_tensor(bundle):
     model = bundle.model
     if _is_qwen_like_model(model):
         return getattr(model.model, "special_token_id_tensor", None)
+    if hasattr(model, "language"):
+        value = getattr(model.language, "special_token_id_tensor", None)
+        if value is not None:
+            return value
     return getattr(model, "special_token_id_tensor", None)
 
 

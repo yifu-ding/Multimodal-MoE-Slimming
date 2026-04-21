@@ -31,6 +31,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 # MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-VL-30B-A3B-Instruct}"
 # MODEL_PATH="${MODEL_PATH:-OpenGVLab/InternVL3_5-GPT-OSS-20B-A4B-Preview-HF}"
+# deepseek-ai/deepseek-vl2-small
 
 DATASET="${DATASET:-gqa}"
 NUM_SAMPLES="${NUM_SAMPLES:-1024}"
@@ -78,6 +79,9 @@ case "${MODEL_TAG}" in
         ;;
     kimi-vl-a3b-instruct)
         MODEL_TAG="kimi-vl-a3b"
+        ;;
+    deepseek-vl2-small)
+        MODEL_TAG="deepseek-vl2-small"
         ;;
     internvl-3.5-gpt-oss-20b-a4b-preview-hf)
         MODEL_TAG="internvl-3.5-20b-a4b"

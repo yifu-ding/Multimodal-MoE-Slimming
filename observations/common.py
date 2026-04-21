@@ -30,6 +30,7 @@ from tasks.dataset_paths import require_dataset_dir
 from tasks.gqa import gqa_transform, load_gqa_instruction_rows, resolve_gqa_subdir
 from utils import create_mask_after_last_token, create_mask_after_token
 
+from src.base.models.deepseek_vl import load_model as load_deepseek_vl_model
 from src.base.models.internvl import load_model as load_internvl_model
 from src.base.models.kimi import load_model as load_kimi_model
 from src.base.models.qwen3 import load_model as load_qwen3_model
@@ -149,12 +150,15 @@ def ensure_writable_datasets_cache() -> None:
 
 
 def infer_model_family(model_name_or_path: str) -> str:
-    if "Kimi-VL" in model_name_or_path:
+    name = model_name_or_path.lower()
+    if "kimi-vl" in name:
         return "kimi"
-    if "Qwen3-VL" in model_name_or_path:
+    if "qwen3-vl" in name:
         return "qwen3"
-    if "InternVL" in model_name_or_path:
+    if "internvl" in name:
         return "internvl"
+    if "deepseek-vl" in name:
+        return "deepseek_vl"
     raise ValueError(f"Unsupported model family for path: {model_name_or_path}")
 
 
@@ -217,6 +221,7 @@ def resolve_model_name_or_path(model_name_or_path: str) -> str:
             "Qwen/Qwen3-VL-4B-Instruct",
             "OpenGVLab/InternVL-3.5-GPT-OSS-20B-A4B-Preview-HF",
             "OpenGVLab/InternVL3_5-GPT-OSS-20B-A4B-Preview-HF",
+            "deepseek-ai/deepseek-vl2-small",
         ]
         for model_id in known_model_ids:
             if model_id.split("/")[-1] == basename:
@@ -240,6 +245,46 @@ def normalize_dataset_name(dataset_name: str) -> str:
         "m4_instruct_data": "m4_instruct",
     }
     return aliases.get(normalized, normalized)
+
+
+def _get_deepseek_decoder_layers(model):
+    candidates = [
+        ("language", "model", "layers"),
+        ("language_model", "model", "layers"),
+        ("model", "language_model", "layers"),
+        ("language", "layers"),
+        ("language_model", "layers"),
+    ]
+    for path in candidates:
+        current = model
+        ok = True
+        for attr in path:
+            if not hasattr(current, attr):
+                ok = False
+                break
+            current = getattr(current, attr)
+        if ok:
+            return current
+    raise AttributeError(f"Cannot resolve DeepSeek decoder layers from model type {type(model)}")
+
+
+def _get_deepseek_language_model(model):
+    candidates = [
+        ("language",),
+        ("language_model",),
+        ("model", "language_model"),
+    ]
+    for path in candidates:
+        current = model
+        ok = True
+        for attr in path:
+            if not hasattr(current, attr):
+                ok = False
+                break
+            current = getattr(current, attr)
+        if ok:
+            return current
+    raise AttributeError(f"Cannot resolve DeepSeek language model from model type {type(model)}")
 
 
 def build_dataset(dataset_name: str, model_family: str, **kwargs):
@@ -336,6 +381,28 @@ def load_model_bundle(
                 create_mask_after_last_token, special_token_id=151644, offset=3
             ),
         }
+    elif family == "deepseek_vl":
+        model, processor = load_deepseek_vl_model(
+            resolved_name_or_path,
+            device_map=device_map,
+            attn_implementation=attn_implementation,
+        )
+        eos_token = getattr(processor.tokenizer, "eos_token", None) or ""
+        eos_token_id = getattr(model.config.text_config, "eos_token_id", None)
+        model_config = {
+            "family": family,
+            "get_lm": _get_deepseek_language_model,
+            "is_moe_layer": lambda cfg, idx: (
+                idx >= getattr(cfg, "first_k_dense_replace", 0)
+                and hasattr(_get_deepseek_decoder_layers(model)[idx].mlp, "experts")
+            ),
+            "eos_token": eos_token,
+            "create_mask": partial(
+                create_mask_after_last_token,
+                special_token_id=eos_token_id if eos_token_id is not None else -1,
+                offset=1,
+            ),
+        }
     else:
         model, processor = load_internvl_model(
             resolved_name_or_path,
@@ -369,6 +436,62 @@ def prepare_inputs(
     bundle: ModelBundle, batch: Dict[str, List[Any]], dataset_name: str
 ) -> Dict[str, torch.Tensor]:
     processor = bundle.processor
+    if bundle.family == "deepseek_vl":
+        packed = []
+        for i, text in enumerate(batch["model_input_org_text"]):
+            visuals = batch["model_input_visual"][i]
+            if not isinstance(visuals, list):
+                visuals = [visuals]
+            image_prefix = "".join(
+                f"This is image_{image_idx + 1}: <image>\n"
+                for image_idx in range(len(visuals))
+            )
+            conversation = [
+                {
+                    "role": "<|User|>",
+                    "content": image_prefix + text,
+                    "images": visuals,
+                },
+                {
+                    "role": "<|Assistant|>",
+                    "content": batch["model_input_full_answer"][i] + bundle.model_config["eos_token"],
+                },
+            ]
+            prepared = processor(
+                conversations=conversation,
+                images=visuals,
+                force_batchify=True,
+                system_prompt="",
+            )
+            packed.append(prepared)
+
+        if len(packed) == 1:
+            return packed[0]
+
+        merged = {}
+        keys = packed[0].keys() if hasattr(packed[0], "keys") else packed[0].dict.keys()
+        for key in keys:
+            values = [item[key] for item in packed]
+            first = values[0]
+            if hasattr(first, "ndim") and first.ndim >= 1:
+                if key in ("input_ids", "attention_mask", "labels"):
+                    max_len = max(v.shape[-1] for v in values)
+                    pad_value = 0
+                    if key == "labels":
+                        pad_value = -100
+                    padded = []
+                    for value in values:
+                        pad_len = max_len - value.shape[-1]
+                        if pad_len > 0:
+                            value = F.pad(value, (0, pad_len), value=pad_value)
+                        padded.append(value)
+                    merged[key] = torch.cat(padded, dim=0)
+                else:
+                    merged[key] = torch.cat(values, dim=0)
+            else:
+                merged[key] = values
+        return merged
+
     batched_messages = [
         bundle.text_to_message(text) for text in batch["model_input_org_text"]
     ]
@@ -788,6 +911,25 @@ def discover_layer_structure(bundle: ModelBundle) -> Tuple[Dict[int, int], Dict[
                 )
             layer_to_num_channels[layer_idx] = int(intermediate_size)
         return layer_to_num_experts, layer_to_num_channels
+    if bundle.family == "deepseek_vl":
+        config = bundle.model.config.text_config
+        for layer_idx, layer in enumerate(_get_deepseek_decoder_layers(bundle.model)):
+            if layer_idx < getattr(config, "first_k_dense_replace", 0):
+                continue
+            if not hasattr(layer.mlp, "experts"):
+                continue
+            layer_to_num_experts[layer_idx] = len(layer.mlp.experts)
+            sample_expert = layer.mlp.experts[0]
+            if hasattr(sample_expert, "up_proj"):
+                layer_to_num_channels[layer_idx] = int(sample_expert.up_proj.out_features)
+            elif hasattr(sample_expert, "gate_up_proj"):
+                gate_up = sample_expert.gate_up_proj
+                layer_to_num_channels[layer_idx] = int(gate_up.shape[0] // 2)
+            else:
+                raise NotImplementedError(
+                    f"Cannot infer DeepSeek-VL expert width from type {type(sample_expert)}"
+                )
+        return layer_to_num_experts, layer_to_num_channels
     config = bundle.model.config.text_config
     for layer_idx, layer in enumerate(bundle.model.language_model.model.layers):
         if (
@@ -835,6 +977,8 @@ def collect_observation_stats(args) -> Dict[str, Any]:
     accumulator = ObservationAccumulator(layer_to_num_experts, layer_to_num_channels)
     if bundle.family == "qwen3":
         attach_qwen3_observer(bundle, accumulator)
+    elif bundle.family == "deepseek_vl":
+        raise NotImplementedError("Observation collection does not support DeepSeek-VL yet.")
     else:
         attach_kimi_observer(bundle, accumulator)
     print("[Observation] Observation hooks attached.", flush=True)

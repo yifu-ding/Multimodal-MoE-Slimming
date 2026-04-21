@@ -11,6 +11,9 @@ def auto_load_model(model_path: str, device_map="auto", attn_implementation="fla
     elif family == "qwen3":
         from src.base.models.qwen3 import load_model
         return load_model(resolved, device_map=device_map, attn_implementation=attn_implementation)
+    elif family == "deepseek_vl":
+        from src.base.models.deepseek_vl import load_model
+        return load_model(resolved, device_map=device_map, attn_implementation=attn_implementation)
     elif family == "internvl":
         from src.base.models.internvl import load_model
         return load_model(resolved, device_map=device_map, attn_implementation=attn_implementation)
