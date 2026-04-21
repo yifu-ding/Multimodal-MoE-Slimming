@@ -57,7 +57,7 @@ def _build_synthetic_banks(
     init_hidden: torch.Tensor,
     init_labels: torch.Tensor | None,
     init_std: float,
-) -> tuple[torch.nn.ParameterDict, torch.Tensor]:
+) -> tuple[torch.nn.ParameterDict, torch.Tensor, torch.Tensor]:
     flat_hidden = init_hidden.reshape(-1, init_hidden.shape[-1])
     if init_labels is None:
         flat_labels = torch.full(
@@ -70,6 +70,7 @@ def _build_synthetic_banks(
         flat_labels = init_labels.reshape(-1).to(torch.int8)
 
     bank_params: dict[str, torch.nn.Parameter] = {}
+    flat_bank_indices = torch.empty(flat_labels.shape[0], dtype=torch.long, device=flat_labels.device)
     for mod_id in (MODALITY_TEXT, MODALITY_IMAGE, MODALITY_VIDEO):
         mod_mask = flat_labels == mod_id
         if int(mod_mask.sum()) == 0:
@@ -78,17 +79,24 @@ def _build_synthetic_banks(
         if init_std > 0:
             bank_value.add_(torch.randn_like(bank_value) * init_std)
         bank_params[str(int(mod_id))] = torch.nn.Parameter(bank_value)
-    return torch.nn.ParameterDict(bank_params), flat_labels
+        flat_bank_indices[mod_mask] = torch.arange(
+            int(mod_mask.sum()),
+            device=flat_labels.device,
+            dtype=torch.long,
+        )
+    return torch.nn.ParameterDict(bank_params), flat_labels, flat_bank_indices
 
 
 def _assemble_synthetic_hidden(
     bank_params: torch.nn.ParameterDict,
     template_labels: torch.Tensor,
+    template_bank_indices: torch.Tensor,
     synthetic_size: int,
     compressed_length: int,
     hidden_size: int,
 ) -> torch.Tensor:
     flat_labels = template_labels.reshape(-1)
+    flat_bank_indices = template_bank_indices.reshape(-1)
     flat_hidden = torch.empty(
         flat_labels.shape[0],
         hidden_size,
@@ -96,8 +104,29 @@ def _assemble_synthetic_hidden(
         dtype=next(iter(bank_params.values())).dtype,
     )
     for mod_id_str, bank in bank_params.items():
-        flat_hidden[flat_labels == int(mod_id_str)] = bank
+        mod_mask = flat_labels == int(mod_id_str)
+        flat_hidden[mod_mask] = bank.index_select(0, flat_bank_indices[mod_mask])
     return flat_hidden.view(synthetic_size, compressed_length, hidden_size)
+
+
+def _sample_synthetic_batch_indices(
+    synthetic_size: int,
+    synthetic_batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if synthetic_batch_size <= 0 or synthetic_batch_size >= synthetic_size:
+        return torch.arange(synthetic_size, device=device, dtype=torch.long)
+    return torch.randperm(synthetic_size, device=device)[:synthetic_batch_size]
+
+
+def _sample_synthetic_batch_indices(
+    synthetic_size: int,
+    synthetic_batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if synthetic_batch_size <= 0 or synthetic_batch_size >= synthetic_size:
+        return torch.arange(synthetic_size, device=device, dtype=torch.long)
+    return torch.randperm(synthetic_size, device=device)[:synthetic_batch_size]
 
 
 def _compute_next_block_rel_l2(
@@ -393,6 +422,7 @@ def _build_output_payload(
             "teacher_cache_path": args.teacher_cache_path,
             "teacher_metadata": teacher_meta,
             "synthetic_size": args.synthetic_size,
+            "synthetic_batch_size": args.synthetic_batch_size,
             "compressed_length": int(synthetic_hidden_cpu.shape[1]),
             "hidden_size": int(synthetic_hidden_cpu.shape[2]),
             "dtype": "float32",
@@ -454,6 +484,25 @@ def _save_payload(
     return payload
 
 
+def _assemble_full_synthetic_hidden(
+    *,
+    bank_params,
+    synth_template_labels: torch.Tensor,
+    synth_template_bank_indices: torch.Tensor,
+    synthetic_size: int,
+    compressed_length: int,
+    hidden_size: int,
+) -> torch.Tensor:
+    return _assemble_synthetic_hidden(
+        bank_params=bank_params,
+        template_labels=synth_template_labels,
+        template_bank_indices=synth_template_bank_indices,
+        synthetic_size=synthetic_size,
+        compressed_length=compressed_length,
+        hidden_size=hidden_size,
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI (命令行参数)
 # ---------------------------------------------------------------------------
@@ -465,6 +514,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--teacher_cache_path", type=str, required=True)
     parser.add_argument("--output_path", type=str, required=True)
     parser.add_argument("--synthetic_size", type=int, default=256)
+    parser.add_argument("--synthetic_batch_size", type=int, default=0,
+                        help="How many synthetic samples to use per optimization step. "
+                             "0 means using all synthetic samples.")
     parser.add_argument("--teacher_batch_size", type=int, default=1024)
     parser.add_argument("--train_steps", type=int, default=2000)
     parser.add_argument("--lr", type=float, default=1e-2)
@@ -529,6 +581,7 @@ def main() -> None:
                 "teacher_cache_path": args.teacher_cache_path,
                 "output_path": args.output_path,
                 "synthetic_size": args.synthetic_size,
+                "synthetic_batch_size": args.synthetic_batch_size,
                 "teacher_batch_size": args.teacher_batch_size,
                 "train_steps": args.train_steps,
                 "lr": args.lr,
@@ -586,7 +639,7 @@ def main() -> None:
     if teacher_labels is not None:
         synth_labels = teacher_labels.index_select(0, init_indices).clone()  # not a Parameter
 
-    bank_params, synth_template_labels_flat = _build_synthetic_banks(
+    bank_params, synth_template_labels_flat, synth_template_bank_indices_flat = _build_synthetic_banks(
         init_hidden=init_hidden,
         init_labels=synth_labels,
         init_std=args.init_std,
@@ -596,6 +649,9 @@ def main() -> None:
         if synth_labels is not None
         else synth_template_labels_flat.view(init_hidden.shape[0], init_hidden.shape[1])
     )
+    synth_template_bank_indices = synth_template_bank_indices_flat.view(
+        init_hidden.shape[0], init_hidden.shape[1]
+    )
     optimizer = torch.optim.Adam(list(bank_params.parameters()), lr=args.lr)
     history = []
     final_losses = None
@@ -603,11 +659,15 @@ def main() -> None:
 
     block_bundle = None
     block_constraint_layer = None
-    teacher_anchor_hidden = init_hidden
+    teacher_anchor_indices = init_indices.clone()
     teacher_anchor_attention_mask = torch.ones(init_hidden.shape[:2], dtype=torch.long, device=device)
     teacher_anchor_position_ids = init_position_ids
     synth_attention_mask = torch.ones(init_hidden.shape[:2], dtype=torch.long, device=device)
     synth_position_ids = init_position_ids.clone()
+    effective_synth_batch_size = (
+        args.synthetic_size if args.synthetic_batch_size <= 0
+        else min(args.synthetic_batch_size, args.synthetic_size)
+    )
 
     if args.lambda_block > 0:
         if not args.model_name_or_path:
@@ -622,7 +682,6 @@ def main() -> None:
         block_constraint_layer = int(teacher_meta["teacher_layer"]) + 1
         block_layer = get_decoder_layer(block_bundle, block_constraint_layer)
         block_device = next(block_layer.parameters()).device
-        teacher_anchor_hidden = teacher_anchor_hidden.to(block_device)
         teacher_anchor_attention_mask = teacher_anchor_attention_mask.to(block_device)
         teacher_anchor_position_ids = teacher_anchor_position_ids.to(block_device)
         synth_attention_mask = synth_attention_mask.to(block_device)
@@ -638,13 +697,26 @@ def main() -> None:
             for _, bank in bank_params.items():
                 bank.data = bank.data.to(block_device)
             synth_template_labels_flat = synth_template_labels_flat.to(block_device)
+            synth_template_bank_indices_flat = synth_template_bank_indices_flat.to(block_device)
+            synth_template_bank_indices = synth_template_bank_indices.to(block_device)
+            teacher_anchor_indices = teacher_anchor_indices.to(block_device)
             device = str(block_device)
 
     for step in trange(args.train_steps, desc="Distilling compact hidden", leave=False):
+        synth_batch_indices = _sample_synthetic_batch_indices(
+            synthetic_size=args.synthetic_size,
+            synthetic_batch_size=effective_synth_batch_size,
+            device=synth_template_labels.device,
+        )
+        synth_batch_labels = synth_template_labels.index_select(0, synth_batch_indices)
+        synth_batch_bank_indices = synth_template_bank_indices.index_select(0, synth_batch_indices)
+        synth_batch_position_ids = synth_position_ids.index_select(0, synth_batch_indices)
+        synth_batch_attention_mask = synth_attention_mask.index_select(0, synth_batch_indices)
         synthetic_hidden = _assemble_synthetic_hidden(
             bank_params=bank_params,
-            template_labels=synth_template_labels,
-            synthetic_size=args.synthetic_size,
+            template_labels=synth_batch_labels,
+            template_bank_indices=synth_batch_bank_indices,
+            synthetic_size=synth_batch_indices.shape[0],
             compressed_length=init_hidden.shape[1],
             hidden_size=init_hidden.shape[2],
         )
@@ -656,7 +728,7 @@ def main() -> None:
         # Per-modality grouped losses (primary). ``div`` stays pooled.
         losses = _compute_losses(
             teacher_batch, synthetic_hidden,
-            teacher_batch_labels, synth_labels,
+            teacher_batch_labels, synth_batch_labels,
             mmd_subsample=args.mmd_subsample,
         )
 
@@ -668,15 +740,19 @@ def main() -> None:
             div_scale = min(1.0, (step + 1) / float(args.div_warmup_steps))
 
         if args.lambda_block > 0:
+            teacher_anchor_hidden = teacher_cache.index_select(
+                0,
+                teacher_anchor_indices.index_select(0, synth_batch_indices),
+            )
             block_rel_l2 = _compute_next_block_rel_l2(
                 bundle=block_bundle,
                 layer_idx=block_constraint_layer,
                 teacher_hidden=teacher_anchor_hidden,
-                teacher_attention_mask=teacher_anchor_attention_mask,
-                teacher_position_ids=teacher_anchor_position_ids,
+                teacher_attention_mask=teacher_anchor_attention_mask.index_select(0, synth_batch_indices),
+                teacher_position_ids=teacher_anchor_position_ids.index_select(0, synth_batch_indices),
                 synthetic_hidden=synthetic_hidden,
-                synthetic_attention_mask=synth_attention_mask,
-                synthetic_position_ids=synth_position_ids,
+                synthetic_attention_mask=synth_batch_attention_mask,
+                synthetic_position_ids=synth_batch_position_ids,
             )
             losses["block_rel_l2"] = block_rel_l2
 
@@ -742,13 +818,21 @@ def main() -> None:
             and (step + 1) % args.checkpoint_interval == 0
             and step != args.train_steps - 1
         ):
+            checkpoint_hidden = _assemble_full_synthetic_hidden(
+                bank_params=bank_params,
+                synth_template_labels=synth_template_labels,
+                synth_template_bank_indices=synth_template_bank_indices,
+                synthetic_size=args.synthetic_size,
+                compressed_length=init_hidden.shape[1],
+                hidden_size=init_hidden.shape[2],
+            )
             checkpoint_path = os.path.join(
                 os.path.dirname(args.output_path),
                 f"{os.path.splitext(os.path.basename(args.output_path))[0]}-step{step + 1}.pt",
             )
             _save_payload(
                 output_path=checkpoint_path,
-                synthetic_hidden=synthetic_hidden,
+                synthetic_hidden=checkpoint_hidden,
                 synth_position_ids=synth_position_ids,
                 synth_labels=synth_labels,
                 teacher_meta=teacher_meta,
@@ -759,9 +843,10 @@ def main() -> None:
             )
             print(f"[representation_distill] Saved checkpoint: {checkpoint_path}")
 
-    synthetic_hidden = _assemble_synthetic_hidden(
+    synthetic_hidden = _assemble_full_synthetic_hidden(
         bank_params=bank_params,
-        template_labels=synth_template_labels,
+        synth_template_labels=synth_template_labels,
+        synth_template_bank_indices=synth_template_bank_indices,
         synthetic_size=args.synthetic_size,
         compressed_length=init_hidden.shape[1],
         hidden_size=init_hidden.shape[2],

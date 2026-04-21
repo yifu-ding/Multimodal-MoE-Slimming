@@ -746,6 +746,42 @@ def _load_egoschema_rows() -> List[dict]:
     return _load_hf_dataset("lmms-lab/egoschema", "GENERATION", split="test")
 
 
+def _build_egoschema_subset_helpers() -> TaskHelpers:
+    from lmms_eval.tasks.egoschema.utils import egoschema_doc_to_text
+
+    def doc_to_visual(doc):
+        return [_resolve_egoschema_video_path(doc["video_idx"])]
+
+    def doc_to_text(doc):
+        return egoschema_doc_to_text(doc, lmms_eval_specific_kwargs={
+            "post_prompt": "\nAnswer with the option's letter from the given choices directly.",
+        })
+
+    def doc_to_answer(doc):
+        answer = str(doc["answer"]).strip()
+        if answer.isdigit():
+            idx = int(answer)
+            if 0 <= idx < 5:
+                return chr(ord("A") + idx)
+        return answer
+
+    return TaskHelpers(
+        task_name="egoschema_subset",
+        doc_to_visual=doc_to_visual,
+        doc_to_text=doc_to_text,
+        doc_to_answer=doc_to_answer,
+        evaluate=_mc_accuracy_evaluate,
+        media_type="video",
+    )
+
+
+def _load_egoschema_subset_rows() -> List[dict]:
+    local_parquet = os.path.join(_hf_home(), "datasets", "egoschema", "Subset", "test-00000-of-00001.parquet")
+    if os.path.exists(local_parquet):
+        return _load_dataset_from_parquet(local_parquet)
+    return _load_hf_dataset("lmms-lab/egoschema", "Subset", split="test")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # VideoMME (video - multiple choice)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -807,7 +843,10 @@ def _build_longvideobench_helpers() -> TaskHelpers:
         })
 
     def doc_to_answer(doc):
-        return doc.get("correct_choice", doc.get("answer", ""))
+        answer = doc.get("correct_choice", doc.get("answer", ""))
+        if isinstance(answer, int) and 0 <= answer < 26:
+            return chr(ord("A") + answer)
+        return str(answer)
 
     return TaskHelpers(
         task_name="longvideobench",
@@ -852,6 +891,7 @@ _TASK_REGISTRY = {
     "video_mmmu":      (_load_videommmu_rows, _build_videommmu_helpers),
     "mvbench":         (_load_mvbench_rows, _build_mvbench_helpers),
     "egoschema":       (_load_egoschema_rows, _build_egoschema_helpers),
+    "egoschema_subset": (_load_egoschema_subset_rows, _build_egoschema_subset_helpers),
     "videomme":        (_load_videomme_rows, _build_videomme_helpers),
     "longvideobench":  (_load_longvideobench_rows, _build_longvideobench_helpers),
 }

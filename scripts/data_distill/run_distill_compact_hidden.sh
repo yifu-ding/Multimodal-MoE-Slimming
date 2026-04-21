@@ -14,7 +14,8 @@ OUTPUT_PATH="${OUTPUT_PATH:-$(dirname "${HIDDEN_PAYLOAD_PATH}")/distilled-${RUN_
 LATEST_DISTILLED_LINK_DIR="${LATEST_DISTILLED_LINK_DIR:-$(dirname "${HIDDEN_PAYLOAD_PATH}")/distilled-latest}"
 
 # 合成集规模：之前 256 对 2048d 分布的 MMD / cov 估计偏紧，放大到 512
-SYNTHETIC_SIZE="${SYNTHETIC_SIZE:-512}"
+SYNTHETIC_SIZE="${SYNTHETIC_SIZE:-1024}"  # 总规模
+SYNTHETIC_BATCH_SIZE="${SYNTHETIC_BATCH_SIZE:-512}"  # 每次优化用的 batch 规模
 TEACHER_BATCH_SIZE="${TEACHER_BATCH_SIZE:-1024}"
 
 # 之前 2000 步明显没收敛（history 首尾 mmd/cov/mean/var 都还在上升）
@@ -30,11 +31,11 @@ INIT_STD="${INIT_STD:-0.0}"
 #   - div 在 loss 首尾实际 dominate 了优化器（其它项都在涨），权重 0.1 → 0.02，
 #     并配合 warmup 避免前期扰动。
 LAMBDA_MMD="${LAMBDA_MMD:-1.0}"
-LAMBDA_COV="${LAMBDA_COV:-10.0}"
-LAMBDA_DIV="${LAMBDA_DIV:-0.005}"
-LAMBDA_MEAN="${LAMBDA_MEAN:-2.0}"
-LAMBDA_VAR="${LAMBDA_VAR:-20.0}"
-LAMBDA_BLOCK="${LAMBDA_BLOCK:-0.5}"
+LAMBDA_COV="${LAMBDA_COV:-2.0}"
+LAMBDA_DIV="${LAMBDA_DIV:-0.002}"
+LAMBDA_MEAN="${LAMBDA_MEAN:-1.0}"
+LAMBDA_VAR="${LAMBDA_VAR:-2.0}"
+LAMBDA_BLOCK="${LAMBDA_BLOCK:-0.25}"
 
 USE_EMA_NORMALIZED_LOSSES="${USE_EMA_NORMALIZED_LOSSES:-0}"
 LOSS_EMA_DECAY="${LOSS_EMA_DECAY:-0.99}"
@@ -69,6 +70,7 @@ CMD=(
     --output_path "${OUTPUT_PATH}"
     --model_name_or_path "${MODEL_PATH}"
     --synthetic_size "${SYNTHETIC_SIZE}"
+    --synthetic_batch_size "${SYNTHETIC_BATCH_SIZE}"
     --teacher_batch_size "${TEACHER_BATCH_SIZE}"
     --train_steps "${TRAIN_STEPS}"
     --lr "${LR}"
@@ -102,6 +104,7 @@ CMD+=("${EXTRA_ARGS[@]}")
 echo "Teacher cache   : ${HIDDEN_PAYLOAD_PATH}"
 echo "Output          : ${OUTPUT_PATH}"
 echo "Synthetic M     : ${SYNTHETIC_SIZE}"
+echo "Synthetic batch : ${SYNTHETIC_BATCH_SIZE}"
 echo "Train steps     : ${TRAIN_STEPS}"
 echo "LR              : ${LR}"
 echo "Lambdas         : mmd=${LAMBDA_MMD}  cov=${LAMBDA_COV}  mean=${LAMBDA_MEAN}  var=${LAMBDA_VAR}  div=${LAMBDA_DIV}  block=${LAMBDA_BLOCK} (warmup=${DIV_WARMUP_STEPS})"

@@ -246,11 +246,73 @@ def _load_hidden_payload(input_hidden_path: str):
     modality_labels = payload.get("modality_labels", None)
     position_ids = payload.get("position_ids", None)
 
+    def _flatten_batched_tensor(name: str, tensor: torch.Tensor | None, hidden_batch_shape: tuple[int, int]):
+        if tensor is None:
+            return None
+        if tensor.ndim < 2:
+            raise ValueError(
+                f"Expected `{name}` to have at least 2 dims when flattening batched hidden states, "
+                f"got shape {tuple(tensor.shape)}."
+            )
+        if tuple(tensor.shape[:2]) != hidden_batch_shape:
+            raise ValueError(
+                f"Batched hidden states have prefix {hidden_batch_shape}, but `{name}` has prefix "
+                f"{tuple(tensor.shape[:2])}. Cannot flatten consistently."
+            )
+        return tensor.reshape(hidden_batch_shape[0] * hidden_batch_shape[1], *tensor.shape[2:])
+
+    def _normalize_hidden_layout(
+        *,
+        hidden: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        position_ids: torch.Tensor | None,
+        modality_labels: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        if hidden.ndim == 4:
+            hidden_batch_shape = tuple(hidden.shape[:2])
+            hidden = hidden.reshape(hidden_batch_shape[0] * hidden_batch_shape[1], *hidden.shape[2:])
+            attention_mask = _flatten_batched_tensor("attention_mask", attention_mask, hidden_batch_shape)
+            position_ids = _flatten_batched_tensor("position_ids", position_ids, hidden_batch_shape)
+            modality_labels = _flatten_batched_tensor("modality_labels", modality_labels, hidden_batch_shape)
+
+        if hidden.ndim != 3:
+            raise ValueError(
+                f"Expected hidden states with shape [N, L, D] or [B, N, L, D], got {tuple(hidden.shape)}."
+            )
+
+        if attention_mask is None:
+            attention_mask = torch.ones(hidden.shape[:2], dtype=torch.long)
+        elif attention_mask.shape != hidden.shape[:2]:
+            raise ValueError(
+                f"Attention mask shape {tuple(attention_mask.shape)} must match hidden prefix "
+                f"{tuple(hidden.shape[:2])}."
+            )
+
+        if position_ids is not None and hidden.shape[:2] != position_ids.shape:
+            synthetic_batch_size = metadata.get("synthetic_batch_size", None)
+            synthetic_size = metadata.get("synthetic_size", None)
+            raise ValueError(
+                f"Position ids shape {tuple(position_ids.shape)} must match hidden prefix "
+                f"{tuple(hidden.shape[:2])}. This payload is likely incomplete: hidden states only contain "
+                f"a sampled synthetic batch instead of the full synthetic set. "
+                f"metadata.synthetic_batch_size={synthetic_batch_size}, metadata.synthetic_size={synthetic_size}."
+            )
+        if modality_labels is not None and modality_labels.shape != hidden.shape[:2]:
+            raise ValueError(
+                f"Modality labels shape {tuple(modality_labels.shape)} must match hidden prefix "
+                f"{tuple(hidden.shape[:2])}."
+            )
+        return hidden, attention_mask, position_ids, modality_labels
+
     if "synthetic_hidden" in payload:
         hidden = payload["synthetic_hidden"]
         attention_mask = payload.get("attention_mask")
-        if attention_mask is None:
-            attention_mask = torch.ones(hidden.shape[:2], dtype=torch.long)
+        hidden, attention_mask, position_ids, modality_labels = _normalize_hidden_layout(
+            hidden=hidden,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            modality_labels=modality_labels,
+        )
         if position_ids is not None:
             hidden, position_ids, modality_labels = sort_sequence_by_position_ids(
                 hidden, position_ids, modality_labels,
@@ -268,7 +330,12 @@ def _load_hidden_payload(input_hidden_path: str):
 
     if "teacher_cache" in payload:
         hidden = payload["teacher_cache"]
-        attention_mask = torch.ones(hidden.shape[:2], dtype=torch.long)
+        hidden, attention_mask, position_ids, modality_labels = _normalize_hidden_layout(
+            hidden=hidden,
+            attention_mask=None,
+            position_ids=position_ids,
+            modality_labels=modality_labels,
+        )
         if position_ids is not None:
             hidden, position_ids, modality_labels = sort_sequence_by_position_ids(
                 hidden, position_ids, modality_labels,

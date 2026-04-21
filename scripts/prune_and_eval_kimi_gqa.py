@@ -21,8 +21,10 @@ from src.generate_mask import generate_masks as build_masks_pipeline
 from src.prune import apply_structural_pruning
 
 
-def _normalize_answer(s: str) -> str:
-    return s.strip().lower()
+def _normalize_answer(s) -> str:
+    if s is None:
+        return ""
+    return str(s).strip().lower()
 
 
 def move_to_device(inputs: dict, device) -> dict:
