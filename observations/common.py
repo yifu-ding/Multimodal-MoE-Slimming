@@ -1192,73 +1192,59 @@ def attach_qwen3_observer(bundle: ModelBundle, accumulator: ObservationAccumulat
             and layer_idx not in getattr(config, "mlp_only_layers", [])
         ):
             continue
-        # 把层号挂到 expert 容器上, 方便后面记录 routing 和 activation 时标识来源层.
         layer.mlp.experts.layer_idx = layer_idx
-        original_forward = layer.mlp.forward
 
-        def observed_forward(self, hidden_states, *args, __orig=original_forward, **kwargs):
-            # 先把 [batch, seq, hidden] 展平成 token 维度, 后面所有统计都按 token 处理.
-            flat = hidden_states.reshape(-1, hidden_states.shape[-1])
-            # 根据上游准备好的 mask 构造当前 active token 对应的 text / visual 掩码.
-            # 如果有 padding mask, 这里会自动把 padding token 对齐去掉.
-            maybe_text_mask = getattr(self, "moe_text_mask", None)
-            maybe_visual_mask = getattr(self, "moe_media_mask", None)
-            if maybe_text_mask is None and maybe_visual_mask is None:
-                text_mask = torch.ones(flat.shape[0], dtype=torch.bool, device=flat.device)
-                visual_mask = torch.zeros(flat.shape[0], dtype=torch.bool, device=flat.device)
+        def observation_callback(
+            *,
+            layer_idx: int,
+            router_indices: torch.Tensor,
+            router_logits: torch.Tensor,
+            active_states: torch.Tensor,
+            moe_text_mask: Optional[torch.Tensor],
+            moe_media_mask: Optional[torch.Tensor],
+            moe_padding_mask: Optional[torch.Tensor],
+            experts: Any,
+        ) -> None:
+            n_tok = int(router_indices.shape[0])
+            if moe_text_mask is None and moe_media_mask is None:
+                text_mask = torch.ones(n_tok, dtype=torch.bool, device=router_indices.device)
+                visual_mask = torch.zeros(n_tok, dtype=torch.bool, device=router_indices.device)
             else:
                 text_mask, visual_mask = _build_masks_for_active_tokens(
-                    maybe_text_mask,
-                    maybe_visual_mask,
-                    getattr(self, "moe_padding_mask", None),
-                    flat.shape[0],
-                    flat.device,
+                    moe_text_mask,
+                    moe_media_mask,
+                    moe_padding_mask,
+                    n_tok,
+                    router_indices.device,
                 )
-            active_states = flat
-            if getattr(self, "moe_padding_mask", None) is not None:
-                # Qwen3 的 gate 只对非 padding token 做路由, 所以这里也同步过滤 hidden states.
-                keep = ~self.moe_padding_mask.to(flat.device).view(-1)
-                active_states = flat[keep]
-                text_mask = text_mask[keep]
-                visual_mask = visual_mask[keep]
-            # 单独跑一次 gate, 取出每个 active token 的 expert 路由结果.
-            gate_outputs = self.gate(active_states)
-            if not (isinstance(gate_outputs, tuple) and len(gate_outputs) == 3):
-                raise RuntimeError("Expected Qwen3 gate to return (logits, weights, indices).")
-            router_logits, _, router_indices = gate_outputs
-            # 这里记录的是 token -> expert 的路由选择.
-            accumulator.record_routing(self.layer_idx, router_indices, text_mask, visual_mask)
+                if int(text_mask.numel()) != n_tok or int(visual_mask.numel()) != n_tok:
+                    text_mask = torch.ones(n_tok, dtype=torch.bool, device=router_indices.device)
+                    visual_mask = torch.zeros(n_tok, dtype=torch.bool, device=router_indices.device)
+
+            accumulator.record_routing(layer_idx, router_indices, text_mask, visual_mask)
             accumulator.record_topk_routing_and_router_logits(
-                self.layer_idx, router_indices, text_mask, visual_mask, router_logits
+                layer_idx, router_indices, text_mask, visual_mask, router_logits
             )
-            # one_hot 后形状大致是 [num_tokens, topk, num_experts].
-            # permute 成 [num_experts, topk, num_tokens] 后, 更方便按 expert 聚合.
-            num_experts = _safe_num_experts(self.experts)
-            expert_mask = F.one_hot(router_indices, num_classes=num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            # 只遍历本次前向里真正命中的 expert, 避免无效计算.
+
+            num_experts = _safe_num_experts(experts)
+            expert_mask = F.one_hot(router_indices, num_classes=num_experts).permute(2, 1, 0)
             expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
             for expert_tensor in expert_hit:
                 expert_idx = int(expert_tensor[0].item())
-                # token_idx 是被当前 expert 选中的 token 下标.
-                # topk_pos 表示命中的是第几个 top-k 位置, 这里只是顺手解出来, 后面不直接使用.
-                topk_pos, token_idx = torch.where(expert_mask[expert_idx])
+                _, token_idx = torch.where(expert_mask[expert_idx])
+                if token_idx.numel() == 0:
+                    continue
                 current_state = active_states[token_idx]
-                # 直接对当前 expert 提取中间 channel 激活, 用于后续观察统计.
-                activations = compute_qwen3_channel_activation(
-                    self.experts, expert_idx, current_state
-                )
+                activations = compute_qwen3_channel_activation(experts, expert_idx, current_state)
                 accumulator.record_channel_response(
-                    self.layer_idx,
+                    layer_idx,
                     expert_idx,
                     activations,
                     text_mask[token_idx],
                     visual_mask[token_idx],
                 )
-            # 观察逻辑做完后, 继续执行原始 MLP forward, 保持模型行为不变.
-            return __orig(hidden_states, *args, **kwargs)
 
-        layer.mlp.forward = observed_forward.__get__(layer.mlp)
+        layer.mlp._obs_callback = observation_callback
 
 
 def attach_kimi_observer(bundle: ModelBundle, accumulator: ObservationAccumulator) -> None:

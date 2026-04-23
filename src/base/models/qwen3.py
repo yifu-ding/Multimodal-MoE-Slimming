@@ -180,6 +180,10 @@ def mlp_forward(
         routing_weights, router_indices = torch.topk(routing_weights, top_k, dim=-1)
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(router_logits.dtype)
+    # expose the exact routing result used by this forward for observation hooks
+    self._obs_router_logits = router_logits
+    self._obs_router_indices = router_indices
+    self._obs_routing_weights = routing_weights
 
     # import ipdb; ipdb.set_trace()
     if hasattr(self, "gate_dict") and self.gate_dict is not None:
@@ -220,6 +224,23 @@ def mlp_forward(
                 hidden_states.shape[0] * top_k - (router_weights > 0).sum().item()
             )
 
+    # lightweight observation callback for external statistics collection
+    obs_cb = getattr(self, "_obs_callback", None)
+    if callable(obs_cb):
+        try:
+            obs_cb(
+                layer_idx=getattr(self, "layer_idx", -1),
+                router_indices=router_indices,
+                router_logits=router_logits,
+                active_states=hidden_states,
+                moe_text_mask=getattr(self, "moe_text_mask", None),
+                moe_media_mask=getattr(self, "moe_media_mask", None),
+                moe_padding_mask=getattr(self, "moe_padding_mask", None),
+                experts=self.experts,
+            )
+        except Exception as exc:
+            logger.warning(f"[observation] qwen3 obs callback failed at layer={getattr(self, 'layer_idx', -1)}: {exc}")
+
     # hidden_states = hidden_states.reshape(batch_size, -1, self.hidden_size)
     routed_out = self.experts(hidden_states, router_indices, routing_weights)
     if skip_mask is not None:
@@ -245,7 +266,7 @@ def decoder_layer_forward(
     tau: Optional[float] = None,
     **kwargs: Unpack[TransformersKwargs],
 ) -> torch.Tensor:
-    residual = hidden_states.to(self.input_layernorm.weight.device)
+    residual = hidden_states
     hidden_states = self.input_layernorm(hidden_states)
     # Self Attention
     hidden_states, _ = self.self_attn(
@@ -258,6 +279,10 @@ def decoder_layer_forward(
         position_embeddings=position_embeddings,
         **kwargs,
     )
+    if residual.device != hidden_states.device:
+        residual = residual.to(hidden_states.device)
+    if residual.dtype != hidden_states.dtype:
+        residual = residual.to(hidden_states.dtype)
     hidden_states = residual + hidden_states
 
     # Fully Connected
@@ -273,6 +298,10 @@ def decoder_layer_forward(
         )
     else:
         hidden_states = self.mlp(hidden_states)
+    if residual.device != hidden_states.device:
+        residual = residual.to(hidden_states.device)
+    if residual.dtype != hidden_states.dtype:
+        residual = residual.to(hidden_states.dtype)
     hidden_states = residual + hidden_states
     return hidden_states
 
