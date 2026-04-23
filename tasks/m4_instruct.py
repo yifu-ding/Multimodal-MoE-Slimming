@@ -13,12 +13,24 @@ All samples in M4-Instruct are multi-image (2-8 images per sample).
 import os
 import re
 import zipfile
-from typing import Any, Dict, List, Optional, Tuple
+import json
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from PIL import Image
-from datasets import load_dataset
+from huggingface_hub.errors import LocalEntryNotFoundError, OfflineModeIsEnabled
 
 _M4_CACHE: Optional[Dict[str, Any]] = None  # {"zip_handles": {...}}
+
+# Zip archives sorted by size (ascending) so we prefer smaller/local ones first.
+_PREFERRED_ZIP_ORDER = [
+    "MIT-States_PropertyCoherence.zip",
+    "MIT-States_StateCoherence.zip",
+    "OCR-VQA.zip",
+    "IEdit.zip",
+    "CLEVR-Change.zip",
+    "DocVQA.zip",
+    "VizWiz.zip",
+]
 
 
 def _get_cache_dir() -> str:
@@ -48,6 +60,59 @@ def _download_annotation_json() -> str:
     return path
 
 
+def _find_local_repo_file(filename: str) -> Optional[str]:
+    """Find a dataset file in known local HF cache locations."""
+    cache_dir = _get_cache_dir()
+    direct_path = os.path.join(cache_dir, filename)
+    if os.path.isfile(direct_path):
+        return direct_path
+
+    snapshot_root = os.path.join(
+        os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")),
+        "hub",
+        "datasets--lmms-lab--M4-Instruct-Data",
+        "snapshots",
+    )
+    if os.path.isdir(snapshot_root):
+        snapshots = sorted(
+            [
+                os.path.join(snapshot_root, entry)
+                for entry in os.listdir(snapshot_root)
+                if os.path.isdir(os.path.join(snapshot_root, entry))
+            ]
+        )
+        for snapshot_dir in reversed(snapshots):
+            candidate = os.path.join(snapshot_dir, filename)
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+def _offline_mode_enabled() -> bool:
+    return os.environ.get("HF_HUB_OFFLINE", "").strip().lower() in {"1", "on", "yes", "true"}
+
+
+def _list_available_zips() -> set[str]:
+    available = set()
+    cache_dir = _get_cache_dir()
+    if os.path.isdir(cache_dir):
+        available.update(name for name in os.listdir(cache_dir) if name.endswith(".zip"))
+
+    snapshot_root = os.path.join(
+        os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")),
+        "hub",
+        "datasets--lmms-lab--M4-Instruct-Data",
+        "snapshots",
+    )
+    if os.path.isdir(snapshot_root):
+        for entry in os.listdir(snapshot_root):
+            snapshot_dir = os.path.join(snapshot_root, entry)
+            if not os.path.isdir(snapshot_dir):
+                continue
+            available.update(name for name in os.listdir(snapshot_dir) if name.endswith(".zip"))
+    return available
+
+
 def _get_zip_name(image_path: str) -> str:
     """Derive the zip archive name from an image path, e.g. 'HQ-Edit/images/1.jpg' -> 'HQ-Edit.zip'."""
     top_dir = image_path.split("/")[0]
@@ -58,19 +123,30 @@ def _download_zip(zip_name: str) -> str:
     """Download a single zip archive via hf_hub_download (cached)."""
     from huggingface_hub import hf_hub_download
 
-    cache_dir = _get_cache_dir()
-    local_path = os.path.join(cache_dir, zip_name)
-    if os.path.isfile(local_path):
+    local_path = _find_local_repo_file(zip_name)
+    if local_path is not None:
         return local_path
 
+    if _offline_mode_enabled():
+        raise FileNotFoundError(
+            f"M4-Instruct asset {zip_name} is not available in local cache, and HF offline mode is enabled. "
+            f"Place it under {_get_cache_dir()} or disable HF_HUB_OFFLINE to allow download."
+        )
+
     print(f"[M4-Instruct] Downloading {zip_name} ...")
-    path = hf_hub_download(
-        repo_id="lmms-lab/M4-Instruct-Data",
-        filename=zip_name,
-        repo_type="dataset",
-        local_dir=cache_dir,
-    )
-    return path
+    try:
+        return hf_hub_download(
+            repo_id="lmms-lab/M4-Instruct-Data",
+            filename=zip_name,
+            repo_type="dataset",
+            local_dir=_get_cache_dir(),
+        )
+    except (OfflineModeIsEnabled, LocalEntryNotFoundError) as exc:
+        raise FileNotFoundError(
+            f"Failed to obtain M4-Instruct asset {zip_name}. "
+            f"Checked local cache first and then download failed. "
+            f"Expected a cached file under {_get_cache_dir()}."
+        ) from exc
 
 
 def _init_cache() -> Dict[str, Any]:
@@ -121,24 +197,95 @@ def _strip_image_tags(text: str) -> str:
     return re.sub(r"<image>\s*", "", text).strip()
 
 
+def _skip_json_whitespace(text: str, start: int) -> int:
+    while start < len(text) and text[start] in " \t\r\n":
+        start += 1
+    return start
+
+
+def _iter_json_array(path: str, chunk_size: int = 1 << 20) -> Iterator[Dict[str, Any]]:
+    """Yield objects from a top-level JSON array without loading the full file."""
+    decoder = json.JSONDecoder()
+    buffer = ""
+    started = False
+    with open(path, "r", encoding="utf-8") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            eof = chunk == ""
+            if chunk:
+                buffer += chunk
+
+            cursor = 0
+            if not started:
+                cursor = _skip_json_whitespace(buffer, cursor)
+                if cursor >= len(buffer):
+                    if eof:
+                        raise ValueError(f"Empty JSON content in {path}")
+                    continue
+                if buffer[cursor] != "[":
+                    raise ValueError(f"Expected top-level JSON array in {path}")
+                started = True
+                cursor += 1
+
+            while True:
+                cursor = _skip_json_whitespace(buffer, cursor)
+                if cursor >= len(buffer):
+                    break
+                if buffer[cursor] == "]":
+                    return
+                try:
+                    item, cursor = decoder.raw_decode(buffer, cursor)
+                except json.JSONDecodeError:
+                    if eof:
+                        raise ValueError(f"Malformed JSON array in {path}")
+                    break
+                if not isinstance(item, dict):
+                    raise ValueError(f"Expected object entries in {path}, got {type(item).__name__}")
+                yield item
+                cursor = _skip_json_whitespace(buffer, cursor)
+                if cursor >= len(buffer):
+                    break
+                if buffer[cursor] == ",":
+                    cursor += 1
+                    continue
+                if buffer[cursor] == "]":
+                    return
+                if eof:
+                    raise ValueError(f"Unexpected trailing content in {path}")
+                break
+
+            buffer = buffer[cursor:]
+            if eof:
+                if buffer.strip():
+                    raise ValueError(f"Unexpected EOF while parsing {path}")
+                return
+
+
 def _iter_m4_annotations():
     ann_path = _download_annotation_json()
-    streamed = load_dataset("json", data_files=ann_path, split="train", streaming=True)
-    for ann in streamed:
+    for ann in _iter_json_array(ann_path):
         yield ann
 
 
 def load_m4_instruct_rows(max_rows: int = 1024) -> List[Dict[str, Any]]:
-    """Stream and collect up to *max_rows* M4-Instruct rows."""
+    """Collect M4-Instruct rows while preferring locally available/smaller zips."""
     if max_rows <= 0:
         return []
 
-    rows: List[Dict[str, Any]] = []
+    from collections import defaultdict
+
+    available_zips = _list_available_zips()
+    offline = _offline_mode_enabled()
+    by_zip: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     scanned = 0
+
     for ann in _iter_m4_annotations():
         scanned += 1
         images = ann.get("image")
         if not isinstance(images, list) or not images:
+            continue
+        zip_name = _get_zip_name(images[0])
+        if offline and zip_name not in available_zips:
             continue
         conv = ann.get("conversations", [])
         if not isinstance(conv, list):
@@ -146,7 +293,7 @@ def load_m4_instruct_rows(max_rows: int = 1024) -> List[Dict[str, Any]]:
         question_raw, answer = _extract_question_and_answer(conv)
         if not question_raw:
             continue
-        rows.append(
+        by_zip[zip_name].append(
             {
                 "sample_id": ann.get("sample_id", f"row-{scanned}"),
                 "question": _strip_image_tags(question_raw),
@@ -157,12 +304,31 @@ def load_m4_instruct_rows(max_rows: int = 1024) -> List[Dict[str, Any]]:
                 "metadata": ann.get("metadata", {}),
             }
         )
-        if len(rows) >= max_rows:
+
+    def zip_sort_key(zip_name: str) -> tuple[int, int, str]:
+        local_rank = 0 if zip_name in available_zips else 1
+        preferred_rank = (
+            _PREFERRED_ZIP_ORDER.index(zip_name) if zip_name in _PREFERRED_ZIP_ORDER else len(_PREFERRED_ZIP_ORDER)
+        )
+        return (local_rank, preferred_rank, zip_name)
+
+    ordered_zips = sorted(by_zip.keys(), key=zip_sort_key)
+    rows: List[Dict[str, Any]] = []
+    for zip_name in ordered_zips:
+        remaining = max_rows - len(rows)
+        if remaining <= 0:
             break
+        rows.extend(by_zip[zip_name][:remaining])
+
+    if offline and len(rows) < max_rows:
+        raise FileNotFoundError(
+            f"Only found {len(rows)} M4-Instruct samples from locally cached zip files in offline mode, "
+            f"but max_rows={max_rows}. Cached zips: {sorted(available_zips)}"
+        )
 
     zips_used = sorted({_get_zip_name(r["image_paths"][0]) for r in rows})
     print(
-        f"[M4-Instruct] Stream-collected {len(rows)} rows (requested={max_rows}, scanned={scanned}) "
+        f"[M4-Instruct] Collected {len(rows)} rows (requested={max_rows}, scanned={scanned}, offline={offline}) "
         f"from {len(zips_used)} zip(s): {zips_used}"
     )
     return rows
