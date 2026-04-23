@@ -630,11 +630,33 @@ def compute_generic_expert_activation(expert: Any, hidden_states: torch.Tensor):
 
 
 class ObservationAccumulator:
-    def __init__(self, layer_to_num_experts: Dict[int, int], layer_to_num_channels: Dict[int, int]):
+    def __init__(
+        self,
+        layer_to_num_experts: Dict[int, int],
+        layer_to_num_channels: Dict[int, int],
+        topk_count_limit: int = 8,
+    ):
         self.layer_to_num_experts = layer_to_num_experts
         self.layer_to_num_channels = layer_to_num_channels
+        self.topk_count_limit = int(topk_count_limit)
         self.layers = sorted(layer_to_num_experts.keys())
         self.routing_counts = {
+            layer: {
+                m: torch.zeros(layer_to_num_experts[layer], dtype=torch.float64)
+                for m in MODALITIES
+            }
+            for layer in self.layers
+        }
+        # 只统计前 min(self.topk_count_limit, 该层 K) 个 top-k 槽位上的 (token, slot) 路由命中
+        self.topk_routing_counts = {
+            layer: {
+                m: torch.zeros(layer_to_num_experts[layer], dtype=torch.float64)
+                for m in MODALITIES
+            }
+            for layer in self.layers
+        }
+        # 原始 router logits 在 expert 维上按模态对 token 求和（不经过 topk）
+        self.router_logits_sum = {
             layer: {
                 m: torch.zeros(layer_to_num_experts[layer], dtype=torch.float64)
                 for m in MODALITIES
@@ -683,6 +705,44 @@ class ObservationAccumulator:
             ).to(torch.float64)
             self.routing_counts[layer_idx][modality] += counts
 
+    def record_topk_routing_and_router_logits(
+        self,
+        layer_idx: int,
+        router_indices: torch.Tensor,
+        text_mask: torch.Tensor,
+        visual_mask: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> None:
+        """仅将前 `topk_count_limit` 个 top-k 槽位计入 topk 路由；将 router_logits 在 expert 维上按模态对 token 求和。"""
+        text_mask = text_mask.bool()
+        visual_mask = visual_mask.bool()
+        n_tok, k_dim = int(router_indices.shape[0]), int(router_indices.shape[1])
+        if int(router_logits.shape[0]) != n_tok:
+            raise ValueError(
+                f"router_logits 行数 {router_logits.shape[0]} 与 topk 行数 {n_tok} 不一致 (layer {layer_idx})"
+            )
+        n_exp = int(router_logits.shape[1])
+        if n_exp != self.layer_to_num_experts[layer_idx]:
+            raise ValueError(
+                f"router_logits expert 维 {n_exp} 与该层 n_experts {self.layer_to_num_experts[layer_idx]} 不一致 (layer {layer_idx})"
+            )
+        k_eff = min(self.topk_count_limit, k_dim)
+        if k_eff < 1:
+            return
+        sliced = router_indices[:, :k_eff]
+        log_cpu = router_logits.detach().to(torch.float64)
+        for modality, mask in (("text", text_mask), ("visual", visual_mask)):
+            if int(mask.sum().item()) == 0:
+                continue
+            # topk 路由计数（(token,slot) 拉直后 bincount）
+            sel = sliced[mask].reshape(-1).detach().cpu()
+            counts = torch.bincount(
+                sel, minlength=self.layer_to_num_experts[layer_idx]
+            ).to(torch.float64)
+            self.topk_routing_counts[layer_idx][modality] += counts
+            # 原始 logits：每个 expert 一维，对该模态上所有 token 在 expert 维求和
+            self.router_logits_sum[layer_idx][modality] += log_cpu[mask].sum(0).cpu()
+
     def record_channel_response(
         self,
         layer_idx: int,
@@ -709,6 +769,9 @@ class ObservationAccumulator:
             "layer_to_num_experts": self.layer_to_num_experts,
             "layer_to_num_channels": self.layer_to_num_channels,
             "routing_counts": self.routing_counts,
+            "topk_routing_counts": self.topk_routing_counts,
+            "router_logits_sum": self.router_logits_sum,
+            "router_topk": self.topk_count_limit,
             "token_counts": self.token_counts,
             "channel_abs_sum": self.channel_abs_sum,
             "channel_count": self.channel_count,
@@ -773,13 +836,18 @@ def attach_qwen3_observer(bundle: ModelBundle, accumulator: ObservationAccumulat
                 # Qwen3 的 gate 只对非 padding token 做路由, 所以这里也同步过滤 hidden states.
                 keep = ~self.moe_padding_mask.to(flat.device).view(-1)
                 active_states = flat[keep]
+                text_mask = text_mask[keep]
+                visual_mask = visual_mask[keep]
             # 单独跑一次 gate, 取出每个 active token 的 expert 路由结果.
             gate_outputs = self.gate(active_states)
             if not (isinstance(gate_outputs, tuple) and len(gate_outputs) == 3):
                 raise RuntimeError("Expected Qwen3 gate to return (logits, weights, indices).")
-            _, _, router_indices = gate_outputs
+            router_logits, _, router_indices = gate_outputs
             # 这里记录的是 token -> expert 的路由选择.
             accumulator.record_routing(self.layer_idx, router_indices, text_mask, visual_mask)
+            accumulator.record_topk_routing_and_router_logits(
+                self.layer_idx, router_indices, text_mask, visual_mask, router_logits
+            )
             # one_hot 后形状大致是 [num_tokens, topk, num_experts].
             # permute 成 [num_experts, topk, num_tokens] 后, 更方便按 expert 聚合.
             expert_mask = F.one_hot(router_indices, num_classes=self.experts.num_experts)
@@ -833,6 +901,17 @@ def attach_kimi_observer(bundle: ModelBundle, accumulator: ObservationAccumulato
         original_moe_infer = layer.mlp.moe_infer
 
         def observed_gate_forward(self, hidden_states, *args, __orig=original_gate_forward, **kwargs):
+            # 与 `gate_forward` 中 gate 权重的线性层一致, 在 topk 前得到 router logits, 供按 expert 维累计.
+            hs = hidden_states
+            if len(hs.shape) == 3:
+                flat = hs.view(-1, hs.shape[-1])
+            elif len(hs.shape) == 2:
+                flat = hs
+            else:
+                raise RuntimeError(f"Kimi gate 观察: 不支持的 hidden_states 维数 {hs.shape}")
+            router_logits = F.linear(
+                flat.type(torch.float32), self.weight.type(torch.float32), None
+            )
             # 先执行原始 gate, 拿到每个 token 的 top-k expert 路由结果.
             topk_idx, topk_weight, aux_loss = __orig(hidden_states, *args, **kwargs)
             # 这些索引由上游的 Kimi forward 在打开 freq_save_dir 后提前写入.
@@ -851,6 +930,9 @@ def attach_kimi_observer(bundle: ModelBundle, accumulator: ObservationAccumulato
                 visual_mask = torch.zeros(topk_idx.shape[0], dtype=torch.bool, device=topk_idx.device)
             # 这里记录的是 token -> expert 的路由选择, 还没有真正跑 expert 计算.
             accumulator.record_routing(self.layer_idx, topk_idx, text_mask, visual_mask)
+            accumulator.record_topk_routing_and_router_logits(
+                self.layer_idx, topk_idx, text_mask, visual_mask, router_logits
+            )
             return topk_idx, topk_weight, aux_loss
 
         def observed_moe_infer(self, x, topk_ids, topk_weight, *args, __orig=original_moe_infer, **kwargs):
@@ -1016,7 +1098,10 @@ def collect_observation_stats(args) -> Dict[str, Any]:
         f"covering {sum(layer_to_num_experts.values())} experts.",
         flush=True,
     )
-    accumulator = ObservationAccumulator(layer_to_num_experts, layer_to_num_channels)
+    router_topk = int(getattr(args, "router_topk", 8))
+    accumulator = ObservationAccumulator(
+        layer_to_num_experts, layer_to_num_channels, topk_count_limit=router_topk
+    )
     if bundle.family == "qwen3":
         attach_qwen3_observer(bundle, accumulator)
     elif bundle.family == "deepseek_vl":
@@ -1089,13 +1174,17 @@ def collect_observation_stats(args) -> Dict[str, Any]:
     return payload
 
 
-def compute_routing_freq(raw_stats: Dict[str, Any]) -> Dict[int, Dict[str, torch.Tensor]]:
-    output = {}
+def compute_routing_freq(
+    raw_stats: Dict[str, Any], counts_key: str = "routing_counts"
+) -> Dict[int, Dict[str, torch.Tensor]]:
+    if counts_key not in raw_stats:
+        counts_key = "routing_counts"
+    output: Dict[int, Dict[str, torch.Tensor]] = {}
     for layer in raw_stats["layers"]:
         output[layer] = {}
         for modality in MODALITIES:
             denom = raw_stats["token_counts"][layer][modality]
-            counts = raw_stats["routing_counts"][layer][modality].clone()
+            counts = raw_stats[counts_key][layer][modality].clone()
             if denom <= 0:
                 output[layer][modality] = torch.zeros_like(counts)
             else:
@@ -1299,4 +1388,10 @@ def build_base_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--raw_stats_path", type=str, default="")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--router-topk",
+        type=int,
+        default=8,
+        help="O1/路由：top-k 路由直方图只计前 k 个槽位；超过模型 top_k 时以模型 top_k 为准。",
+    )
     return parser
