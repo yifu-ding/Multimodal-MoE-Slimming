@@ -151,7 +151,7 @@ def infer_model_family(model_name_or_path: str) -> str:
     name = model_name_or_path.lower()
     if "kimi-vl" in name:
         return "kimi"
-    if "qwen3-vl" in name:
+    if "qwen3-vl" in name or "qwen3.5-35b-a3b" in name:
         return "qwen3"
     if "internvl" in name:
         return "internvl"
@@ -217,6 +217,7 @@ def resolve_model_name_or_path(model_name_or_path: str) -> str:
             "moonshotai/Kimi-VL-A3B-Instruct",
             "Qwen/Qwen3-VL-30B-A3B-Instruct",
             "Qwen/Qwen3-VL-4B-Instruct",
+            "Qwen/Qwen3.5-35B-A3B",
             "OpenGVLab/InternVL-3.5-GPT-OSS-20B-A4B-Preview-HF",
             "OpenGVLab/InternVL3_5-GPT-OSS-20B-A4B-Preview-HF",
             "deepseek-ai/deepseek-vl2-small",
@@ -331,6 +332,33 @@ def _get_deepseek_text_config(model):
     return cfg
 
 
+def _get_qwen3_text_config(model):
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        raise AttributeError(f"Model {type(model)} has no `config` for Qwen3 config resolution.")
+    return getattr(cfg, "text_config", cfg)
+
+
+def _get_qwen3_decoder_layers(model):
+    candidates = [
+        ("model", "language_model", "layers"),  # Qwen3-VL
+        ("model", "layers"),  # Qwen3 text
+        ("language_model", "layers"),
+        ("layers",),
+    ]
+    for path in candidates:
+        current = model
+        ok = True
+        for attr in path:
+            if not hasattr(current, attr):
+                ok = False
+                break
+            current = getattr(current, attr)
+        if ok:
+            return current
+    raise AttributeError(f"Cannot resolve Qwen3 decoder layers from model type {type(model)}")
+
+
 def build_dataset(dataset_name: str, model_family: str, **kwargs):
     dataset_name = normalize_dataset_name(dataset_name)
     if dataset_name == "gqa":
@@ -416,19 +444,29 @@ def load_model_bundle(
         model, processor = load_qwen3_model(resolved_name_or_path, 
                                             device_map=device_map, 
                                             attn_implementation=attn_implementation)
+        qwen_cfg = _get_qwen3_text_config(model)
+        supports_vision = bool(
+            hasattr(model, "visual")
+            or hasattr(getattr(model, "model", None), "visual")
+            or getattr(model.config, "vision_config", None) is not None
+        )
+        if not supports_vision:
+            text_to_message = lambda text: [{"role": "user", "content": text}]
+        eos_token = getattr(processor, "eos_token", None) or "<|im_end|>"
         model_config = {
             "family": family,
-            "get_lm": lambda m: m.model.language_model,
+            "get_lm": lambda m: getattr(getattr(m, "model", None), "language_model", getattr(m, "model", m)),
             "is_moe_layer": lambda cfg, idx: (
-                hasattr(cfg, "num_experts")
-                and cfg.num_experts > 0
-                and (idx + 1) % cfg.decoder_sparse_step == 0
+                getattr(cfg, "num_experts", 0) > 0
+                and (idx + 1) % getattr(cfg, "decoder_sparse_step", 1) == 0
                 and idx not in getattr(cfg, "mlp_only_layers", [])
             ),
-            "eos_token": "<|im_end|>",
+            "eos_token": eos_token,
             "create_mask": partial(
                 create_mask_after_last_token, special_token_id=151644, offset=3
             ),
+            "supports_vision": supports_vision,
+            "qwen_text_config": qwen_cfg,
         }
     elif family == "deepseek_vl":
         from src.base.models.deepseek_vl import load_model as load_deepseek_vl_model
@@ -492,6 +530,7 @@ def prepare_inputs(
     bundle: ModelBundle, batch: Dict[str, List[Any]], dataset_name: str
 ) -> Dict[str, torch.Tensor]:
     processor = bundle.processor
+    supports_vision = bool(bundle.model_config.get("supports_vision", True))
     if bundle.family == "deepseek_vl":
         packed = []
         for i, text in enumerate(batch["model_input_org_text"]):
@@ -529,9 +568,14 @@ def prepare_inputs(
     batched_messages = [
         bundle.text_to_message(text) for text in batch["model_input_org_text"]
     ]
-    batched_messages = processor.apply_chat_template(
-        batched_messages, add_generation_prompt=True, return_tensors="pt"
-    )
+    if supports_vision:
+        batched_messages = processor.apply_chat_template(
+            batched_messages, add_generation_prompt=True, return_tensors="pt"
+        )
+    else:
+        batched_messages = processor.apply_chat_template(
+            batched_messages, add_generation_prompt=True, tokenize=False
+        )
     tmp = []
     for i, _ in enumerate(batched_messages):
         batched_messages[i] = (
@@ -550,16 +594,24 @@ def prepare_inputs(
                 * (frame_num - 1)
                 + batched_messages[i][media_end_idx:]
             )
-    if dataset_name in ("video_mmmu", "m4_instruct"):
+    if supports_vision and dataset_name in ("video_mmmu", "m4_instruct"):
         batch["model_input_visual"] = tmp
-    inputs = processor(
-        images=batch["model_input_visual"],
-        text=batched_messages,
-        return_tensors="pt",
-        padding=True,
-        padding_side="left",
-        truncation=True,
-    )
+    if supports_vision:
+        inputs = processor(
+            images=batch["model_input_visual"],
+            text=batched_messages,
+            return_tensors="pt",
+            padding=True,
+            padding_side="left",
+            truncation=True,
+        )
+    else:
+        inputs = processor(
+            text=batched_messages,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        )
     return inputs
 
 
@@ -603,18 +655,24 @@ def resolve_activation_fn(obj: Any) -> Callable[[torch.Tensor], torch.Tensor]:
 
 
 def compute_qwen3_channel_activation(experts, expert_idx: int, hidden_states: torch.Tensor):
-    gate_weight = experts.gate_up_proj[expert_idx]
-    if gate_weight.shape[-1] == hidden_states.shape[-1]:
-        gate_up = F.linear(hidden_states, gate_weight)
-    elif gate_weight.shape[0] == hidden_states.shape[-1]:
-        gate_up = hidden_states @ gate_weight
-    else:
-        raise ValueError(
-            f"Unsupported Qwen3 fused gate_up_proj shape {tuple(gate_weight.shape)} "
-            f"for hidden size {hidden_states.shape[-1]}."
-        )
-    gate, up = gate_up.chunk(2, dim=-1)
-    return experts.act_fn(gate) * up
+    if hasattr(experts, "gate_up_proj"):
+        gate_weight = experts.gate_up_proj[expert_idx]
+        if gate_weight.shape[-1] == hidden_states.shape[-1]:
+            gate_up = F.linear(hidden_states, gate_weight)
+        elif gate_weight.shape[0] == hidden_states.shape[-1]:
+            gate_up = hidden_states @ gate_weight
+        else:
+            raise ValueError(
+                f"Unsupported Qwen3 fused gate_up_proj shape {tuple(gate_weight.shape)} "
+                f"for hidden size {hidden_states.shape[-1]}."
+            )
+        gate, up = gate_up.chunk(2, dim=-1)
+        return experts.act_fn(gate) * up
+    if hasattr(experts, "__getitem__"):
+        return compute_generic_expert_activation(experts[expert_idx], hidden_states)
+    raise NotImplementedError(
+        f"Cannot infer Qwen3 expert activation structure for experts type: {type(experts)}"
+    )
 
 
 def _linear_from_module_or_param(module_or_param: Any, hidden_states: torch.Tensor):
@@ -956,16 +1014,17 @@ def attach_deepseek_observer(bundle: ModelBundle, accumulator: ObservationAccumu
 
 def attach_qwen3_observer(bundle: ModelBundle, accumulator: ObservationAccumulator) -> None:
     model = bundle.model
-    config = model.config.text_config
-    for layer_idx, layer in enumerate(model.model.language_model.layers):
+    config = _get_qwen3_text_config(model)
+    layers = _get_qwen3_decoder_layers(model)
+    for layer_idx, layer in enumerate(layers):
         # 只在 Qwen3 的稀疏 MoE 层上挂观察逻辑.
         # 条件分别表示:
         # 1. 模型启用了 expert.
         # 2. 当前层命中 decoder_sparse_step 指定的稀疏层周期.
         # 3. 当前层不在只保留 dense MLP 的例外列表里.
         if not (
-            config.num_experts > 0
-            and (layer_idx + 1) % config.decoder_sparse_step == 0
+            getattr(config, "num_experts", 0) > 0
+            and (layer_idx + 1) % getattr(config, "decoder_sparse_step", 1) == 0
             and layer_idx not in getattr(config, "mlp_only_layers", [])
         ):
             continue
@@ -978,13 +1037,19 @@ def attach_qwen3_observer(bundle: ModelBundle, accumulator: ObservationAccumulat
             flat = hidden_states.reshape(-1, hidden_states.shape[-1])
             # 根据上游准备好的 mask 构造当前 active token 对应的 text / visual 掩码.
             # 如果有 padding mask, 这里会自动把 padding token 对齐去掉.
-            text_mask, visual_mask = _build_masks_for_active_tokens(
-                getattr(self, "moe_text_mask", None),
-                getattr(self, "moe_media_mask", None),
-                getattr(self, "moe_padding_mask", None),
-                flat.shape[0],
-                flat.device,
-            )
+            maybe_text_mask = getattr(self, "moe_text_mask", None)
+            maybe_visual_mask = getattr(self, "moe_media_mask", None)
+            if maybe_text_mask is None and maybe_visual_mask is None:
+                text_mask = torch.ones(flat.shape[0], dtype=torch.bool, device=flat.device)
+                visual_mask = torch.zeros(flat.shape[0], dtype=torch.bool, device=flat.device)
+            else:
+                text_mask, visual_mask = _build_masks_for_active_tokens(
+                    maybe_text_mask,
+                    maybe_visual_mask,
+                    getattr(self, "moe_padding_mask", None),
+                    flat.shape[0],
+                    flat.device,
+                )
             active_states = flat
             if getattr(self, "moe_padding_mask", None) is not None:
                 # Qwen3 的 gate 只对非 padding token 做路由, 所以这里也同步过滤 hidden states.
@@ -1004,7 +1069,8 @@ def attach_qwen3_observer(bundle: ModelBundle, accumulator: ObservationAccumulat
             )
             # one_hot 后形状大致是 [num_tokens, topk, num_experts].
             # permute 成 [num_experts, topk, num_tokens] 后, 更方便按 expert 聚合.
-            expert_mask = F.one_hot(router_indices, num_classes=self.experts.num_experts)
+            num_experts = getattr(self.experts, "num_experts", len(self.experts))
+            expert_mask = F.one_hot(router_indices, num_classes=num_experts)
             expert_mask = expert_mask.permute(2, 1, 0)
             # 只遍历本次前向里真正命中的 expert, 避免无效计算.
             expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
@@ -1148,26 +1214,35 @@ def discover_layer_structure(bundle: ModelBundle) -> Tuple[Dict[int, int], Dict[
     layer_to_num_experts = {}
     layer_to_num_channels = {}
     if bundle.family == "qwen3":
-        config = bundle.model.config.text_config
-        for layer_idx, layer in enumerate(bundle.model.model.language_model.layers):
+        config = _get_qwen3_text_config(bundle.model)
+        layers = _get_qwen3_decoder_layers(bundle.model)
+        for layer_idx, layer in enumerate(layers):
             if (
-                config.num_experts > 0
-                and (layer_idx + 1) % config.decoder_sparse_step == 0
+                getattr(config, "num_experts", 0) > 0
+                and (layer_idx + 1) % getattr(config, "decoder_sparse_step", 1) == 0
                 and layer_idx not in getattr(config, "mlp_only_layers", [])
             ):
-                layer_to_num_experts[layer_idx] = layer.mlp.experts.num_experts
+                experts = layer.mlp.experts
+                num_experts = getattr(experts, "num_experts", len(experts))
+                layer_to_num_experts[layer_idx] = int(num_experts)
                 intermediate_size = getattr(
-                    layer.mlp.experts, "intermediate_dim", None
+                    experts, "intermediate_dim", None
                 )
                 if intermediate_size is None:
                     intermediate_size = getattr(
-                        layer.mlp.experts, "intermediate_size", None
+                        experts, "intermediate_size", None
                     )
                 if intermediate_size is None:
-                    raise AttributeError(
-                        "Cannot infer Qwen3 expert width: expected "
-                        "`intermediate_dim` or `intermediate_size` on fused experts."
-                    )
+                    sample_expert = experts[0]
+                    if hasattr(sample_expert, "up_proj"):
+                        intermediate_size = sample_expert.up_proj.out_features
+                    elif hasattr(sample_expert, "w3"):
+                        w3 = sample_expert.w3
+                        intermediate_size = (
+                            w3.out_features if isinstance(w3, torch.nn.Module) else w3.shape[0]
+                        )
+                if intermediate_size is None:
+                    raise AttributeError("Cannot infer Qwen3 expert width for observation hooks.")
                 layer_to_num_channels[layer_idx] = int(intermediate_size)
         return layer_to_num_experts, layer_to_num_channels
     if bundle.family == "internvl":
@@ -1236,6 +1311,7 @@ def discover_layer_structure(bundle: ModelBundle) -> Tuple[Dict[int, int], Dict[
 
 
 def collect_observation_stats(args) -> Dict[str, Any]:
+    normalized_dataset = normalize_dataset_name(args.dataset)
     print(
         f"[Observation] Starting collection for dataset={args.dataset}, requested_samples={args.num_samples}",
         flush=True,
@@ -1265,25 +1341,41 @@ def collect_observation_stats(args) -> Dict[str, Any]:
     print("[Observation] Observation hooks attached.", flush=True)
 
     print(f"[Observation] Building dataset: {args.dataset}", flush=True)
-    data = build_dataset(args.dataset, bundle.family)
-    if args.subset_seed is not None:
-        pool = list(range(args.start_idx, len(data)))
-        n_pick = min(args.num_samples, len(pool))
-        rng = random.Random(args.subset_seed)
-        subset_indices = rng.sample(pool, n_pick) if n_pick > 0 else []
-        print(
-            f"[Observation] Dataset size={len(data)}, random subset: seed={args.subset_seed}, "
-            f"pool=[{args.start_idx}, {len(data)}), picked={len(subset_indices)}, batch_size={args.batch_size}",
-            flush=True,
-        )
-    else:
+    if normalized_dataset == "m4_instruct":
+        required_rows = max(0, args.start_idx) + max(0, args.num_samples)
+        data = build_dataset(args.dataset, bundle.family, max_rows=required_rows)
+        if args.subset_seed is not None:
+            print(
+                "[Observation] m4_instruct 使用流式按需加载，忽略 --subset_seed，改为顺序区间采样。",
+                flush=True,
+            )
         subset_end = min(args.start_idx + args.num_samples, len(data))
         subset_indices = list(range(args.start_idx, subset_end))
         print(
-            f"[Observation] Dataset size={len(data)}, processing range=[{args.start_idx}, {subset_end}), "
+            f"[Observation] Dataset size={len(data)} (stream loaded), processing range=[{args.start_idx}, {subset_end}), "
             f"actual_samples={len(subset_indices)}, batch_size={args.batch_size}",
             flush=True,
         )
+    else:
+        data = build_dataset(args.dataset, bundle.family)
+        if args.subset_seed is not None:
+            pool = list(range(args.start_idx, len(data)))
+            n_pick = min(args.num_samples, len(pool))
+            rng = random.Random(args.subset_seed)
+            subset_indices = rng.sample(pool, n_pick) if n_pick > 0 else []
+            print(
+                f"[Observation] Dataset size={len(data)}, random subset: seed={args.subset_seed}, "
+                f"pool=[{args.start_idx}, {len(data)}), picked={len(subset_indices)}, batch_size={args.batch_size}",
+                flush=True,
+            )
+        else:
+            subset_end = min(args.start_idx + args.num_samples, len(data))
+            subset_indices = list(range(args.start_idx, subset_end))
+            print(
+                f"[Observation] Dataset size={len(data)}, processing range=[{args.start_idx}, {subset_end}), "
+                f"actual_samples={len(subset_indices)}, batch_size={args.batch_size}",
+                flush=True,
+            )
     print_probe_snapshot(accumulator, stage="开始前（尚未处理任何 batch）")
     subset = Subset(data, subset_indices)
     dataloader = DataLoader(
@@ -1530,7 +1622,12 @@ def plot_expert_channel_lines_per_expert(
 def build_base_arg_parser(description: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--model_name_or_path", type=str, required=True)
-    parser.add_argument("--dataset", type=str, default="gqa", choices=["gqa", "coco", "video_mmmu"])
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="gqa",
+        choices=["gqa", "coco", "video_mmmu", "m4_instruct", "m4-instruct", "m4"],
+    )
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--start_idx", type=int, default=0)
     parser.add_argument("--num_samples", type=int, default=64)
