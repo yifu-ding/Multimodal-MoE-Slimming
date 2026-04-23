@@ -63,6 +63,7 @@ INTRA_METHOD="${INTRA_METHOD:-second_attr_coverage}"
 # 这个 metric 没有双模态版本
 #   weight
 MODALITY_AWARE="${MODALITY_AWARE:-1}"  # 是否开启双模态
+NORMALIZE="${NORMALIZE:-0}"  # 是否对 text / visual 分模态做层级归一化
 INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-3proj_second_order}"
 
 ALIGN_INTER="${ALIGN_INTER:-0}"
@@ -71,7 +72,7 @@ MIN_PER_EXPERT="${MIN_PER_EXPERT:-256}"
 # THRESHOLDS_PATH="${THRESHOLDS_PATH:-${PREFIX}/storage/prune/thresholds/kimi_gqa/thresholds.pt}"
 THRESHOLDS_PATH="${THRESHOLDS_PATH:-}" 
 
-NUM_SAMPLES="${NUM_SAMPLES:-1000}"  # 样本数, 0 表示全量
+NUM_SAMPLES="${NUM_SAMPLES:-0}"  # 样本数, 0 表示全量
 START_IDX="${START_IDX:-0}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"
@@ -80,42 +81,104 @@ SUBSET_SEED="${SUBSET_SEED:-}"
 USE_LMMS_EVAL="${USE_LMMS_EVAL:-0}"
 
 MODEL_NAME="${MODEL_NAME:-}"
+if [[ -n "${MODEL_NAME}" ]]; then
+    case "${MODEL_NAME}" in
+        deepseek-vl2-small)
+            MODEL_PATH="${MODEL_PATH:-deepseek-ai/deepseek-vl2-small}"
+            MODEL_FAMILY="deepseek_vl"
+            ;;
+        kimi-vl-a3b|kimi-vl-a3b-instruct)
+            MODEL_NAME="kimi-vl-a3b"
+            MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
+            MODEL_FAMILY="kimi"
+            ;;
+        qwen3-vl-30b-a3b|qwen3-vl-30b-a3b-instruct)
+            MODEL_NAME="qwen3-vl-30b-a3b"
+            MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-VL-30B-A3B-Instruct}"
+            MODEL_FAMILY="qwen3_vl"
+            ;;
+        internvl3_5-30b-a3b-hf)
+            MODEL_PATH="${MODEL_PATH:-OpenGVLab/InternVL3_5-30B-A3B-HF}"
+            MODEL_FAMILY="internvl"
+            ;;
+        gemma-4-26b-a4b)
+            MODEL_PATH="${MODEL_PATH:-google/gemma-4-26B-A4B}"
+            MODEL_FAMILY="gemma4"
+            ;;
+        qwen3.5-35b-a3b)
+            MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.5-35B-A3B}"
+            MODEL_FAMILY="qwen3_5"
+            ;;
+        *)
+            echo "error: MODEL_NAME must be one of: deepseek-vl2-small kimi-vl-a3b kimi-vl-a3b-instruct qwen3-vl-30b-a3b qwen3-vl-30b-a3b-instruct internvl3_5-30b-a3b-hf gemma-4-26b-a4b qwen3.5-35b-a3b. Got: ${MODEL_NAME}" >&2
+            exit 1
+            ;;
+    esac
+fi
+
 if [[ -z "${MODEL_NAME}" ]]; then
     MODEL_TAG_RAW="${MODEL_PATH##*/}"
     MODEL_NAME="${MODEL_TAG_RAW,,}"
-    case "${MODEL_NAME}" in
-        qwen3-vl-30b-a3b-instruct)
-            MODEL_NAME="qwen3-vl-30b-a3b"
+fi
+
+if [[ -z "${MODEL_FAMILY:-}" ]]; then
+    MODEL_LOWER="${MODEL_PATH,,}"
+    case "${MODEL_LOWER}" in
+        *deepseek-vl2*)
+            MODEL_FAMILY="deepseek_vl"
             ;;
-        kimi-vl-a3b-instruct)
-            MODEL_NAME="kimi-vl-a3b"
+        *kimi-vl*)
+            MODEL_FAMILY="kimi"
             ;;
-        internvl-3.5-gpt-oss-20b-a4b-preview-hf)
-            MODEL_NAME="internvl-3.5-20b-a4b"
+        *qwen3-vl*)
+            MODEL_FAMILY="qwen3_vl"
+            ;;
+        *internvl*)
+            MODEL_FAMILY="internvl"
+            ;;
+        *gemma-4*)
+            MODEL_FAMILY="gemma4"
+            ;;
+        *qwen3.5*)
+            MODEL_FAMILY="qwen3_5"
             ;;
         *)
-            MODEL_NAME="${MODEL_NAME%-instruct}"
+            echo "error: cannot infer model family from MODEL_PATH=${MODEL_PATH}. Please set MODEL_NAME explicitly." >&2
+            exit 1
             ;;
     esac
 fi
 
 RATIO_TAG="p$(python3 -c "print(str(int(float('${PRUNE_RATIO}')*100)))")"
-OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/results/prune_eval_${MODEL_NAME}_gqa_${RATIO_TAG}-rell2-$(date +%m%d%H%M)}/logs"
+OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/results/prune_eval_${MODEL_NAME}_gqa_${RATIO_TAG}-$(date +%m%d%H%M)}/logs"
 
 EXTRA_ARGS=("$@")
 
 if [[ "${USE_LMMS_EVAL}" == "1" ]]; then
     # ── lmms-eval mode: use the eval wrapper with built-in task metrics ──
-    # Auto-select eval script based on model family
-    MODEL_LOWER="${MODEL_PATH,,}"
-    if [[ "${MODEL_LOWER}" == *"qwen3"* ]]; then
-        EVAL_SCRIPT="eval/qwen3.py"
-        MODEL_KEY="qwen3_vl"
-    else
-        EVAL_SCRIPT="eval/kimi.py"
-        MODEL_KEY="kimi_vl"
-    fi
+    # Auto-select eval script based on model family.
+    # Today only Kimi-VL and Qwen3-VL have local lmms-eval wrappers with MoDES pruning support.
+    case "${MODEL_FAMILY}" in
+        qwen3_vl)
+            EVAL_SCRIPT="eval/qwen3.py"
+            MODEL_KEY="qwen3_vl"
+            ;;
+        kimi)
+            EVAL_SCRIPT="eval/kimi.py"
+            MODEL_KEY="kimi_vl"
+            ;;
+        deepseek_vl|internvl|gemma4|qwen3_5)
+            echo "[warn] USE_LMMS_EVAL=1 is not implemented for MODEL_FAMILY=${MODEL_FAMILY}; falling back to legacy prune_and_eval path." >&2
+            USE_LMMS_EVAL="0"
+            ;;
+        *)
+            echo "error: unsupported MODEL_FAMILY=${MODEL_FAMILY}" >&2
+            exit 1
+            ;;
+    esac
+fi
 
+if [[ "${USE_LMMS_EVAL}" == "1" ]]; then
     MODEL_ARGS="pretrained=${MODEL_PATH}"
     if [[ -n "${SCORES_PATH}" ]]; then
         MODEL_ARGS+=",scores_path=${SCORES_PATH}"
@@ -124,6 +187,7 @@ if [[ "${USE_LMMS_EVAL}" == "1" ]]; then
         MODEL_ARGS+=",intra_method=${INTRA_METHOD}"
         MODEL_ARGS+=",intra_expert_metric=${INTRA_EXPERT_METRIC}"
         MODEL_ARGS+=",modality_aware=${MODALITY_AWARE}"
+        MODEL_ARGS+=",normalize=${NORMALIZE}"
         MODEL_ARGS+=",smooth_fn=${SMOOTH_FN}"
         MODEL_ARGS+=",align_inter=${ALIGN_INTER}"
         MODEL_ARGS+=",min_per_expert=${MIN_PER_EXPERT}"
@@ -174,6 +238,10 @@ else
         CMD+=(--modality_aware)
     fi
 
+    if [[ "${NORMALIZE}" == "1" ]]; then
+        CMD+=(--normalize)
+    fi
+
     if [[ -n "${SUBSET_SEED}" ]]; then
         CMD+=(--subset_seed "${SUBSET_SEED}")
     fi
@@ -199,6 +267,7 @@ echo "Inter       : ${INTER_METHOD}"
 echo "Intra       : ${INTRA_METHOD}"
 echo "Metric      : ${INTRA_EXPERT_METRIC}"
 echo "Modality    : $([[ "${MODALITY_AWARE}" == "1" ]] && echo "text+visual" || echo "disabled")"
+echo "Normalize   : ${NORMALIZE}"
 echo "Smooth fn   : ${SMOOTH_FN}"
 echo "Eval output : ${OUTPUT_DIR}"
 echo "Samples     : ${NUM_SAMPLES} (0=full)"

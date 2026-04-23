@@ -37,6 +37,7 @@ def generate_masks(
     adjust_masks_kwargs = prune_kwargs.get("adjust_masks_kwargs", {})
     smooth_fn = prune_kwargs.get("smooth_fn", "sqrt")
     modality_aware = bool(prune_kwargs.get("modality_aware", False))
+    normalize = bool(prune_kwargs.get("normalize", False))
 
     (
         intermediate_scores,
@@ -51,6 +52,7 @@ def generate_masks(
         mask_method_kwargs=mask_method_kwargs,
         smooth_fn=smooth_fn,
         modality_aware=modality_aware, 
+        normalize=normalize,
         device=device,
         verbose=verbose,
     )

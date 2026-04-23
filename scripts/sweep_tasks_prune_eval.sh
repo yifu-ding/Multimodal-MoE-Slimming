@@ -19,6 +19,8 @@
 #
 # Other env vars are passed through to run_prune_eval_kimi_gqa.sh
 # (SCORES_PATH, PRUNE_RATIO, NUM_SAMPLES, ...).
+# MODEL_NAME selects the model; this script also sets MODEL_PATH to the default HF id unless you set
+# SWEEP_MODEL_PATH (so export MODEL_PATH=... in your shell is ignored in favor of MODEL_NAME).
 
 set -euo pipefail
 
@@ -32,27 +34,59 @@ export PYTHONPATH="${PREFIX}"
 # export SCORES_PATH="storage/prune/scores/kimi-vl-a3b_gqa-rell2-041513.pt"
 # export SCORES_PATH="storage/prune/scores/kimi-vl-a3b_coco-rell2-fill1-0416-115847.pt"
 # export SCORES_PATH="storage/data_distill_kimi/gqa-sample_at1.0-0418234400/distilled-0419142618/scores-step4000.pt"
-export SCORES_PATH="storage/data_distill_kimi/gqa-sample_at1.0-0418234400/distilled-0419182016/distilled_hidden-scores.pt"
+# export SCORES_PATH="storage/data_distill_kimi/gqa-sample_at1.0-0418234400/distilled-0419182016/distilled_hidden-scores.pt"
 # export SCORES_PATH="storage/data_distill_kimi/gqa-sample_at1.0-0418234400/distilled-0419164811/distilled_hidden-step7000-scores.pt"
+export SCORES_PATH="${SCORES_PATH:-}"
 
+NUM_SAMPLES="${NUM_SAMPLES:-0}"
 USE_LMMS_EVAL=${USE_LMMS_EVAL:-0}
 # ── Task grid ──────────────────────────────────────────────────────────────────
 # All 14 tasks requested; override via SWEEP_TASKS env var.
-SWEEP_TASKS="${SWEEP_TASKS:-textvqa chartqa mmstar mmbench mmvet mme realworldqa coco2017cap mvbench egoschema videomme longvideobench video_mmmu}"
-
+SWEEP_TASKS="${SWEEP_TASKS:-gqa textvqa chartqa mmstar mmbench mme realworldqa coco2017cap longvideobench}"
+# mmvet video_mmmu videomme mvbench egoschema
 # ── Setting grids (same defaults as sweep_prune_eval_kimi_gqa.sh) ──────────────
-SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform uniform_coverage}"
-SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-uniform second_attr_coverage}"
-SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-0}"
+SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform}"
+SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-second_attr_coverage}"
+SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-0 1}"
 SMOOTH_FN="${SMOOTH_FN:-sqrt}"
-SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act 3proj_second_order down_second_order_exact}"
+SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act}"
 # 3proj_second_order down_saliency 3proj_saliency 3proj_grad wg
 
 # ── Output paths ───────────────────────────────────────────────────────────────
 # Timestamp is fixed at script start so all runs share the same directory.
 SWEEP_TS="${SWEEP_TS:-$(date +%m%d%H%M)}"
-MODEL_NAME="${MODEL_NAME:-kimi}"
-SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-distilled-0419182016-distilled_hidden-scores"  # -${SWEEP_TS}
+MODEL_NAME="${MODEL_NAME:-kimi-vl-a3b}"
+# Short family tags (no -instruct), same as run_prune_eval_kimi_gqa.sh
+case "${MODEL_NAME}" in
+  deepseek-vl2-small) ;;
+  kimi-vl-a3b-instruct) MODEL_NAME="kimi-vl-a3b" ;;
+  kimi-vl-a3b) ;;
+  qwen3-vl-30b-a3b-instruct) MODEL_NAME="qwen3-vl-30b-a3b" ;;
+  qwen3-vl-30b-a3b) ;;
+  internvl3_5-30b-a3b-hf) ;;
+  gemma-4-26b-a4b) ;;
+  qwen3.5-35b-a3b) ;;
+  *)
+    echo "error: MODEL_NAME must be one of: deepseek-vl2-small kimi-vl-a3b kimi-vl-a3b-instruct qwen3-vl-30b-a3b qwen3-vl-30b-a3b-instruct internvl3_5-30b-a3b-hf gemma-4-26b-a4b qwen3.5-35b-a3b (see run_prune_eval_kimi_gqa.sh). Got: ${MODEL_NAME}" >&2
+    exit 1
+    ;;
+esac
+# Pin MODEL_PATH from MODEL_NAME (HF repo ids, aligned with download_hf_benchmarks.MODELS) so a
+# stale export MODEL_PATH=... in the shell does not load a different model than MODEL_NAME.
+# Use SWEEP_MODEL_PATH=/path/or/hf-id to use a local copy or non-default id instead.
+if [[ -n "${SWEEP_MODEL_PATH:-}" ]]; then
+  export MODEL_PATH="${SWEEP_MODEL_PATH}"
+else
+  case "${MODEL_NAME}" in
+    deepseek-vl2-small) export MODEL_PATH="deepseek-ai/deepseek-vl2-small" ;;
+    kimi-vl-a3b) export MODEL_PATH="moonshotai/Kimi-VL-A3B-Instruct" ;;
+    qwen3-vl-30b-a3b) export MODEL_PATH="Qwen/Qwen3-VL-30B-A3B-Instruct" ;;
+    internvl3_5-30b-a3b-hf) export MODEL_PATH="OpenGVLab/InternVL3_5-30B-A3B-HF" ;;
+    gemma-4-26b-a4b) export MODEL_PATH="google/gemma-4-26B-A4B" ;;
+    qwen3.5-35b-a3b) export MODEL_PATH="Qwen/Qwen3.5-35B-A3B" ;;
+  esac
+fi
+SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-mixed-num_342-token_2048-sample_at1.0-0421175527-teacher"  # -${SWEEP_TS}
 export OUTPUT_DIR="${SWEEP_BASE}"
 
 if [[ -d "${SWEEP_BASE}" ]]; then
@@ -134,7 +168,7 @@ for TASK in ${SWEEP_TASKS}; do
           RUN_LOG="${SWEEP_LOG_DIR}/stdout_${TAG}.log"
 
           echo ""
-          echo "========== sweep run ${RUN_IDX}: TASK=${TASK} INTER=${INTER_METHOD} INTRA=${INTRA_METHOD} MODALITY=${MODALITY_AWARE} METRIC=${INTRA_EXPERT_METRIC} =========="
+          echo "========== sweep run ${RUN_IDX}: ${MODEL_NAME} TASK=${TASK} INTER=${INTER_METHOD} INTRA=${INTRA_METHOD} MODALITY=${MODALITY_AWARE} METRIC=${INTRA_EXPERT_METRIC} =========="
 
           set +e
           TASK="${TASK}" \
@@ -145,6 +179,7 @@ for TASK in ${SWEEP_TASKS}; do
             SMOOTH_FN="${SMOOTH_FN}" \
             MODEL_NAME="${MODEL_NAME}" \
             PREFIX="${PREFIX}" \
+            NUM_SAMPLES="${NUM_SAMPLES}" \
             USE_LMMS_EVAL="${USE_LMMS_EVAL}" \
             bash "${SCRIPT_DIR}/run_prune_eval_kimi_gqa.sh" 2>&1 | tee "${RUN_LOG}"
           EXIT_CODE=${PIPESTATUS[0]}

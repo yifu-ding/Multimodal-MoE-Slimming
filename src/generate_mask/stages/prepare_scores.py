@@ -69,6 +69,7 @@ def prepare_scores(
     mask_method_kwargs: Dict[str, Any],
     smooth_fn: str = "sqrt",
     modality_aware: bool = False,
+    normalize: bool = False,
     device: str = "cpu",
     verbose: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, int, int, int, Dict[str, Any], list]:
@@ -85,6 +86,13 @@ def prepare_scores(
     intra_expert_metric = mask_method_kwargs.get("intra_expert_metric", "activation")
     if modality_aware:
         modality_scores = load_modality_channel_scores(payload, device, intra_expert_metric)
+        if normalize:
+            modality_scores["text"] = modality_scores["text"] / modality_scores["text"].sum(
+                dim=(1, 2), keepdim=True
+            ).clamp_min(1e-12)
+            modality_scores["visual"] = modality_scores["visual"] / modality_scores["visual"].sum(
+                dim=(1, 2), keepdim=True
+            ).clamp_min(1e-12)
         intermediate_scores = (modality_scores["text"] + modality_scores["visual"]) / 2.0
         _print("[prepare_scores] intermediate_scores is mean of text and visual scores")
         L, E, I = intermediate_scores.shape

@@ -23,6 +23,10 @@ set -euo pipefail
 
 source scripts/select_least_used_gpu.sh # 自动选择显存使用量最少的 gpu
 
+if [[ "${CONDA_DEFAULT_ENV:-}" == "ds-vl2" ]]; then
+    export LD_LIBRARY_PATH="/home/dyf/miniconda/envs/ds-vl2/lib:${LD_LIBRARY_PATH:-}"
+fi
+
 PREFIX="${PREFIX:-$(pwd)}"
 export PYTHONPATH="${PREFIX}"
 

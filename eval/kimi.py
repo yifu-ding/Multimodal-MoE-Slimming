@@ -248,6 +248,7 @@ class KimiVL(lmms):
             intra_method = kwargs.get("intra_method", "uniform")
             intra_expert_metric = kwargs.get("intra_expert_metric", "activation")
             modality_aware = bool(int(kwargs.get("modality_aware", 0)))
+            normalize = bool(int(kwargs.get("normalize", 0)))
             smooth_fn = kwargs.get("smooth_fn", "sqrt")
             align_inter = int(kwargs.get("align_inter", 0))
             min_per_expert = int(kwargs.get("min_per_expert", 0))
@@ -272,6 +273,7 @@ class KimiVL(lmms):
                         "min_per_expert": min_per_expert,
                     },
                     "modality_aware": modality_aware,
+                    "normalize": normalize,
                     "prune_hidden": False,
                     "prune_gqa": False,
                     "smooth_fn": smooth_fn,
