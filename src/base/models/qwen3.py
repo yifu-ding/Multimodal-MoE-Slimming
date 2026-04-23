@@ -571,6 +571,10 @@ def moe_forward(
     moe_other_mask = None
     expert_range = None
     moe_padding_mask = None
+    obs_enabled = bool(
+        hasattr(self.language_model.layers[0].mlp, "_obs_callback")
+        and callable(getattr(self.language_model.layers[0].mlp, "_obs_callback"))
+    )
     if (
         enable_tau_skip
         or moe_layer_skip is not None
@@ -578,6 +582,7 @@ def moe_forward(
             hasattr(self.language_model.layers[0].mlp, "gate_dict")
             and self.language_model.layers[0].mlp.gate_dict is not None
         )
+        or obs_enabled
     ):
         moe_media_mask = (
             visual_pos_masks.view(-1).to(input_ids.device)
@@ -613,6 +618,7 @@ def moe_forward(
             moe_layer_skip is not None
             or enable_tau_skip
             or (hasattr(layer.mlp, "gate_dict") and layer.mlp.gate_dict is not None)
+            or obs_enabled
         ):
             layer.mlp.moe_text_mask = (
                 moe_text_mask[:, None] if moe_text_mask is not None else None
