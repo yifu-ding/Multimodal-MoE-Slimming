@@ -654,6 +654,17 @@ def resolve_activation_fn(obj: Any) -> Callable[[torch.Tensor], torch.Tensor]:
     return F.silu
 
 
+def _safe_num_experts(experts: Any) -> int:
+    n = getattr(experts, "num_experts", None)
+    if n is not None:
+        return int(n)
+    if hasattr(experts, "__len__"):
+        return int(len(experts))
+    if hasattr(experts, "gate_up_proj"):
+        return int(experts.gate_up_proj.shape[0])
+    raise AttributeError(f"Cannot infer number of experts from type: {type(experts)}")
+
+
 def compute_qwen3_channel_activation(experts, expert_idx: int, hidden_states: torch.Tensor):
     if hasattr(experts, "gate_up_proj"):
         gate_weight = experts.gate_up_proj[expert_idx]
@@ -1069,7 +1080,7 @@ def attach_qwen3_observer(bundle: ModelBundle, accumulator: ObservationAccumulat
             )
             # one_hot 后形状大致是 [num_tokens, topk, num_experts].
             # permute 成 [num_experts, topk, num_tokens] 后, 更方便按 expert 聚合.
-            num_experts = getattr(self.experts, "num_experts", len(self.experts))
+            num_experts = _safe_num_experts(self.experts)
             expert_mask = F.one_hot(router_indices, num_classes=num_experts)
             expert_mask = expert_mask.permute(2, 1, 0)
             # 只遍历本次前向里真正命中的 expert, 避免无效计算.
@@ -1223,7 +1234,7 @@ def discover_layer_structure(bundle: ModelBundle) -> Tuple[Dict[int, int], Dict[
                 and layer_idx not in getattr(config, "mlp_only_layers", [])
             ):
                 experts = layer.mlp.experts
-                num_experts = getattr(experts, "num_experts", len(experts))
+                num_experts = _safe_num_experts(experts)
                 layer_to_num_experts[layer_idx] = int(num_experts)
                 intermediate_size = getattr(
                     experts, "intermediate_dim", None
