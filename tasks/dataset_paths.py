@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from glob import glob
 
 
 def get_hf_home() -> str:
@@ -15,6 +16,16 @@ def resolve_dataset_dir(dataset_name: str, *parts: str) -> str:
         os.path.join(get_hf_datasets_root(), dataset_name, *parts),
         os.path.join("storage", "datasets", dataset_name, *parts),
     ]
+    # Fallback: datasets downloaded via HF hub snapshots, e.g.
+    # $HF_HOME/hub/datasets--lmms-lab--COCO-Caption2017/snapshots/<rev>/data
+    hf_home = get_hf_home()
+    hub_root = os.path.join(hf_home, "hub")
+    repo_suffix = dataset_name.replace("/", "--")
+    snapshot_glob = os.path.join(
+        hub_root, f"datasets--*--{repo_suffix}", "snapshots", "*", *parts
+    )
+    snapshot_candidates = sorted(glob(snapshot_glob))
+    candidates.extend(snapshot_candidates[::-1])  # prefer latest lexicographically
     for candidate in candidates:
         if os.path.exists(candidate):
             return candidate
