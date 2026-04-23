@@ -8,7 +8,13 @@ except ImportError:
     from typing_extensions import Unpack
 
 try:
-    from transformers import Qwen3VLMoeForConditionalGeneration, AutoProcessor
+    from transformers import (
+        Qwen3VLMoeForConditionalGeneration,
+        AutoProcessor,
+        AutoModelForCausalLM,
+        AutoTokenizer,
+        AutoConfig,
+    )
     from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
         Qwen3VLMoeCausalLMOutputWithPast,
         Qwen3VLMoeModelOutputWithPast,
@@ -24,6 +30,9 @@ except Exception:
     logger.warning("Qwen3VLMoeForConditionalGeneration is not available.")
     Qwen3VLMoeForConditionalGeneration = None
     AutoProcessor = None
+    AutoModelForCausalLM = None
+    AutoTokenizer = None
+    AutoConfig = None
     TransformersKwargs = None
     Qwen3VLMoeModelOutputWithPast = None
     Qwen3VLMoeCausalLMOutputWithPast = None
@@ -740,7 +749,7 @@ def load_model(
     device_map: str = "auto",
     layer_gate_dict: dict = None,
 ):
-    """Load Qwen3-VL-MoE model with MoDES expert skipping support.
+    """Load Qwen3 model (VL-MoE or text MoE) with MoDES expert skipping support.
 
     Args:
         model_path: Path or HF model id for Qwen3-VL-MoE.
@@ -753,6 +762,35 @@ def load_model(
     Returns:
         Tuple of (model, processor).
     """
+    if AutoConfig is None or AutoModelForCausalLM is None or AutoTokenizer is None:
+        try:
+            import transformers
+
+            transformers_version = transformers.__version__
+        except Exception:
+            transformers_version = "unknown"
+        raise ImportError(
+            "Qwen3 loading requires transformers with AutoConfig/AutoModelForCausalLM/AutoTokenizer. "
+            f"Installed transformers version: {transformers_version}."
+        )
+    model_cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+    arch = ",".join(getattr(model_cfg, "architectures", []) or []).lower()
+    is_vl = "qwen3vl" in arch or "qwen3_vl" in arch
+
+    if not is_vl:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch_dtype,
+            attn_implementation=attn_implementation,
+            trust_remote_code=trust_remote_code,
+            device_map=device_map,
+        )
+        model.eval()
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code
+        )
+        return model, tokenizer
+
     if Qwen3VLMoeForConditionalGeneration is None or AutoProcessor is None:
         try:
             import transformers
