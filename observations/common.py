@@ -1,4 +1,5 @@
 import argparse
+import importlib
 import importlib.util
 import inspect
 import json
@@ -248,7 +249,18 @@ def _resolve_attn_implementation(attn_implementation: str | None) -> str | None:
     if attn_implementation != "flash_attention_2":
         return attn_implementation
     if importlib.util.find_spec("flash_attn") is not None:
-        return attn_implementation
+        try:
+            # `flash_attn` may be installed while its compiled extension is ABI-incompatible
+            # with the current torch build. Validate the actual CUDA extension import before use.
+            importlib.import_module("flash_attn_2_cuda")
+            return attn_implementation
+        except Exception as exc:
+            print(
+                "[model-load] `flash_attn` is installed but unusable in the current environment; "
+                f"falling back from `flash_attention_2` to `sdpa`. Import error: {exc!r}",
+                flush=True,
+            )
+            return "sdpa"
     print(
         "[model-load] `flash_attn` is unavailable in the current environment; "
         "falling back from `flash_attention_2` to `sdpa`.",
@@ -800,6 +812,148 @@ def _build_masks_for_active_tokens(
     return text_mask, visual_mask
 
 
+def _resolve_special_token_tensor_for_model(model) -> Optional[torch.Tensor]:
+    for candidate in (
+        getattr(model, "special_token_id_tensor", None),
+        getattr(getattr(model, "model", None), "special_token_id_tensor", None),
+        getattr(getattr(model, "language", None), "special_token_id_tensor", None),
+    ):
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def populate_deepseek_observer_masks(bundle: ModelBundle, inputs: Dict[str, Any]) -> None:
+    input_ids = inputs.get("input_ids", None)
+    if input_ids is None:
+        raise KeyError("DeepSeek-VL observation requires `input_ids` in model inputs.")
+    flat_input_ids = input_ids.view(-1)
+    special_ids = _resolve_special_token_tensor_for_model(bundle.model)
+    if special_ids is not None:
+        special_ids = special_ids.to(flat_input_ids.device)
+        text_mask = ~torch.isin(flat_input_ids, special_ids)
+    else:
+        text_mask = torch.ones_like(flat_input_ids, dtype=torch.bool)
+
+    image_seq_mask = inputs.get("images_seq_mask", None)
+    if image_seq_mask is not None:
+        visual_mask = image_seq_mask.to(flat_input_ids.device).view(-1).bool()
+    else:
+        visual_mask = torch.zeros_like(flat_input_ids, dtype=torch.bool)
+    text_mask = text_mask & (~visual_mask)
+
+    attention_mask = inputs.get("attention_mask", None)
+    padding_mask = None
+    if attention_mask is not None:
+        padding_mask = (~attention_mask.to(flat_input_ids.device).bool()).view(-1, 1)
+
+    for layer in _get_deepseek_decoder_layers(bundle.model):
+        if not hasattr(layer, "mlp"):
+            continue
+        if not hasattr(layer.mlp, "experts"):
+            continue
+        layer.mlp.moe_text_mask = text_mask[:, None]
+        layer.mlp.moe_media_mask = visual_mask[:, None]
+        layer.mlp.moe_padding_mask = padding_mask
+
+
+def attach_deepseek_observer(bundle: ModelBundle, accumulator: ObservationAccumulator) -> None:
+    model = bundle.model
+    config = _get_deepseek_text_config(model)
+    for layer_idx, layer in enumerate(_get_deepseek_decoder_layers(model)):
+        if not (
+            getattr(config, "n_routed_experts", None) is not None
+            and layer_idx >= getattr(config, "first_k_dense_replace", 0)
+            and layer_idx % getattr(config, "moe_layer_freq", 1) == 0
+            and hasattr(layer.mlp, "experts")
+            and hasattr(layer.mlp, "gate")
+            and hasattr(layer.mlp, "moe_infer")
+        ):
+            continue
+
+        layer.mlp.layer_idx = layer_idx
+        layer.mlp.gate.layer_idx = layer_idx
+        original_gate_forward = layer.mlp.gate.forward
+        original_moe_infer = layer.mlp.moe_infer
+
+        def observed_gate_forward(
+            self,
+            hidden_states,
+            *args,
+            __orig=original_gate_forward,
+            __mlp=layer.mlp,
+            **kwargs,
+        ):
+            if hidden_states.dim() != 3:
+                raise RuntimeError(
+                    f"DeepSeek gate observation expects 3D hidden_states, got {tuple(hidden_states.shape)}"
+                )
+            flat = hidden_states.view(-1, hidden_states.shape[-1])
+            text_mask, visual_mask = _build_masks_for_active_tokens(
+                getattr(self, "moe_text_mask", getattr(__mlp, "moe_text_mask", None)),
+                getattr(self, "moe_media_mask", getattr(__mlp, "moe_media_mask", None)),
+                getattr(self, "moe_padding_mask", getattr(__mlp, "moe_padding_mask", None)),
+                flat.shape[0],
+                flat.device,
+            )
+            router_logits = F.linear(
+                flat.type(torch.float32), self.weight.type(torch.float32), None
+            )
+            topk_idx, topk_weight, aux_loss = __orig(hidden_states, *args, **kwargs)
+            active_topk_idx = topk_idx
+            active_router_logits = router_logits
+            padding_mask = getattr(self, "moe_padding_mask", getattr(__mlp, "moe_padding_mask", None))
+            if padding_mask is not None:
+                keep = ~padding_mask.to(topk_idx.device).view(-1)
+                active_topk_idx = topk_idx[keep]
+                active_router_logits = router_logits[keep]
+            accumulator.record_routing(self.layer_idx, active_topk_idx, text_mask, visual_mask)
+            accumulator.record_topk_routing_and_router_logits(
+                self.layer_idx, active_topk_idx, text_mask, visual_mask, active_router_logits
+            )
+            return topk_idx, topk_weight, aux_loss
+
+        def observed_moe_infer(self, x, topk_ids, topk_weight, *args, __orig=original_moe_infer, **kwargs):
+            text_mask, visual_mask = _build_masks_for_active_tokens(
+                getattr(self, "moe_text_mask", None),
+                getattr(self, "moe_media_mask", None),
+                getattr(self, "moe_padding_mask", None),
+                x.shape[0],
+                x.device,
+            )
+            active_x = x
+            active_topk_ids = topk_ids
+            if getattr(self, "moe_padding_mask", None) is not None:
+                keep = ~self.moe_padding_mask.to(x.device).view(-1)
+                active_x = x[keep]
+                active_topk_ids = topk_ids[keep]
+            num_experts = len(self.experts)
+            expert_mask = F.one_hot(
+                active_topk_ids.clamp(max=num_experts - 1), num_classes=num_experts
+            ).permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+            for expert_tensor in expert_hit:
+                expert_idx = int(expert_tensor[0].item())
+                expert = self.experts[expert_idx]
+                if expert is None:
+                    continue
+                _, token_idx = torch.where(expert_mask[expert_idx])
+                if token_idx.numel() == 0:
+                    continue
+                activations = compute_generic_expert_activation(expert, active_x[token_idx])
+                accumulator.record_channel_response(
+                    self.layer_idx,
+                    expert_idx,
+                    activations,
+                    text_mask[token_idx],
+                    visual_mask[token_idx],
+                )
+            return __orig(x, topk_ids, topk_weight, *args, **kwargs)
+
+        layer.mlp.gate.forward = observed_gate_forward.__get__(layer.mlp.gate)
+        layer.mlp.moe_infer = observed_moe_infer.__get__(layer.mlp)
+
+
 def attach_qwen3_observer(bundle: ModelBundle, accumulator: ObservationAccumulator) -> None:
     model = bundle.model
     config = model.config.text_config
@@ -1105,7 +1259,7 @@ def collect_observation_stats(args) -> Dict[str, Any]:
     if bundle.family == "qwen3":
         attach_qwen3_observer(bundle, accumulator)
     elif bundle.family == "deepseek_vl":
-        raise NotImplementedError("Observation collection does not support DeepSeek-VL yet.")
+        attach_deepseek_observer(bundle, accumulator)
     else:
         attach_kimi_observer(bundle, accumulator)
     print("[Observation] Observation hooks attached.", flush=True)
@@ -1152,6 +1306,8 @@ def collect_observation_stats(args) -> Dict[str, Any]:
         for batch_idx, batch in enumerate(progress, start=1):
             inputs = prepare_inputs(bundle, batch, args.dataset)
             inputs = move_inputs_to_model_device(bundle.model, inputs)
+            if bundle.family == "deepseek_vl":
+                populate_deepseek_observer_masks(bundle, inputs)
             bundle.model(**filter_model_forward_inputs(bundle.model, inputs), use_cache=False, return_dict=True)
             progress.set_postfix_str(
                 f"samples={min(batch_idx * args.batch_size, len(subset_indices))}/{len(subset_indices)}"
