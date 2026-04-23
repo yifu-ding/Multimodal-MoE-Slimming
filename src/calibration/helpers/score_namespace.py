@@ -23,7 +23,7 @@ ACTIVE_CHANNEL_METRICS = (
     "down_second_order_approx",
     "down_second_order_approx_text",
     "down_second_order_approx_visual",
-    # 
+    # w
     "weight",
     # weight*grad
     "wg",
