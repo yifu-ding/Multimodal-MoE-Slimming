@@ -603,8 +603,9 @@ def prepare_inputs(
             return_tensors="pt",
             padding=True,
             padding_side="left",
-            truncation=True,
+            truncation=False,
         )
+        _apply_balanced_multimodal_truncation(bundle, inputs)
     else:
         inputs = processor(
             text=batched_messages,
@@ -613,6 +614,158 @@ def prepare_inputs(
             truncation=True,
         )
     return inputs
+
+
+def _resolve_multimodal_max_length(bundle: ModelBundle) -> Optional[int]:
+    processor = bundle.processor
+    tokenizer = getattr(processor, "tokenizer", None)
+    candidates = [
+        getattr(tokenizer, "model_max_length", None),
+        getattr(getattr(bundle.model, "config", None), "max_position_embeddings", None),
+        getattr(getattr(bundle.model, "config", None), "max_sequence_length", None),
+        getattr(getattr(getattr(bundle.model, "config", None), "text_config", None), "max_position_embeddings", None),
+    ]
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 0 < value < 1_000_000:
+            return value
+    return None
+
+
+def _resolve_multimodal_media_token_ids(bundle: ModelBundle) -> List[int]:
+    config = getattr(bundle.model, "config", None)
+    token_ids: List[int] = []
+    for attr in ("image_token_id", "video_token_id", "media_placeholder_token_id"):
+        value = getattr(config, attr, None)
+        if value is not None:
+            token_ids.append(int(value))
+    return list(dict.fromkeys(token_ids))
+
+
+def _build_balanced_keep_mask(
+    input_ids_row: torch.Tensor,
+    attention_mask_row: torch.Tensor,
+    media_token_ids: List[int],
+    max_length: int,
+) -> torch.Tensor:
+    active_positions = attention_mask_row.to(torch.bool).nonzero(as_tuple=True)[0]
+    if active_positions.numel() <= max_length:
+        return attention_mask_row.to(torch.bool)
+
+    keep_mask = torch.zeros_like(attention_mask_row, dtype=torch.bool)
+    if not media_token_ids:
+        keep_mask[active_positions[-max_length:]] = True
+        return keep_mask
+
+    media_token_tensor = torch.tensor(
+        media_token_ids,
+        device=input_ids_row.device,
+        dtype=input_ids_row.dtype,
+    )
+    active_input_ids = input_ids_row.index_select(0, active_positions)
+    visual_active_mask = torch.isin(active_input_ids, media_token_tensor)
+    visual_positions = active_positions[visual_active_mask]
+    text_positions = active_positions[~visual_active_mask]
+
+    visual_budget = max_length // 2
+    text_budget = max_length - visual_budget
+    keep_visual = min(visual_positions.numel(), visual_budget)
+    keep_text = min(text_positions.numel(), text_budget)
+    remaining = max_length - keep_visual - keep_text
+
+    if remaining > 0:
+        visual_shortfall = visual_positions.numel() - keep_visual
+        if visual_shortfall > 0:
+            extra = min(remaining, visual_shortfall)
+            keep_visual += extra
+            remaining -= extra
+        text_shortfall = text_positions.numel() - keep_text
+        if remaining > 0 and text_shortfall > 0:
+            keep_text += min(remaining, text_shortfall)
+
+    if keep_visual > 0:
+        keep_mask[visual_positions[:keep_visual]] = True
+    if keep_text > 0:
+        keep_mask[text_positions[-keep_text:]] = True
+    return keep_mask
+
+
+def _pad_trimmed_sequence(
+    tensor: torch.Tensor,
+    keep_masks: List[torch.Tensor],
+    pad_value: int | float,
+) -> torch.Tensor:
+    trimmed_rows = []
+    max_kept = 0
+    for row_idx, keep_mask in enumerate(keep_masks):
+        trimmed = tensor[row_idx][keep_mask]
+        trimmed_rows.append(trimmed)
+        max_kept = max(max_kept, int(trimmed.shape[0]))
+
+    if max_kept == 0:
+        target_shape = (tensor.shape[0], 0, *tensor.shape[2:])
+        return tensor.new_full(target_shape, pad_value)
+
+    target_shape = (tensor.shape[0], max_kept, *tensor.shape[2:])
+    padded = tensor.new_full(target_shape, pad_value)
+    for row_idx, trimmed in enumerate(trimmed_rows):
+        if trimmed.shape[0] == 0:
+            continue
+        padded[row_idx, -trimmed.shape[0] :] = trimmed
+    return padded
+
+
+def _apply_balanced_multimodal_truncation(
+    bundle: ModelBundle,
+    inputs: Dict[str, torch.Tensor],
+) -> None:
+    input_ids = inputs.get("input_ids", None)
+    attention_mask = inputs.get("attention_mask", None)
+    if input_ids is None or attention_mask is None:
+        return
+
+    max_length = _resolve_multimodal_max_length(bundle)
+    if max_length is None or input_ids.shape[1] <= max_length:
+        return
+
+    media_token_ids = _resolve_multimodal_media_token_ids(bundle)
+    keep_masks = [
+        _build_balanced_keep_mask(
+            input_ids_row=input_ids[row_idx],
+            attention_mask_row=attention_mask[row_idx],
+            media_token_ids=media_token_ids,
+            max_length=max_length,
+        )
+        for row_idx in range(input_ids.shape[0])
+    ]
+
+    tokenizer = getattr(bundle.processor, "tokenizer", None)
+    pad_token_id = getattr(tokenizer, "pad_token_id", 0)
+    if pad_token_id is None:
+        pad_token_id = 0
+
+    for key, value in list(inputs.items()):
+        if not torch.is_tensor(value):
+            continue
+        if value.ndim < 2:
+            continue
+        if value.shape[0] != input_ids.shape[0] or value.shape[1] != input_ids.shape[1]:
+            continue
+
+        if key == "attention_mask":
+            pad_value = 0
+        elif key == "input_ids":
+            pad_value = pad_token_id
+        elif key == "labels":
+            pad_value = -100
+        else:
+            pad_value = 0
+        inputs[key] = _pad_trimmed_sequence(value, keep_masks, pad_value)
 
 
 def move_inputs_to_model_device(model, inputs: Dict[str, Any]) -> Dict[str, Any]:
