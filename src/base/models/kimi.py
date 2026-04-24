@@ -1,3 +1,4 @@
+import json
 import torch
 
 # Compat shim: Kimi-VL's remote-code `modeling_kimi_vl.py` does
@@ -92,6 +93,130 @@ def _ensure_writable_hf_modules_cache(model_path: str) -> None:
     _dynamic_module_utils.HF_MODULES_CACHE = fallback
     if hasattr(_hub_utils, "HF_MODULES_CACHE"):
         _hub_utils.HF_MODULES_CACHE = fallback
+
+
+def _resolve_partial_load_device(device_map: str) -> str:
+    if device_map == "auto":
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+    return device_map
+
+
+def _patch_kimi_model_runtime(model, processor) -> None:
+    model.eval()
+    idx = 0
+    config = model.config.text_config
+    model.forward = vl_forward.__get__(model)
+    model.prepare_inputs_for_generation = prepare_inputs_for_generation.__get__(model)
+    model.language_model.forward = language_model_forward.__get__(model.language_model)
+    model.language_model.prepare_inputs_for_generation = (
+        prepare_inputs_for_generation_language.__get__(model.language_model)
+    )
+    model.language_model.model.forward = model_forward.__get__(
+        model.language_model.model
+    )
+    special_token_id_list = processor.tokenizer.all_special_ids
+    model.special_token_id_tensor = torch.tensor(special_token_id_list)
+    for layer in model.language_model.model.layers:
+        layer.forward = decoder_layer_forward.__get__(layer)
+        if (
+            config.n_routed_experts is not None
+            and idx >= config.first_k_dense_replace
+            and idx % config.moe_layer_freq == 0
+        ):
+            layer.mlp.forward = moe_forward.__get__(layer.mlp)
+            layer.mlp.moe_infer = moe_infer.__get__(layer.mlp)
+            layer.mlp.gate.forward = gate_forward.__get__(layer.mlp.gate)
+        layer.mlp.layer_idx = idx
+        idx += 1
+
+
+def _load_partial_kimi_model(
+    model_path: str,
+    *,
+    trust_remote_code: bool,
+    torch_dtype: torch.dtype,
+    device_map: str,
+    attn_implementation: str,
+    max_decoder_layer: int,
+):
+    from accelerate import init_empty_weights
+    try:
+        from accelerate.utils import set_module_tensor_to_device
+    except ImportError:
+        from accelerate.utils.modeling import set_module_tensor_to_device
+    from safetensors import safe_open
+
+    _ensure_writable_hf_modules_cache(model_path)
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+    config = _normalize_kimi_config_for_remote_code(config)
+    config._attn_implementation = attn_implementation
+    total_layers = int(config.text_config.num_hidden_layers)
+    if max_decoder_layer < 0 or max_decoder_layer >= total_layers:
+        raise ValueError(
+            f"Requested max_decoder_layer={max_decoder_layer}, but Kimi has {total_layers} decoder layers."
+        )
+
+    with init_empty_weights():
+        model = AutoModelForCausalLM.from_config(
+            config,
+            trust_remote_code=trust_remote_code,
+        )
+
+    keep_layer_count = max_decoder_layer + 1
+    kept_layers = list(model.language_model.model.layers[:keep_layer_count])
+    model.language_model.model.layers = nn.ModuleList(kept_layers)
+    model.config.text_config.num_hidden_layers = keep_layer_count
+    model.language_model.config.num_hidden_layers = keep_layer_count
+    model.language_model.model.config.num_hidden_layers = keep_layer_count
+
+    # These modules are never reached in cache extraction because forward is early-stopped
+    # at the requested decoder block. Replacing them avoids loading their weights.
+    model.language_model.model.norm = nn.Identity()
+    model.language_model.lm_head = nn.Identity()
+
+    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+    _patch_kimi_model_runtime(model, processor)
+
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if not os.path.exists(index_path):
+        raise FileNotFoundError(
+            f"Partial Kimi loading requires safetensors index, but none was found at {index_path}."
+        )
+
+    with open(index_path, "r", encoding="utf-8") as f:
+        weight_map = json.load(f)["weight_map"]
+
+    selected_prefixes = [
+        "vision_tower.",
+        "multi_modal_projector.",
+        "language_model.model.embed_tokens.",
+    ] + [
+        f"language_model.model.layers.{layer_idx}."
+        for layer_idx in range(keep_layer_count)
+    ]
+
+    file_to_keys = {}
+    for key, filename in weight_map.items():
+        if key.endswith("rotary_emb.inv_freq"):
+            continue
+        if any(key.startswith(prefix) for prefix in selected_prefixes):
+            file_to_keys.setdefault(filename, []).append(key)
+
+    target_device = _resolve_partial_load_device(device_map)
+    for filename, keys in file_to_keys.items():
+        file_path = os.path.join(model_path, filename)
+        with safe_open(file_path, framework="pt", device="cpu") as f:
+            for key in keys:
+                tensor = f.get_tensor(key)
+                set_module_tensor_to_device(
+                    model,
+                    key,
+                    target_device,
+                    value=tensor,
+                    dtype=torch_dtype if tensor.is_floating_point() else None,
+                )
+
+    return model, processor
 
 
 def save_states(
@@ -581,10 +706,13 @@ def vl_forward(
     moe_other_mask = None
     expert_range = None
     moe_padding_mask = None
-    if (
-        hasattr(self.language_model.model.layers[1].mlp, "gate_dict")
-        or hasattr(self.language_model.model.layers[1].mlp, "freq_save_dir")
-        or hasattr(self.language_model.model.layers[1].mlp.gate, "topk_save_dir")
+    sample_layer = None
+    if len(self.language_model.model.layers) > 0:
+        sample_layer = self.language_model.model.layers[min(1, len(self.language_model.model.layers) - 1)]
+    if sample_layer is not None and (
+        hasattr(sample_layer.mlp, "gate_dict")
+        or hasattr(sample_layer.mlp, "freq_save_dir")
+        or hasattr(sample_layer.mlp.gate, "topk_save_dir")
         or moe_layer_skip != -1
         or record_mask
         or enable_tau_skip
@@ -1371,6 +1499,7 @@ def load_model(
     torch_dtype: torch.dtype = torch.bfloat16,
     device_map: str = "auto",
     layer_gate_dict: dict = None,
+    max_decoder_layer: int | None = None,
 ):
     """Load Kimi-VL model with MoDES expert skipping support.
 
@@ -1387,6 +1516,17 @@ def load_model(
     """
     if layer_gate_dict is not None:
         logger.info(f"layer_gate_dict: {layer_gate_dict}")
+    if max_decoder_layer is not None and layer_gate_dict is not None:
+        raise ValueError("Partial Kimi loading does not support layer_gate_dict.")
+    if max_decoder_layer is not None:
+        return _load_partial_kimi_model(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            torch_dtype=torch_dtype,
+            device_map=device_map,
+            attn_implementation=attn_implementation,
+            max_decoder_layer=max_decoder_layer,
+        )
     _ensure_writable_hf_modules_cache(model_path)
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
     config = _normalize_kimi_config_for_remote_code(config)
@@ -1398,21 +1538,7 @@ def load_model(
         trust_remote_code=trust_remote_code,
         attn_implementation=attn_implementation,
     )
-    model.eval()
-    idx = 0
-    config = model.config.text_config
-    model.forward = vl_forward.__get__(model)
-    model.prepare_inputs_for_generation = prepare_inputs_for_generation.__get__(model)
-    model.language_model.forward = language_model_forward.__get__(model.language_model)
-    model.language_model.prepare_inputs_for_generation = (
-        prepare_inputs_for_generation_language.__get__(model.language_model)
-    )
-    model.language_model.model.forward = model_forward.__get__(
-        model.language_model.model
-    )
     processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-    special_token_id_list = processor.tokenizer.all_special_ids
-    model.special_token_id_tensor = torch.tensor(special_token_id_list)
     if layer_gate_dict is not None:
         path = layer_gate_dict.get(
             "freq_path", "storage/data/freq/gqa/Kimi-VL-A3B-Instruct/plot"
@@ -1425,23 +1551,17 @@ def load_model(
             VISUAL_FREQ_DICT = torch.load(
                 os.path.join(path, "visual_counts.pt"), weights_only=False
             )
-    for layer in model.language_model.model.layers:
-        layer.forward = decoder_layer_forward.__get__(layer)
-        if (
-            config.n_routed_experts is not None
-            and idx >= config.first_k_dense_replace
-            and idx % config.moe_layer_freq == 0
-        ):
-            layer.mlp.forward = moe_forward.__get__(layer.mlp)
-            layer.mlp.moe_infer = moe_infer.__get__(layer.mlp)
-            layer.mlp.gate.forward = gate_forward.__get__(layer.mlp.gate)
-            if layer_gate_dict is not None:
-                layer.mlp.gate_dict = layer_gate_dict[
-                    idx
-                ]  # {"text": ..., "visiual": ...}
+    _patch_kimi_model_runtime(model, processor)
+    if layer_gate_dict is not None:
+        config = model.config.text_config
+        for idx, layer in enumerate(model.language_model.model.layers):
+            if (
+                config.n_routed_experts is not None
+                and idx >= config.first_k_dense_replace
+                and idx % config.moe_layer_freq == 0
+            ):
+                layer.mlp.gate_dict = layer_gate_dict[idx]
                 layer.mlp.gate.gate_dict = layer.mlp.gate_dict
-        layer.mlp.layer_idx = idx
-        idx += 1
     return model, processor
 
 
