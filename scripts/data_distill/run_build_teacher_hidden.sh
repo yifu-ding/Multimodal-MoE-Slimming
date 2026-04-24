@@ -17,6 +17,7 @@ VIDEO_MAX_LONG_SIDE="${VIDEO_MAX_LONG_SIDE:-480}"
 SAVE_DTYPE="${SAVE_DTYPE:-float32}"
 DEVICE_MAP="${DEVICE_MAP:-cuda:0}"
 ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
+CACHE_NEXT_BLOCK_TARGETS="${CACHE_NEXT_BLOCK_TARGETS:-1}"
 
 TEACHER_DATASETS="${TEACHER_DATASETS:-gqa coco m4_instruct}"
 #   使用方式
@@ -38,21 +39,8 @@ else
     TEACHER_DATASETS_PATH_LABEL="${TEACHER_DATASETS}"
 fi
 
-MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 OUTPUT_PATH="${OUTPUT_PATH:-${PREFIX}/storage/data_distill_kimi/${TEACHER_DATASETS_PATH_LABEL}-num_${SAMPLES_PER_DATASET}-token_${COMPRESSED_LENGTH}-${COMPRESSION_MODE}_at${ATTN_TEMPERATURE}-$(date +%m%d%H%M%S)}/teacher_hidden.pt"
 LATEST_LINK_DIR="${LATEST_LINK_DIR:-${PREFIX}/storage/data_distill_kimi/${TEACHER_DATASETS_PATH_LABEL}-num_${SAMPLES_PER_DATASET}-token_${COMPRESSED_LENGTH}-${COMPRESSION_MODE}_at${ATTN_TEMPERATURE}-latest}"
-TEACHER_LAYER="${TEACHER_LAYER:-0}"
-COMPRESSED_LENGTH="${COMPRESSED_LENGTH:-256}"
-SAMPLES_PER_DATASET="${SAMPLES_PER_DATASET:-4096}"
-
-BATCH_SIZE="${BATCH_SIZE:-2}"
-SEED="${SEED:-42}"
-SHUFFLE_SEED="${SHUFFLE_SEED:-1234}"
-NUM_VIDEO_FRAMES="${NUM_VIDEO_FRAMES:-8}"
-VIDEO_MAX_LONG_SIDE="${VIDEO_MAX_LONG_SIDE:-480}"
-SAVE_DTYPE="${SAVE_DTYPE:-float32}"
-DEVICE_MAP="${DEVICE_MAP:-cuda:0}"
-ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
 
 EXTRA_ARGS=("$@")
 
@@ -77,6 +65,10 @@ CMD=(
     --attn_temperature "${ATTN_TEMPERATURE}"
 )
 
+if [[ "${CACHE_NEXT_BLOCK_TARGETS}" == "1" ]]; then
+    CMD+=(--cache_next_block_targets)
+fi
+
 CMD+=("${EXTRA_ARGS[@]}")
 
 echo "Model              : ${MODEL_PATH}"
@@ -88,6 +80,7 @@ echo "Batch size         : ${BATCH_SIZE}"
 echo "Video frames       : ${NUM_VIDEO_FRAMES}"
 echo "HF_HOME            : ${HF_HOME}"
 echo "Device map         : ${DEVICE_MAP}"
+echo "Cache next block   : ${CACHE_NEXT_BLOCK_TARGETS}"
 echo "CMD: ${CMD[*]}"
 echo ""
 "${CMD[@]}"
