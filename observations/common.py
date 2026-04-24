@@ -372,8 +372,6 @@ def build_dataset(dataset_name: str, model_family: str, **kwargs):
     if dataset_name == "video_mmmu":
         from tasks.video_mmmu import videommmu_transform
 
-        if model_family != "kimi":
-            raise ValueError("VideoMMMU is only supported for Kimi-VL in this repo.")
         adaptation = load_dataset(
             require_dataset_dir("VideoMMMU", "Adaptation"), token=True
         )["test"]
