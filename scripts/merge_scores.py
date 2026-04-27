@@ -151,6 +151,7 @@ def _merge_payloads(loaded: List[LoadedScores]) -> Tuple[dict, List[str]]:
         "channel_scores": {},
         "expert_scores": {},
         "ema_matrix": {},
+        "ema_matrix_prior_corrected": {},
         "layerwise_loss": {},
         "metadata": copy.deepcopy(newest.payload.get("metadata", {})),
     }
@@ -211,6 +212,17 @@ def _merge_payloads(loaded: List[LoadedScores]) -> Tuple[dict, List[str]]:
             warnings.append(f"[merge warning] ema_matrix.{layer} all candidates are zero; skipped")
 
         val, has_any_value = _merge_latest_nonzero_value(
+            loaded,
+            lambda payload, l=layer: _get_layer_value(payload.get("ema_matrix_prior_corrected", {}), l),
+        )
+        if val is not None:
+            merged["ema_matrix_prior_corrected"][layer] = val
+        elif has_any_value:
+            warnings.append(
+                f"[merge warning] ema_matrix_prior_corrected.{layer} all candidates are zero; skipped"
+            )
+
+        val, has_any_value = _merge_latest_nonzero_value(
             loaded, lambda payload, l=layer: _get_layer_value(payload.get("layerwise_loss", {}), l)
         )
         if val is not None:
@@ -223,6 +235,7 @@ def _merge_payloads(loaded: List[LoadedScores]) -> Tuple[dict, List[str]]:
             *{int(k) for metric_map in merged["channel_scores"].values() for k in metric_map.keys()},
             *{int(k) for metric_map in merged["expert_scores"].values() for k in metric_map.keys()},
             *{int(k) for k in merged["ema_matrix"].keys()},
+            *{int(k) for k in merged["ema_matrix_prior_corrected"].keys()},
             *{int(k) for k in merged["layerwise_loss"].keys()},
         }
     )

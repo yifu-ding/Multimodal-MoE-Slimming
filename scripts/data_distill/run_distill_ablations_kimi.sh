@@ -43,7 +43,7 @@ if [[ "${ABLATION_SUITE}" == "all" || "${ABLATION_SUITE}" == "diversity" ]]; the
 fi
 
 if [[ "${ABLATION_SUITE}" == "all" || "${ABLATION_SUITE}" == "distribution" ]]; then
-    # run_case "distribution" "full" "full" "full"
+    run_case "distribution" "full" "full" "full"
     run_case "distribution" "moment_only" "full" "moment_only"
     run_case "distribution" "mmd_only" "full" "mmd_only"
 fi

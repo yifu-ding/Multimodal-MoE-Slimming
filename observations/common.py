@@ -372,8 +372,6 @@ def build_dataset(dataset_name: str, model_family: str, **kwargs):
     if dataset_name == "video_mmmu":
         from tasks.video_mmmu import videommmu_transform
 
-        if model_family != "kimi":
-            raise ValueError("VideoMMMU is only supported for Kimi-VL in this repo.")
         adaptation = load_dataset(
             require_dataset_dir("VideoMMMU", "Adaptation"), token=True
         )["test"]
@@ -1116,6 +1114,8 @@ def attach_deepseek_observer(bundle: ModelBundle, accumulator: ObservationAccumu
             and hasattr(layer.mlp, "moe_infer")
         ):
             continue
+        if layer_idx not in accumulator.layer_to_num_experts:
+            continue
 
         layer.mlp.layer_idx = layer_idx
         layer.mlp.gate.layer_idx = layer_idx
@@ -1216,6 +1216,8 @@ def attach_qwen3_observer(bundle: ModelBundle, accumulator: ObservationAccumulat
             and layer_idx not in getattr(config, "mlp_only_layers", [])
         ):
             continue
+        if layer_idx not in accumulator.layer_to_num_experts:
+            continue
         layer.mlp.experts.layer_idx = layer_idx
 
         def observation_callback(
@@ -1285,6 +1287,8 @@ def attach_kimi_observer(bundle: ModelBundle, accumulator: ObservationAccumulato
             and layer_idx >= config.first_k_dense_replace
             and layer_idx % config.moe_layer_freq == 0
         ):
+            continue
+        if layer_idx not in accumulator.layer_to_num_experts:
             continue
         # Turn on the mask-population path in `models.kimi.model_forward`.
         # 这里写入一个哨兵值, 让上游 forward 路径额外保存文本和多模态 token 的索引或 mask.
@@ -1497,6 +1501,32 @@ def collect_observation_stats(args) -> Dict[str, Any]:
     bundle = load_model_bundle(args.model_name_or_path)
     print(f"[Observation] Loaded model family: {bundle.family}", flush=True)
     layer_to_num_experts, layer_to_num_channels = discover_layer_structure(bundle)
+    observe_layers_raw = (getattr(args, "observe_layers", "") or "").strip()
+    if observe_layers_raw:
+        wanted = set()
+        for item in observe_layers_raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            wanted.add(int(item))
+        layer_to_num_experts = {
+            layer_idx: n_exp
+            for layer_idx, n_exp in layer_to_num_experts.items()
+            if layer_idx in wanted
+        }
+        layer_to_num_channels = {
+            layer_idx: n_ch
+            for layer_idx, n_ch in layer_to_num_channels.items()
+            if layer_idx in wanted
+        }
+        if not layer_to_num_experts:
+            raise ValueError(
+                f"--observe_layers={observe_layers_raw!r} 过滤后没有可观测 MoE 层。"
+            )
+        print(
+            f"[Observation] Layer filter active: keep layers={sorted(layer_to_num_experts.keys())}",
+            flush=True,
+        )
     print(
         f"[Observation] Discovered {len(layer_to_num_experts)} MoE layers "
         f"covering {sum(layer_to_num_experts.values())} experts.",
@@ -1820,5 +1850,11 @@ def build_base_arg_parser(description: str) -> argparse.ArgumentParser:
         type=int,
         default=8,
         help="O1/路由：top-k 路由直方图只计前 k 个槽位；超过模型 top_k 时以模型 top_k 为准。",
+    )
+    parser.add_argument(
+        "--observe_layers",
+        type=str,
+        default="",
+        help="仅观测指定 MoE 层，逗号分隔，如 '44,45,46,47'。为空时观测全部可观测层。",
     )
     return parser

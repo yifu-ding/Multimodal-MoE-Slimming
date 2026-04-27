@@ -571,9 +571,10 @@ def moe_forward(
     moe_other_mask = None
     expert_range = None
     moe_padding_mask = None
-    obs_enabled = bool(
-        hasattr(self.language_model.layers[0].mlp, "_obs_callback")
-        and callable(getattr(self.language_model.layers[0].mlp, "_obs_callback"))
+    obs_enabled = any(
+        hasattr(layer.mlp, "_obs_callback")
+        and callable(getattr(layer.mlp, "_obs_callback"))
+        for layer in self.language_model.layers
     )
     if (
         enable_tau_skip

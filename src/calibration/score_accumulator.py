@@ -102,16 +102,53 @@ class ScoreAccumulator:
         expert_scores["token_count_visual"] = to_nested_expert_dict(
             normalized_token_count_visual, scalar=True
         )
+        # Raw EMA matches observations/o1: compare per-modality normalized routing
+        # frequencies directly, without an extra global prior correction.
+        text_count_map = self.expert_scores["token_count_text"]      # {layer_idx: Tensor[E]}
+        visual_count_map = self.expert_scores["token_count_visual"]  # {layer_idx: Tensor[E]}
+
+        total_text = sum(
+            float(layer_counts.float().sum().item())
+            for layer_counts in text_count_map.values()
+        )
+        total_visual = sum(
+            float(layer_counts.float().sum().item())
+            for layer_counts in visual_count_map.values()
+        )
+
+        gamma = 1.0
+        prior_ratio = (total_visual + 1e-8) / (total_text + 1e-8)
+
         ema_matrix = {}
+        ema_matrix_prior_corrected = {}
+
         for layer_idx in self.layers:
-            text_freq = self.expert_scores["token_count_text"][layer_idx]
-            visual_freq = self.expert_scores["token_count_visual"][layer_idx]
-            ema_matrix[layer_idx] = (visual_freq - text_freq) / (visual_freq + text_freq + 1e-8)
+            text_freq_tensor = text_count_map[layer_idx].float()      # shape [E]
+            visual_freq_tensor = visual_count_map[layer_idx].float()  # shape [E]
+
+            ema_tensor = (visual_freq_tensor - text_freq_tensor) / (
+                visual_freq_tensor + text_freq_tensor + 1e-8
+            )
+            visual_freq_corr = visual_freq_tensor / (prior_ratio ** gamma)
+            ema_prior_corrected_tensor = (visual_freq_corr - text_freq_tensor) / (
+                visual_freq_corr + text_freq_tensor + 1e-8
+            )
+
+            ema_matrix[layer_idx] = {
+                expert_id: float(ema_tensor[expert_id].item())
+                for expert_id in range(ema_tensor.shape[0])
+            }
+            ema_matrix_prior_corrected[layer_idx] = {
+                expert_id: float(ema_prior_corrected_tensor[expert_id].item())
+                for expert_id in range(ema_prior_corrected_tensor.shape[0])
+            }
+
 
         payload = {
             "channel_scores": channel_scores,
             "expert_scores": expert_scores,
-            "ema_matrix": to_nested_expert_dict(ema_matrix, scalar=True),
+            "ema_matrix": ema_matrix,
+            "ema_matrix_prior_corrected": ema_matrix_prior_corrected,
             "layerwise_loss": dict(self.layerwise_loss),
             "metadata": {
                 "loss_fn": args.loss_fn,
@@ -130,6 +167,8 @@ class ScoreAccumulator:
                 "layer_to_num_channels": self.layer_to_num_channels,
                 "available_channel_metrics": list(CHANNEL_METRICS),
                 "available_expert_metrics": list(EXPERT_METRICS),
+                "ema_matrix_definition": "raw modality affinity: (visual_freq - text_freq) / (visual_freq + text_freq + 1e-8)",
+                "ema_matrix_prior_corrected_definition": "prior-corrected modality affinity: ((visual_freq / prior_ratio) - text_freq) / ((visual_freq / prior_ratio) + text_freq + 1e-8), prior_ratio = total_visual / total_text",
                 "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "created_at_unix": dt.datetime.now(dt.timezone.utc).timestamp(),
             },

@@ -4,35 +4,35 @@ ACTIVE_CHANNEL_METRICS = (
     "gateup_act_text",
     "gateup_act_visual",
     # three proj activation
-    "3proj_act",
-    "3proj_act_text",
-    "3proj_act_visual",
-    # three proj second order
-    "3proj_second_order",
-    "3proj_second_order_text",
-    "3proj_second_order_visual",
-    # three proj saliency
-    "3proj_saliency",
-    "3proj_saliency_text",
-    "3proj_saliency_visual",
-    # down second order (exact)
-    "down_second_order_exact",
-    "down_second_order_exact_text",
-    "down_second_order_exact_visual",
-    # down proj second order (approx)
-    "down_second_order_approx",
-    "down_second_order_approx_text",
-    "down_second_order_approx_visual",
-    # w
-    "weight",
-    # weight*grad
-    "wg",
-    "wg_text",
-    "wg_visual",
-    # weight*activation
-    "wa",
-    "wa_text",
-    "wa_visual",
+    # "3proj_act",
+    # "3proj_act_text",
+    # "3proj_act_visual",
+    # # three proj second order
+    # "3proj_second_order",
+    # "3proj_second_order_text",
+    # "3proj_second_order_visual",
+    # # three proj saliency
+    # "3proj_saliency",
+    # "3proj_saliency_text",
+    # "3proj_saliency_visual",
+    # # down second order (exact)
+    # "down_second_order_exact",
+    # "down_second_order_exact_text",
+    # "down_second_order_exact_visual",
+    # # down proj second order (approx)
+    # "down_second_order_approx",
+    # "down_second_order_approx_text",
+    # "down_second_order_approx_visual",
+    # # w
+    # "weight",
+    # # weight*grad
+    # "wg",
+    # "wg_text",
+    # "wg_visual",
+    # # weight*activation
+    # "wa",
+    # "wa_text",
+    # "wa_visual",
 )
 
 CHANNEL_METRICS = (
@@ -93,6 +93,6 @@ EXPERT_METRICS = (
     "router_fillzero",
     "second_attr",
     "second_attr_fillzero",
-    "true_ablate",
-    "true_ablate_fillzero",
+    # "true_ablate",
+    # "true_ablate_fillzero",
 )

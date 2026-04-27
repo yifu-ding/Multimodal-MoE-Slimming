@@ -9,10 +9,10 @@ export PYTHONPATH="${PREFIX}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
-NUM_SAMPLES="${NUM_SAMPLES:-2048}"
+NUM_SAMPLES="${NUM_SAMPLES:-1024}"
 SUBSET_SEED="${SUBSET_SEED:-42}"
 EMA_THRESHOLD="${EMA_THRESHOLD:-0.5}"
-OUT="${OUTPUT_DIR:-${PREFIX}/observations/o1/results/kimi_gqa_coco_2048}"
+OUT="${OUTPUT_DIR:-${PREFIX}/observations/o1/results/kimi}"
 
 PYTHON="${PYTHON:-$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)}"
 if [[ -z "${PYTHON}" ]]; then
@@ -25,12 +25,11 @@ mkdir -p "${OUT}"
 CMD=(
   "${PYTHON}" observations/o1/scripts/run_o1.py
   --model_name_or_path "${MODEL_PATH}"
-  --datasets gqa coco
+  --datasets gqa coco m4
   --batch_size "${BATCH_SIZE}"
   --num_samples "${NUM_SAMPLES}"
   --output_dir "${OUT}"
-  --subset_seed "${SUBSET_SEED}"
-  --ema_threshold "${EMA_THRESHOLD}"
+  --artifact-suffix "1024sample"
 )
 CMD+=("$@")
 
