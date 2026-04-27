@@ -37,6 +37,7 @@ def generate_masks(
     adjust_masks_kwargs = prune_kwargs.get("adjust_masks_kwargs", {})
     smooth_fn = prune_kwargs.get("smooth_fn", "sqrt")
     modality_aware = bool(prune_kwargs.get("modality_aware", False))
+    use_ema = bool(prune_kwargs.get("use_ema", True))
     normalize = bool(prune_kwargs.get("normalize", False))
 
     (
@@ -62,6 +63,7 @@ def generate_masks(
 
     result = {}
     result["layers"] = layers
+    result["scores_dir"] = scores_dir
     inter_layer_method = loss_based_kwargs.get(
         "inter_layer_method",
         mask_method_kwargs.get("inter_layer_method", "uniform"),
@@ -92,9 +94,10 @@ def generate_masks(
         if verbose:
             _print("[Mask Building] Applying modality-conditioned channel budgeting.")
 
-        modality_masks, shared_masks = build_modality_budget_masks(
+        modality_masks, shared_masks, text_K_E, visual_K_E, k_visual, k_text = build_modality_budget_masks(
             modality_scores["text"],
             modality_scores["visual"],
+            use_ema=use_ema,
             expertwise_scores=expertwise_scores,
             layerwise_keep_plan=layerwise_keep_plan,
             intra_layer_method=mask_method_kwargs.get("intra_layer_method", "uniform"),
@@ -142,6 +145,11 @@ def generate_masks(
             layerwise_keep_plan=layerwise_keep_plan,
             verbose=verbose,
         )
+        result["shared_masks"] = shared_masks
+        result["text_K_E"] = text_K_E
+        result["visual_K_E"] = visual_K_E
+        result["k_visual"] = k_visual
+        result["k_text"] = k_text
         result["K_E_inter"] = result["intermediate_masks"].sum(dim=-1)
 
     align_inter = adjust_masks_kwargs.get("align_inter", 0)

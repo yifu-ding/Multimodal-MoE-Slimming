@@ -142,3 +142,17 @@ def to_nested_expert_dict(layer_map: Dict[int, torch.Tensor], scalar: bool = Fal
                 for eid in range(tensor.shape[0])
             }
     return nested
+
+
+
+def nested_counts_total(count_map):
+    total = 0.0
+    for layer_counts in count_map.values():
+        if isinstance(layer_counts, dict):
+            total += sum(float(v) for v in layer_counts.values())
+        elif torch.is_tensor(layer_counts):
+            total += float(layer_counts.float().sum().item())
+        else:
+            raise TypeError(f"Unsupported layer_counts type: {type(layer_counts)}")
+    return total
+

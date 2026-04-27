@@ -17,12 +17,13 @@ def _pick_topk(available_scores: torch.Tensor, available_idx: torch.Tensor, k: i
 def build_modality_budget_masks(
     text_scores: torch.Tensor,
     visual_scores: torch.Tensor,
+    use_ema: bool,
     expertwise_scores: torch.Tensor | None,
     layerwise_keep_plan: torch.Tensor,
     intra_layer_method: str,
     ema_matrix: Optional[torch.Tensor] = None,
     verbose: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     
     def _tentative(scores: torch.Tensor) -> torch.Tensor:
         if expertwise_scores is not None:
@@ -55,6 +56,8 @@ def build_modality_budget_masks(
     L, E, I = text_scores.shape
     masks = torch.zeros((L, E, I), dtype=torch.bool, device=text_scores.device)
     shared_masks = torch.zeros((L, E, I), dtype=torch.bool, device=text_scores.device)
+    k_visual_tensor = torch.zeros((L, E), dtype=torch.int64, device=text_scores.device)
+    k_text_tensor = torch.zeros((L, E), dtype=torch.int64, device=text_scores.device)
 
     for lid in range(L):
         for eid in range(E):
@@ -74,7 +77,7 @@ def build_modality_budget_masks(
             # chosen channel ids for shared mask
             chosen: Set[int] = set(torch.nonzero(shared_mask, as_tuple=False).flatten().tolist())
 
-            if ema_matrix is None:
+            if ema_matrix is None or not use_ema:
                 norm_vis_ema = 0.5
             else:
                 affinity = float(ema_matrix[lid, eid].item())
@@ -83,7 +86,6 @@ def build_modality_budget_masks(
             norm_text_ema = 1.0 - norm_vis_ema
 
             target_budget = text_K_E[lid, eid] * norm_text_ema + visual_K_E[lid, eid] * norm_vis_ema
-            # target_budget = (text_K_E[lid, eid] + visual_K_E[lid, eid]) / 2.0
 
             visual_only_idx = torch.nonzero(visual_only_mask, as_tuple=False).flatten()
             text_only_idx = torch.nonzero(text_only_mask, as_tuple=False).flatten()
@@ -95,6 +97,8 @@ def build_modality_budget_masks(
             remaining_budget = float(target_budget) - len(chosen)
             k_visual = min(int(round(remaining_budget * norm_vis_ema)), int(visual_only_idx.numel()))
             k_text = min(int(round(remaining_budget * norm_text_ema)), int(text_only_idx.numel()))
+            k_visual_tensor[lid, eid] = int(k_visual)
+            k_text_tensor[lid, eid] = int(k_text)
 
             chosen.update(_pick_topk(v[visual_only_idx], visual_only_idx, k_visual))
             chosen.update(_pick_topk(t[text_only_idx], text_only_idx, k_text))
@@ -107,6 +111,4 @@ def build_modality_budget_masks(
         K_E = masks.sum(dim=-1)
         _print(f"[Modality-aware Budget] after modality-aware budget: {K_E[0]}")
 
-    return masks, shared_masks
-
-
+    return masks, shared_masks, text_K_E, visual_K_E, k_visual_tensor, k_text_tensor

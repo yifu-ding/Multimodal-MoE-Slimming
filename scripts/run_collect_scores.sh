@@ -23,14 +23,12 @@ set -euo pipefail
 
 source scripts/select_least_used_gpu.sh # 自动选择显存使用量最少的 gpu
 
-if [[ "${CONDA_DEFAULT_ENV:-}" == "ds-vl2" ]]; then
-    export LD_LIBRARY_PATH="/home/dyf/miniconda/envs/ds-vl2/lib:${LD_LIBRARY_PATH:-}"
+if [[ "${CONDA_DEFAULT_ENV:-}" == "ds-vl2-h20" ]]; then
+    export LD_LIBRARY_PATH="/home/dyf/miniconda/envs/ds-vl2-h20/lib:${LD_LIBRARY_PATH:-}"
 fi
 
 PREFIX="${PREFIX:-$(pwd)}"
 export PYTHONPATH="${PREFIX}"
-
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 # MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-VL-30B-A3B-Instruct}"
@@ -38,8 +36,8 @@ MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 # deepseek-ai/deepseek-vl2-small
 
 DATASET="${DATASET:-gqa}"
-NUM_SAMPLES="${NUM_SAMPLES:-1024}"
-TOKEN_PER_SAMPLE="${TOKEN_PER_SAMPLE:-2048}"
+NUM_SAMPLES="${NUM_SAMPLES:-256}"
+TOKEN_PER_SAMPLE="${TOKEN_PER_SAMPLE:-1024}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 START_IDX="${START_IDX:-0}"
 SUBSET_SEED="${SUBSET_SEED:-42}"
