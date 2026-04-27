@@ -57,7 +57,7 @@ def load_modality_channel_scores(
     ema_tensor = dict_to_tensor(
         _nested_to_layer_tensors(payload["ema_matrix"])
     ).to(device=device, dtype=torch.float32)
-    import ipdb; ipdb.set_trace()
+    # import ipdb; ipdb.set_trace()
     return {
         "text": dict_to_tensor(text_scores).to(device=device, dtype=torch.float32),
         "visual": dict_to_tensor(visual_scores).to(device=device, dtype=torch.float32),

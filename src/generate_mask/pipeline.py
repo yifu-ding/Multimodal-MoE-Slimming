@@ -86,6 +86,7 @@ def generate_masks(
     result["layerwise_keep_plan"] = layerwise_keep_plan
 
     use_modality = modality_aware or thresholds_path is not None
+    import ipdb; ipdb.set_trace()
 
     if not use_modality:
         result.update(mask_result)

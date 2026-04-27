@@ -1,10 +1,28 @@
-"""在线版 synthetic hidden distillation.
+"""在线版 synthetic hidden distillation, 不依赖预先生成的 teacher cache 文件.
 
-不再预先构建 teacher cache:
-1. 先从 round-robin 数据流里抽取 teacher hidden, 填满 synthetic pool.
-2. pool 填满后, 继续从数据流里在线抽 teacher batch 做分布蒸馏.
+整体分两阶段, 但都在一次进程里顺序完成:
 
-保留原有两阶段脚本; 本文件提供新的单阶段流式流程.
+1) 初始化阶段 (filling synthetic pool)
+   - 从多数据集 round-robin 流中反复取 raw batch, 前向教师模型, 在指定 decoder 层取 block 输出,
+     再按 ``compression_mode`` 压到 ``compressed_length``, 得到与离线 cache 同构的
+     ``(B, L, D)`` teacher hidden, 以及 ``modality_labels`` / ``position_ids``.
+   - 连续累积直到凑满 ``synthetic_size`` 条序列, 作为合成集在参数空间里的初值模板.
+   - 若 ``lambda_block > 0``, 初始化时还会为每条合成 anchor 缓存下一层 block 的输出,
+     供后续 block 监督使用 (在线版不再每步前向下一层).
+
+2) 蒸馏阶段 (optimization loop)
+   - 仍从同一数据流在线抽 ``teacher_batch_size`` 条 teacher 序列, 与当前可学习的 synthetic
+     表示算分布损失; 教师侧每步都是新样本, 不再读固定 ``.pt`` shard.
+   - 可学习参数是 ``_build_synthetic_banks`` 返回的 ``ParameterDict`` (按模态分 bank),
+     通过 ``_assemble_synthetic_hidden`` 拼出与模板同形状的 ``synthetic_hidden``;
+     ``position_ids``, ``modality_labels`` 在在线脚本里冻结为初始化时的值.
+   - 优化器为 Adam, 对 ``bank_params`` 做 ``backward`` + ``step``.
+
+与 ``distill_synthetic_hidden.py`` 的关系: 损失定义, 加权, 消融, diversity warmup 等逻辑复用该模块;
+本文件只负责数据管线 (流式 teacher) 与在线特有的 ``anchor_next_block_targets`` 持久化.
+
+Loss 项 (详见 ``_compute_losses``): 按模态分组的 MMD / cov / mean / var, 以及全局 synthetic token
+上的 diversity (div); 可选 ``block_rel_l2`` 将 synthetic 与初始化时缓存的 next-block teacher 对齐.
 """
 import argparse
 import os
@@ -64,7 +82,17 @@ from src.calibration.representation_distill.runtime.forward_from_hidden import (
 )
 
 
+# ---------------------------------------------------------------------------
+# 数据流: 多数据集 round-robin, 为在线前向提供无限样本序列 (实际受每数据集样本数限制)
+# ---------------------------------------------------------------------------
+
+
 class _RoundRobinDatasetStream:
+    """在多个 teacher 数据集之间轮流取 batch, 每个数据集内部指针循环, 用尽则 reshuffle.
+
+    ``next_batch`` 每次返回 ``(dataset_name, raw_batch)``, 供 ``prepare_raw_batch_inputs`` 使用.
+    """
+
     def __init__(
         self,
         samples_by_dataset: Dict[str, List[Dict]],
@@ -89,6 +117,7 @@ class _RoundRobinDatasetStream:
         self._dataset_cursor = 0
 
     def next_batch(self) -> tuple[str, List[Dict]]:
+        # 轮询数据集游标, 从当前数据集顺序取 ``batch_size`` 条样本 (可能跨 epoch reshuffle)
         dataset_name = self.dataset_order[self._dataset_cursor]
         self._dataset_cursor = (self._dataset_cursor + 1) % len(self.dataset_order)
         dataset_samples = self.samples_by_dataset[dataset_name]
@@ -105,6 +134,7 @@ class _RoundRobinDatasetStream:
 
 
 def _filter_and_group_samples(samples: List[Dict], bundle, args) -> Dict[str, List[Dict]]:
+    # 按 ``teacher_datasets`` 分组, 并对每个数据集调用 ``_select_teacher_samples`` (与离线脚本一致的筛选/重排)
     grouped = {name: [] for name in args.teacher_datasets}
     for sample in samples:
         grouped[sample["dataset_name"]].append(sample)
@@ -123,6 +153,11 @@ def _filter_and_group_samples(samples: List[Dict], bundle, args) -> Dict[str, Li
     return filtered
 
 
+# ---------------------------------------------------------------------------
+# 落盘: 与离线蒸馏 payload 结构对齐, 额外可带 ``anchor_next_block_targets`` (在线 block 监督锚点)
+# ---------------------------------------------------------------------------
+
+
 def _build_output_payload(
     *,
     synthetic_hidden: torch.Tensor,
@@ -134,6 +169,7 @@ def _build_output_payload(
     final_losses: dict[str, float] | None,
     history: list[dict],
 ) -> dict:
+    # ``synthetic_hidden`` 已是 float32 CPU; ``metadata`` 记录超参与训练末期的标量 loss 历史
     payload = {
         "synthetic_hidden": synthetic_hidden.detach().cpu().float(),
         "attention_mask": torch.ones(
@@ -151,7 +187,6 @@ def _build_output_payload(
             "train_steps": args.train_steps,
             "teacher_datasets": list(args.teacher_datasets),
             "samples_per_dataset": args.samples_per_dataset,
-            "teacher_input_batch_size": args.batch_size,
             "compressed_length": int(synthetic_hidden.shape[1]),
             "hidden_size": int(synthetic_hidden.shape[2]),
             "dtype": "float32",
@@ -225,6 +260,11 @@ def _prune_saved_pt_paths(saved_paths: list[str], *, max_keep: int) -> list[str]
     return retained
 
 
+# ---------------------------------------------------------------------------
+# 单次教师前向: raw batch -> 压缩 hidden (+ 可选 next block 目标)
+# ---------------------------------------------------------------------------
+
+
 def _extract_teacher_chunk(
     *,
     bundle,
@@ -238,6 +278,7 @@ def _extract_teacher_chunk(
     sample_generator: torch.Generator,
     include_next_block: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    # 与 ``build_teacher_hidden_cache`` 同一条链路: 取 layer hidden, 再 ``compress_hidden_states`` 到固定 token 数
     inputs = prepare_raw_batch_inputs(bundle, raw_batch)
     inputs = move_inputs_to_model_device(bundle.model, inputs)
     compression_masks = None
@@ -261,6 +302,7 @@ def _extract_teacher_chunk(
         attn_temperature=attn_temperature,
     )
 
+    # 从压缩后的表征继续跑一层 decoder, 得到 ``teacher_layer+1`` 的 block 输出, 仅 CPU 侧缓存给 block loss
     next_block_target = None
     if include_next_block:
         compressed_attention_mask = torch.ones(
@@ -291,6 +333,11 @@ def _extract_teacher_chunk(
     return hidden, labels, position_ids, next_block_target
 
 
+# ---------------------------------------------------------------------------
+# 累积 ``target_count`` 条压缩 teacher 样本: 反复 ``next_batch`` + ``_extract_teacher_chunk``, ``torch.cat`` 拼接
+# ---------------------------------------------------------------------------
+
+
 def _collect_stream_examples(
     *,
     stream: _RoundRobinDatasetStream,
@@ -310,6 +357,7 @@ def _collect_stream_examples(
     progress = None
     if desc is not None:
         progress = tqdm(total=target_count, desc=desc, dynamic_ncols=True, leave=False)
+    # 若单次前向 batch 大于剩余条数, 只截取前 ``take`` 行, 避免池子大小被 batch 边界撑爆
     while collected < target_count:
         dataset_name, raw_batch = stream.next_batch()
         hidden, labels, position_ids, next_block_target = _extract_teacher_chunk(
@@ -344,6 +392,11 @@ def _collect_stream_examples(
         torch.cat(position_parts, dim=0),
         out_next,
     )
+
+
+# ---------------------------------------------------------------------------
+# CLI: 在线蒸馏独有参数 (数据流, 压缩, 数据集列表); 损失权重与离线脚本含义一致
+# ---------------------------------------------------------------------------
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -424,6 +477,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    # ----- 通用准备: 随机种子, 输出目录, 设备, 教师模型 bundle, 数据元信息 -----
     args = build_arg_parser().parse_args()
     ablation_notes = _apply_ablation_presets(args)
     train_dtype = _parse_dtype(args.train_dtype)
@@ -462,7 +516,6 @@ def main() -> None:
                 "modality_aware_compression": args.modality_aware_compression,
                 "teacher_datasets": list(args.teacher_datasets),
                 "samples_per_dataset": args.samples_per_dataset,
-                "teacher_input_batch_size": args.batch_size,
                 "teacher_batch_size": args.teacher_batch_size,
                 "synthetic_size": args.synthetic_size,
                 "synthetic_batch_size": args.synthetic_batch_size,
@@ -506,6 +559,7 @@ def main() -> None:
     if args.lambda_block > 0 and args.teacher_layer >= num_layers - 1:
         raise ValueError("lambda_block > 0 requires a valid next decoder block.")
 
+    # ----- 构造 round-robin 流: 磁盘上 dump 样本列表, 再按数据集分组并筛选 -----
     all_samples = dump_original_data(
         output_dir=os.path.dirname(args.output_path),
         samples_per_dataset=args.samples_per_dataset,
@@ -525,6 +579,7 @@ def main() -> None:
     sample_generator = torch.Generator()
     sample_generator.manual_seed(args.seed)
 
+    # 写入最终 ``.pt`` 的 teacher 侧元信息 (不含大 tensor, 仅描述配置)
     teacher_meta = {
         "method": "multimodal_representation_level_calibration_distillation_online",
         "model_name_or_path": args.model_name_or_path,
@@ -545,6 +600,8 @@ def main() -> None:
         "created_at": utc_now_iso(),
     }
 
+    # ----- 阶段一: 用流式 teacher 填满 ``synthetic_size`` 的初始化池 (CPU 缓存再搬到训练 device) -----
+    # 此处每条样本对应之后 synthetic 的一条序列; 若开 block loss, 同时缓存与之一一对应的 next-block 目标
     _log_stage("Filling synthetic pool from streamed teacher hidden states.")
     init_hidden_cpu, synth_labels_cpu, init_position_ids_cpu, anchor_next_block_targets_cpu = _collect_stream_examples(
         stream=stream,
@@ -565,6 +622,9 @@ def main() -> None:
         else None
     )
 
+    # ----- 将初始化 hidden 拆成按模态的 ``nn.Parameter`` bank, 训练时只更新这些参数 -----
+    # ``synth_template_labels`` / ``synth_template_bank_indices`` 把每条序列每个 token 映射到对应 bank 行,
+    # ``_assemble_synthetic_hidden`` 按索引 gather 出当前步用的 ``synthetic_hidden`` 子 batch
     bank_params, synth_template_labels_flat, synth_template_bank_indices_flat = _build_synthetic_banks(
         init_hidden=init_hidden,
         init_labels=synth_labels,
@@ -581,12 +641,14 @@ def main() -> None:
         else min(args.synthetic_batch_size, args.synthetic_size)
     )
 
+    # Adam 只作用于 ``bank_params``; ``position_ids``, 模板 label, ``anchor_next_block_targets`` 均不参与梯度
     optimizer = torch.optim.Adam(list(bank_params.parameters()), lr=args.lr)
     loss_ema_state: dict[str, torch.Tensor] | None = {} if args.use_ema_normalized_losses else None
     history: list[dict] = []
     saved_pt_paths: list[str] = []
     final_losses = None
 
+    # ----- 阶段二: 每步从数据流再抽一批 teacher, 与 synthetic 算 loss, 反传更新 bank -----
     _log_stage(f"Entering optimization loop at step=0, target_step={args.train_steps}.")
     progress = tqdm(
         range(args.train_steps),
@@ -595,6 +657,7 @@ def main() -> None:
         leave=True,
     )
     for step in progress:
+        # 在线 teacher batch: 与初始化独立, 每步都是新前向, 分布上覆盖流式数据混合
         teacher_batch_cpu, teacher_batch_labels_cpu, _, _ = _collect_stream_examples(
             stream=stream,
             target_count=args.teacher_batch_size,
@@ -607,6 +670,7 @@ def main() -> None:
         teacher_batch = teacher_batch_cpu.to(device=device, dtype=train_dtype)
         teacher_batch_labels = teacher_batch_labels_cpu.to(device=device)
 
+        # 随机子采样 synthetic 序列索引 (可 ``synthetic_batch_size < synthetic_size`` 以降低每步显存)
         synth_batch_indices = _sample_synthetic_batch_indices(
             synthetic_size=args.synthetic_size,
             synthetic_batch_size=effective_synth_batch_size,
@@ -624,6 +688,7 @@ def main() -> None:
             hidden_size=init_hidden.shape[2],
         )
 
+        # ``_compute_losses`` 返回: ``mmd``, ``cov``, ``mean``, ``var``, ``div``, 以及可选的 ``mmd/mod*`` 等诊断键
         losses = _compute_losses(
             teacher_batch,
             synthetic_hidden,
@@ -632,10 +697,12 @@ def main() -> None:
             mmd_subsample=args.mmd_subsample,
         )
 
+        # ``div`` 项乘以 ``div_scale``, 从 0 线性爬升到 1, 减轻训练早期 diversity 项主导
         div_scale = 1.0
         if args.div_warmup_steps > 0:
             div_scale = min(1.0, (step + 1) / float(args.div_warmup_steps))
 
+        # block 监督: 用初始化阶段为同索引 synthetic 缓存的 teacher next-block 表征, 与当前 synthetic 算相对 L2
         if args.lambda_block > 0:
             cached_teacher_target = anchor_next_block_targets.index_select(0, synth_batch_indices)
             losses["block_rel_l2"] = _compute_cached_next_block_rel_l2(
@@ -651,6 +718,7 @@ def main() -> None:
             ema_state=loss_ema_state,
         )
 
+        # 标准一阶更新: ``total_loss`` 对 ``bank_params`` 反传, Adam 步进
         optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
         optimizer.step()
@@ -674,6 +742,7 @@ def main() -> None:
             if "/" in k:
                 final_losses[k] = float(v.detach().cpu().item())
 
+        # 诊断: token norm, centroid 距离, diversity 余弦分位数等, 仅周期性写入 ``final_losses`` 与 history
         should_log_diagnostics = (
             step % args.log_interval == 0
             or step == args.train_steps - 1
@@ -689,6 +758,7 @@ def main() -> None:
             for k, v in diagnostics.items():
                 final_losses[k] = float(v.detach().cpu().item())
 
+        # 注意: 在线版未实现 teacher-teacher baseline ratio (离线 ``distill_synthetic_hidden`` 中有)
         should_log_wandb = (
             wandb_run is not None
             and (
@@ -766,8 +836,10 @@ def main() -> None:
             saved_pt_paths.append(checkpoint_path)
             saved_pt_paths = _prune_saved_pt_paths(saved_pt_paths, max_keep=2)
 
+        # 释放本步 teacher GPU tensor, 降低峰值显存 (下一迭代会重新从 CPU 拉 batch)
         del teacher_batch_cpu, teacher_batch_labels_cpu, teacher_batch, teacher_batch_labels
 
+    # 训练结束: 用最新 ``bank_params`` 拼出完整 ``synthetic_size`` 张量并保存主 checkpoint
     final_hidden = _assemble_synthetic_hidden(
         bank_params=bank_params,
         template_labels=synth_template_labels,
