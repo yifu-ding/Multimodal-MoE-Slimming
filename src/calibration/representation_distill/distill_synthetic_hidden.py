@@ -3,6 +3,7 @@
 训练目标: 用 MMD, 协方差, 多样性等分布损失, 辅以均值与方差矩匹配, 使合成样本在统计上逼近教师缓存.
 """
 import argparse
+import bisect
 import os
 import sys
 
@@ -54,41 +55,317 @@ def _subsample_flat(tensor: torch.Tensor, max_tokens: int) -> torch.Tensor:
     return tensor[indices]
 
 
-def _load_teacher_cache_payload(cache_path: str) -> dict:
-    payload = torch.load(cache_path, map_location="cpu")
-    if "teacher_cache" in payload:
-        return payload
+def _parse_dtype(name: str) -> torch.dtype:
+    mapping = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }
+    if name not in mapping:
+        raise ValueError(f"Unsupported dtype: {name}")
+    return mapping[name]
 
-    shards = payload.get("shards")
-    if not shards:
-        raise KeyError(
-            f"Teacher cache payload at {cache_path} contains neither `teacher_cache` nor `shards`."
+
+def _torch_load_cpu(path: str) -> dict:
+    try:
+        return torch.load(path, map_location="cpu", mmap=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _load_teacher_cache_payload(cache_path: str) -> dict:
+    return _torch_load_cpu(cache_path)
+
+
+class _DenseTeacherCacheStore:
+    def __init__(self, payload: dict):
+        self.payload = payload
+        self.teacher_cache = payload["teacher_cache"]
+        self.next_block_cache = payload.get("next_block_cache", None)
+        self.teacher_labels = payload.get("modality_labels", None)
+        self.teacher_position_ids = payload.get("position_ids", None)
+        if self.teacher_position_ids is not None:
+            self.teacher_position_ids = self.teacher_position_ids.to(dtype=torch.long)
+            self.teacher_cache, self.teacher_position_ids, self.teacher_labels = sort_sequence_by_position_ids(
+                self.teacher_cache,
+                self.teacher_position_ids,
+                self.teacher_labels,
+            )
+        else:
+            self.teacher_position_ids = torch.arange(
+                self.teacher_cache.shape[1], dtype=torch.long
+            ).unsqueeze(0).expand(self.teacher_cache.shape[0], -1)
+
+    @property
+    def num_samples(self) -> int:
+        return int(self.teacher_cache.shape[0])
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return tuple(self.teacher_cache.shape)
+
+    def fetch_indices(
+        self,
+        indices: torch.Tensor,
+        *,
+        target_device: str | torch.device,
+        target_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        indices = indices.to(dtype=torch.long, device="cpu")
+        hidden = self.teacher_cache.index_select(0, indices).to(device=target_device, dtype=target_dtype)
+        labels = (
+            self.teacher_labels.index_select(0, indices).to(target_device)
+            if self.teacher_labels is not None
+            else None
+        )
+        position_ids = self.teacher_position_ids.index_select(0, indices).to(target_device)
+        return hidden, labels, position_ids
+
+    def sample_random(
+        self,
+        count: int,
+        *,
+        target_device: str | torch.device,
+        target_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+        indices = torch.randint(0, self.num_samples, (count,), device="cpu")
+        hidden, labels, position_ids = self.fetch_indices(
+            indices,
+            target_device=target_device,
+            target_dtype=target_dtype,
+        )
+        return hidden, labels, position_ids, indices
+
+    def fetch_next_block_indices(
+        self,
+        indices: torch.Tensor,
+        *,
+        target_device: str | torch.device,
+        target_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if self.next_block_cache is None:
+            raise KeyError("Teacher cache payload does not contain `next_block_cache`.")
+        indices = indices.to(dtype=torch.long, device="cpu")
+        return self.next_block_cache.index_select(0, indices).to(device=target_device, dtype=target_dtype)
+
+
+class _ShardedTeacherCacheStore:
+    def __init__(self, cache_path: str, payload: dict, *, pool_size: int):
+        self.payload = payload
+        self.cache_root = os.path.dirname(cache_path)
+        self.shards = payload["shards"]
+        self.num_samples = int(payload.get("metadata", {}).get("total_samples", sum(int(s["num_samples"]) for s in self.shards)))
+        self.pool_size = max(1, min(int(pool_size), self.num_samples))
+        self._shard_offsets = []
+        offset = 0
+        for shard in self.shards:
+            self._shard_offsets.append(offset)
+            offset += int(shard["num_samples"])
+        self._shard_cache: dict[int, dict] = {}
+        self._buffer_hidden: torch.Tensor | None = None
+        self._buffer_labels: torch.Tensor | None = None
+        self._buffer_position_ids: torch.Tensor | None = None
+        self._buffer_global_indices: torch.Tensor | None = None
+        self._shard_order = torch.randperm(len(self.shards)).tolist() if self.shards else []
+        self._shard_cursor = 0
+        self._sample_calls = 0
+        self._refresh_every_calls = 16
+
+        first = self._load_shard(0)
+        self.shape = (
+            self.num_samples,
+            int(first["teacher_cache"].shape[1]),
+            int(first["teacher_cache"].shape[2]),
         )
 
-    shard_root = os.path.dirname(cache_path)
-    teacher_cache_parts = []
-    modality_label_parts = []
-    position_id_parts = []
-    next_block_parts = []
-    for shard_info in tqdm(shards, desc="Loading teacher cache shards", leave=False):
-        shard_path = os.path.join(shard_root, shard_info["path"])
-        shard_payload = torch.load(shard_path, map_location="cpu")
-        teacher_cache_parts.append(shard_payload["teacher_cache"].float())
-        if "modality_labels" in shard_payload:
-            modality_label_parts.append(shard_payload["modality_labels"])
-        if "position_ids" in shard_payload:
-            position_id_parts.append(shard_payload["position_ids"])
-        if "next_block_cache" in shard_payload:
-            next_block_parts.append(shard_payload["next_block_cache"].float())
+    def _load_shard(self, shard_idx: int) -> dict:
+        cached = self._shard_cache.get(shard_idx)
+        if cached is not None:
+            return cached
+        shard_path = os.path.join(self.cache_root, self.shards[shard_idx]["path"])
+        shard_payload = _torch_load_cpu(shard_path)
+        if "position_ids" not in shard_payload:
+            shard_payload["position_ids"] = torch.arange(
+                shard_payload["teacher_cache"].shape[1], dtype=torch.long
+            ).unsqueeze(0).expand(shard_payload["teacher_cache"].shape[0], -1)
+        else:
+            shard_payload["position_ids"] = shard_payload["position_ids"].to(dtype=torch.long)
+        self._shard_cache = {shard_idx: shard_payload}
+        return shard_payload
 
-    payload["teacher_cache"] = torch.cat(teacher_cache_parts, dim=0)
-    if modality_label_parts:
-        payload["modality_labels"] = torch.cat(modality_label_parts, dim=0)
-    if position_id_parts:
-        payload["position_ids"] = torch.cat(position_id_parts, dim=0)
-    if next_block_parts:
-        payload["next_block_cache"] = torch.cat(next_block_parts, dim=0)
-    return payload
+    def _append_to_buffer(
+        self,
+        hidden: torch.Tensor,
+        labels: torch.Tensor | None,
+        position_ids: torch.Tensor,
+        global_indices: torch.Tensor,
+    ) -> None:
+        if self._buffer_hidden is None:
+            self._buffer_hidden = hidden
+            self._buffer_labels = labels
+            self._buffer_position_ids = position_ids
+            self._buffer_global_indices = global_indices
+            return
+        self._buffer_hidden = torch.cat([self._buffer_hidden, hidden], dim=0)
+        if self._buffer_labels is not None and labels is not None:
+            self._buffer_labels = torch.cat([self._buffer_labels, labels], dim=0)
+        elif labels is None:
+            self._buffer_labels = None
+        self._buffer_position_ids = torch.cat([self._buffer_position_ids, position_ids], dim=0)
+        self._buffer_global_indices = torch.cat([self._buffer_global_indices, global_indices], dim=0)
+
+    def _buffer_size(self) -> int:
+        return 0 if self._buffer_hidden is None else int(self._buffer_hidden.shape[0])
+
+    def _trim_buffer(self, max_samples: int) -> None:
+        if self._buffer_hidden is None:
+            return
+        if self._buffer_hidden.shape[0] <= max_samples:
+            return
+        keep_start = self._buffer_hidden.shape[0] - max_samples
+        keep = torch.arange(keep_start, self._buffer_hidden.shape[0], dtype=torch.long)
+        self._buffer_hidden = self._buffer_hidden.index_select(0, keep)
+        if self._buffer_labels is not None:
+            self._buffer_labels = self._buffer_labels.index_select(0, keep)
+        self._buffer_position_ids = self._buffer_position_ids.index_select(0, keep)
+        self._buffer_global_indices = self._buffer_global_indices.index_select(0, keep)
+
+    def _fill_buffer(self, min_samples: int) -> None:
+        current = 0 if self._buffer_hidden is None else int(self._buffer_hidden.shape[0])
+        while current < min_samples:
+            if self._shard_cursor >= len(self._shard_order):
+                self._shard_order = torch.randperm(len(self.shards)).tolist()
+                self._shard_cursor = 0
+            shard_idx = self._shard_order[self._shard_cursor]
+            self._shard_cursor += 1
+            shard_payload = self._load_shard(shard_idx)
+            offset = self._shard_offsets[shard_idx]
+            global_indices = offset + torch.arange(shard_payload["teacher_cache"].shape[0], dtype=torch.long)
+            self._append_to_buffer(
+                shard_payload["teacher_cache"],
+                shard_payload.get("modality_labels", None),
+                shard_payload["position_ids"],
+                global_indices,
+            )
+            current = int(self._buffer_hidden.shape[0])
+
+    def _refresh_buffer(self, add_samples: int) -> None:
+        if add_samples <= 0:
+            return
+        old_target = self.pool_size
+        self._fill_buffer(min(old_target + add_samples, self.num_samples))
+        self._trim_buffer(old_target)
+
+    def sample_random(
+        self,
+        count: int,
+        *,
+        target_device: str | torch.device,
+        target_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+        self._fill_buffer(min(self.pool_size, self.num_samples))
+        assert self._buffer_hidden is not None and self._buffer_position_ids is not None and self._buffer_global_indices is not None
+        pool_count = self._buffer_hidden.shape[0]
+        if count <= pool_count:
+            take = torch.randperm(pool_count, device="cpu")[:count]
+        else:
+            take = torch.randint(0, pool_count, (count,), device="cpu")
+        hidden = self._buffer_hidden.index_select(0, take).to(device=target_device, dtype=target_dtype)
+        labels = (
+            self._buffer_labels.index_select(0, take).to(target_device)
+            if self._buffer_labels is not None
+            else None
+        )
+        position_ids = self._buffer_position_ids.index_select(0, take).to(target_device)
+        global_indices = self._buffer_global_indices.index_select(0, take)
+        self._sample_calls += 1
+        shard_samples = int(self.shards[0]["num_samples"]) if self.shards else 0
+        if (
+            shard_samples > 0
+            and self._buffer_size() < self.num_samples
+            and self._sample_calls % self._refresh_every_calls == 0
+        ):
+            self._refresh_buffer(shard_samples)
+        return hidden, labels, position_ids, global_indices
+
+    def fetch_indices(
+        self,
+        indices: torch.Tensor,
+        *,
+        target_device: str | torch.device,
+        target_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        indices = indices.to(dtype=torch.long, device="cpu")
+        order = torch.argsort(indices)
+        sorted_indices = indices.index_select(0, order)
+        hidden_parts = []
+        label_parts = []
+        position_parts = []
+        start = 0
+        while start < sorted_indices.numel():
+            global_idx = int(sorted_indices[start].item())
+            shard_idx = bisect.bisect_right(self._shard_offsets, global_idx) - 1
+            shard_start = self._shard_offsets[shard_idx]
+            shard_end = shard_start + int(self.shards[shard_idx]["num_samples"])
+            end = start
+            while end < sorted_indices.numel() and int(sorted_indices[end].item()) < shard_end:
+                end += 1
+            shard_payload = self._load_shard(shard_idx)
+            local_indices = (sorted_indices[start:end] - shard_start).to(dtype=torch.long)
+            hidden_parts.append(shard_payload["teacher_cache"].index_select(0, local_indices))
+            if "modality_labels" in shard_payload:
+                label_parts.append(shard_payload["modality_labels"].index_select(0, local_indices))
+            position_parts.append(shard_payload["position_ids"].index_select(0, local_indices))
+            start = end
+
+        hidden = torch.cat(hidden_parts, dim=0)
+        labels = torch.cat(label_parts, dim=0) if label_parts else None
+        position_ids = torch.cat(position_parts, dim=0)
+        inverse = torch.argsort(order)
+        hidden = hidden.index_select(0, inverse).to(device=target_device, dtype=target_dtype)
+        labels = labels.index_select(0, inverse).to(target_device) if labels is not None else None
+        position_ids = position_ids.index_select(0, inverse).to(target_device)
+        return hidden, labels, position_ids
+
+    def fetch_next_block_indices(
+        self,
+        indices: torch.Tensor,
+        *,
+        target_device: str | torch.device,
+        target_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        indices = indices.to(dtype=torch.long, device="cpu")
+        order = torch.argsort(indices)
+        sorted_indices = indices.index_select(0, order)
+        parts = []
+        start = 0
+        while start < sorted_indices.numel():
+            global_idx = int(sorted_indices[start].item())
+            shard_idx = bisect.bisect_right(self._shard_offsets, global_idx) - 1
+            shard_start = self._shard_offsets[shard_idx]
+            shard_end = shard_start + int(self.shards[shard_idx]["num_samples"])
+            end = start
+            while end < sorted_indices.numel() and int(sorted_indices[end].item()) < shard_end:
+                end += 1
+            shard_payload = self._load_shard(shard_idx)
+            if "next_block_cache" not in shard_payload:
+                raise KeyError("Teacher cache shard does not contain `next_block_cache`.")
+            local_indices = (sorted_indices[start:end] - shard_start).to(dtype=torch.long)
+            parts.append(shard_payload["next_block_cache"].index_select(0, local_indices))
+            start = end
+        out = torch.cat(parts, dim=0)
+        inverse = torch.argsort(order)
+        return out.index_select(0, inverse).to(device=target_device, dtype=target_dtype)
+
+
+def _build_teacher_cache_store(cache_path: str, payload: dict, *, pool_size: int):
+    if "teacher_cache" in payload:
+        return _DenseTeacherCacheStore(payload)
+    if "shards" in payload:
+        return _ShardedTeacherCacheStore(cache_path, payload, pool_size=pool_size)
+    raise KeyError(
+        f"Teacher cache payload at {cache_path} contains neither `teacher_cache` nor `shards`."
+    )
 
 
 def _build_synthetic_banks(
@@ -157,6 +434,19 @@ def _sample_synthetic_batch_indices(
     return torch.randperm(synthetic_size, device=device)[:synthetic_batch_size]
 
 
+def _compute_cached_next_block_rel_l2(
+    *,
+    cached_teacher_target: torch.Tensor,
+    synthetic_hidden: torch.Tensor,
+    synthetic_attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    diff = (synthetic_hidden.float() - cached_teacher_target.float()).pow(2).sum(dim=-1).sqrt()
+    ref = cached_teacher_target.float().pow(2).sum(dim=-1).sqrt().clamp_min(1e-6)
+    token_loss = diff / ref
+    masked = token_loss * synthetic_attention_mask.float()
+    return masked.sum() / synthetic_attention_mask.float().sum().clamp_min(1.0)
+
+
 def _sample_synthetic_batch_indices(
     synthetic_size: int,
     synthetic_batch_size: int,
@@ -185,6 +475,8 @@ def _mmd_rbf(
     """
     if X.shape[0] == 0 or Y.shape[0] == 0:
         return torch.tensor(0.0, device=X.device)
+    X = X.float()
+    Y = Y.float()
 
     # 成对欧氏距离平方, 用于 RBF 核
     XX = torch.cdist(X, X).pow(2)
@@ -209,6 +501,8 @@ def _mmd_rbf(
 
 def _cov_loss(teacher_flat: torch.Tensor, synth_flat: torch.Tensor) -> torch.Tensor:
     """MSE between cross-channel covariance matrices."""
+    teacher_flat = teacher_flat.float()
+    synth_flat = synth_flat.float()
     # 通道维协方差矩阵的逐元素 MSE, 对齐二阶结构
     t_centered = teacher_flat - teacher_flat.mean(dim=0, keepdim=True)
     s_centered = synth_flat - synth_flat.mean(dim=0, keepdim=True)
@@ -252,6 +546,7 @@ def _cosine_offdiag_stats(flat: torch.Tensor) -> dict[str, torch.Tensor]:
             "cosine_max": zero,
         }
 
+    flat = flat.float()
     normed = F.normalize(flat, dim=-1)
     sim = normed @ normed.T
     off_diag = sim.masked_select(~torch.eye(sim.shape[0], dtype=torch.bool, device=sim.device))
@@ -311,29 +606,25 @@ def _compute_diagnostics(
 
 def _compute_teacher_baseline_losses(
     *,
-    teacher_cache: torch.Tensor,
-    teacher_labels: torch.Tensor | None,
+    teacher_store,
     teacher_batch_size: int,
     mmd_subsample: int,
     target_device: str | torch.device,
+    target_dtype: torch.dtype,
 ) -> dict[str, torch.Tensor]:
     """Teacher-vs-teacher baseline used to contextualize non-zero distribution losses."""
-    if teacher_cache.shape[0] == 0:
+    if teacher_store.num_samples == 0:
         return {}
-    ref_batch_size = min(teacher_batch_size, teacher_cache.shape[0])
-    ref_indices_a = torch.randint(0, teacher_cache.shape[0], (ref_batch_size,), device="cpu")
-    ref_indices_b = torch.randint(0, teacher_cache.shape[0], (ref_batch_size,), device="cpu")
-    ref_batch_a = teacher_cache.index_select(0, ref_indices_a).to(target_device)
-    ref_batch_b = teacher_cache.index_select(0, ref_indices_b).to(target_device)
-    ref_labels_a = (
-        teacher_labels.index_select(0, ref_indices_a).to(target_device)
-        if teacher_labels is not None
-        else None
+    ref_batch_size = min(teacher_batch_size, teacher_store.num_samples)
+    ref_batch_a, ref_labels_a, _, _ = teacher_store.sample_random(
+        ref_batch_size,
+        target_device=target_device,
+        target_dtype=target_dtype,
     )
-    ref_labels_b = (
-        teacher_labels.index_select(0, ref_indices_b).to(target_device)
-        if teacher_labels is not None
-        else None
+    ref_batch_b, ref_labels_b, _, _ = teacher_store.sample_random(
+        ref_batch_size,
+        target_device=target_device,
+        target_dtype=target_dtype,
     )
     ref_losses = _compute_losses(
         ref_batch_a,
@@ -580,8 +871,10 @@ def _build_output_payload(
             "position_ids_strategy": "frozen_from_init_teacher_samples",
             "train_steps": args.train_steps,
             "teacher_batch_size": args.teacher_batch_size,
+            "teacher_pool_size": args.teacher_pool_size,
             "lr": args.lr,
             "resume_from": args.resume_from,
+            "wandb_every_n_steps": args.wandb_every_n_steps,
             "loss_weights": {
                 "mmd": args.lambda_mmd,
                 "cov": args.lambda_cov,
@@ -646,6 +939,21 @@ def _save_payload(
     return payload
 
 
+def _prune_saved_pt_paths(saved_paths: list[str], *, max_keep: int) -> list[str]:
+    if max_keep <= 0:
+        max_keep = 1
+    retained: list[str] = []
+    for path in saved_paths:
+        if path not in retained:
+            retained.append(path)
+    while len(retained) > max_keep:
+        stale_path = retained.pop(0)
+        if os.path.exists(stale_path):
+            os.remove(stale_path)
+            print(f"[representation_distill] Removed old checkpoint: {stale_path}", flush=True)
+    return retained
+
+
 def _assemble_full_synthetic_hidden(
     *,
     bank_params,
@@ -708,10 +1016,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="How many synthetic samples to use per optimization step. "
                              "0 means using all synthetic samples.")
     parser.add_argument("--teacher_batch_size", type=int, default=1024)
+    parser.add_argument(
+        "--teacher_pool_size",
+        type=int,
+        default=128,
+        help="For sharded teacher caches, keep only this many samples in the in-memory sampling pool.",
+    )
     parser.add_argument("--train_steps", type=int, default=2000)
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--train_dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--init_std", type=float, default=0.0)
     # Distribution-aware loss weights
     parser.add_argument("--lambda_mmd", type=float, default=1.0)
@@ -752,6 +1067,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mmd_subsample", type=int, default=2048,
                         help="Max tokens for kernel matrix computation.")
     parser.add_argument("--log_interval", type=int, default=100)
+    parser.add_argument(
+        "--wandb_every_n_steps",
+        type=int,
+        default=1,
+        help="Upload W&B metrics every N training steps. Set <=0 to log only the final step.",
+    )
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_run_name", type=str, default=None)
     parser.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"])
@@ -765,12 +1086,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_arg_parser().parse_args()
     ablation_notes = _apply_ablation_presets(args)
+    train_dtype = _parse_dtype(args.train_dtype)
     seed_everything(args.seed)
     ensure_dir(os.path.dirname(args.output_path))
     _log_stage(
         "Starting synthetic hidden distillation "
         f"(train_steps={args.train_steps}, synthetic_size={args.synthetic_size}, "
-        f"synthetic_batch_size={args.synthetic_batch_size}, teacher_batch_size={args.teacher_batch_size})."
+        f"synthetic_batch_size={args.synthetic_batch_size}, teacher_batch_size={args.teacher_batch_size}, "
+        f"train_dtype={args.train_dtype})."
     )
 
     wandb_run = None
@@ -795,9 +1118,11 @@ def main() -> None:
                 "synthetic_size": args.synthetic_size,
                 "synthetic_batch_size": args.synthetic_batch_size,
                 "teacher_batch_size": args.teacher_batch_size,
+                "teacher_pool_size": args.teacher_pool_size,
                 "train_steps": args.train_steps,
                 "lr": args.lr,
                 "seed": args.seed,
+                "train_dtype": args.train_dtype,
                 "init_std": args.init_std,
                 "lambda_mmd": args.lambda_mmd,
                 "lambda_cov": args.lambda_cov,
@@ -813,6 +1138,7 @@ def main() -> None:
                 "div_warmup_steps": args.div_warmup_steps,
                 "mmd_subsample": args.mmd_subsample,
                 "log_interval": args.log_interval,
+                "wandb_every_n_steps": args.wandb_every_n_steps,
                 "model_name_or_path": args.model_name_or_path,
                 "device": args.device,
                 "ablation_notes": ablation_notes,
@@ -832,43 +1158,39 @@ def main() -> None:
 
     _log_stage(f"Loading teacher cache from {args.teacher_cache_path}.")
     cache_payload = _load_teacher_cache_payload(args.teacher_cache_path)
-    teacher_cache = cache_payload["teacher_cache"].float()
+    teacher_store = _build_teacher_cache_store(
+        args.teacher_cache_path,
+        cache_payload,
+        pool_size=args.teacher_pool_size,
+    )
     teacher_meta = cache_payload["metadata"]
-    teacher_labels = cache_payload.get("modality_labels", None)
-    teacher_position_ids = cache_payload.get("position_ids", None)
+    teacher_labels = getattr(teacher_store, "teacher_labels", None)
     _log_stage(
         "Loaded teacher cache "
-        f"shape={tuple(teacher_cache.shape)} dtype={teacher_cache.dtype}."
+        f"shape={teacher_store.shape}."
     )
     resume_payload = None
     if args.resume_from:
         _log_stage(f"Loading resume payload from {args.resume_from}.")
         resume_payload = torch.load(args.resume_from, map_location="cpu")
 
-    # 2) 在 CPU 上整理缓存，避免 GPU gather 产生巨额瞬时显存占用
+    # 2) 设备选择
     device = args.device
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    if teacher_position_ids is None:
-        teacher_position_ids = torch.arange(
-            teacher_cache.shape[1], dtype=torch.long
-        ).unsqueeze(0).expand(teacher_cache.shape[0], -1)
-    else:
-        _log_stage("Sorting teacher cache by position ids on CPU.")
-        teacher_position_ids = teacher_position_ids.to(dtype=torch.long)
-        teacher_cache, teacher_position_ids, teacher_labels = sort_sequence_by_position_ids(
-            teacher_cache,
-            teacher_position_ids,
-            teacher_labels,
+    if "shards" in cache_payload:
+        _log_stage(
+            "Using shard lazy sampling for teacher cache; shards will be loaded on demand "
+            f"(teacher_pool_size={args.teacher_pool_size})."
         )
-
-    _log_stage("Keeping teacher cache on CPU; batches will be moved to the training device on demand.")
+    else:
+        _log_stage("Keeping teacher cache on CPU; batches will be moved to the training device on demand.")
 
     resume_training_state = {}
     resume_start_step = 0
 
     if resume_payload is not None:
-        init_hidden = resume_payload["synthetic_hidden"].to(device=device, dtype=torch.float32)
+        init_hidden = resume_payload["synthetic_hidden"].to(device=device, dtype=train_dtype)
         init_position_ids = resume_payload["position_ids"].to(device=device, dtype=torch.long)
         synth_labels = resume_payload.get("modality_labels", None)
         if synth_labels is not None:
@@ -886,17 +1208,11 @@ def main() -> None:
             args.synthetic_batch_size = args.synthetic_size
     else:
         # 3) 初始化: 从教师缓存随机抽 synthetic_size 条序列作为可学习参数, 可选加高斯噪声
-        init_indices = torch.randint(0, teacher_cache.shape[0], (args.synthetic_size,), device="cpu")
-        init_hidden = teacher_cache.index_select(0, init_indices).clone().to(device)
-        init_position_ids = teacher_position_ids.index_select(0, init_indices).clone().to(
-            device=device,
-            dtype=torch.long,
+        init_hidden, synth_labels, init_position_ids, init_indices = teacher_store.sample_random(
+            args.synthetic_size,
+            target_device=device,
+            target_dtype=train_dtype,
         )
-
-        # 合成样本的模态标签与初始化样本一致, 训练过程中不更新
-        synth_labels = None
-        if teacher_labels is not None:
-            synth_labels = teacher_labels.index_select(0, init_indices).clone().to(device=device)  # not a Parameter
 
     bank_params, synth_template_labels_flat, synth_template_bank_indices_flat = _build_synthetic_banks(
         init_hidden=init_hidden,
@@ -913,6 +1229,7 @@ def main() -> None:
     )
     optimizer = torch.optim.Adam(list(bank_params.parameters()), lr=args.lr)
     history = []
+    saved_pt_paths: list[str] = []
     final_losses = None
     loss_ema_state: dict[str, torch.Tensor] | None = {} if args.use_ema_normalized_losses else None
 
@@ -961,9 +1278,21 @@ def main() -> None:
         )
 
     if args.lambda_block > 0:
-        raise ValueError(
-            "Cache-only distillation no longer loads the teacher model online, so "
-            "--lambda_block must be 0. Rebuild or rerun with --lambda_block 0."
+        block_constraint_layer = int(teacher_meta["teacher_layer"]) + 1
+        try:
+            teacher_store.fetch_next_block_indices(
+                teacher_anchor_indices[:1],
+                target_device=device,
+                target_dtype=train_dtype,
+            )
+        except KeyError as exc:
+            raise ValueError(
+                "Teacher cache does not contain cached `next_block_cache`, so "
+                "--lambda_block must be 0 or you need to rebuild the cache with "
+                "--cache_next_block_targets."
+            ) from exc
+        _log_stage(
+            f"Using cached next-block targets for block supervision (layer={block_constraint_layer})."
         )
 
     if wandb_run is not None and teacher_labels is not None and synth_labels is not None:
@@ -1010,12 +1339,10 @@ def main() -> None:
             hidden_size=init_hidden.shape[2],
         )
         # Sample a teacher batch
-        batch_indices = torch.randint(0, teacher_cache.shape[0], (args.teacher_batch_size,), device="cpu")
-        teacher_batch = teacher_cache.index_select(0, batch_indices).to(device)
-        teacher_batch_labels = (
-            teacher_labels.index_select(0, batch_indices).to(device)
-            if teacher_labels is not None
-            else None
+        teacher_batch, teacher_batch_labels, _, _ = teacher_store.sample_random(
+            args.teacher_batch_size,
+            target_device=device,
+            target_dtype=train_dtype,
         )
 
         # Per-modality grouped losses (primary). ``div`` stays pooled.
@@ -1031,6 +1358,19 @@ def main() -> None:
         div_scale = 1.0
         if args.div_warmup_steps > 0:
             div_scale = min(1.0, (step + 1) / float(args.div_warmup_steps))
+
+        if args.lambda_block > 0:
+            cached_teacher_target = teacher_store.fetch_next_block_indices(
+                teacher_anchor_indices.index_select(0, synth_batch_indices),
+                target_device=device,
+                target_dtype=train_dtype,
+            )
+            block_rel_l2 = _compute_cached_next_block_rel_l2(
+                cached_teacher_target=cached_teacher_target,
+                synthetic_hidden=synthetic_hidden,
+                synthetic_attention_mask=synth_batch_attention_mask,
+            )
+            losses["block_rel_l2"] = block_rel_l2
 
         total_loss, weighted_terms, normalized_terms = _compute_weighted_total_loss(
             args=args,
@@ -1079,11 +1419,11 @@ def main() -> None:
                 final_losses[k] = float(v.detach().cpu().item())
 
             teacher_baseline = _compute_teacher_baseline_losses(
-                teacher_cache=teacher_cache,
-                teacher_labels=teacher_labels,
+                teacher_store=teacher_store,
                 teacher_batch_size=teacher_batch.shape[0],
                 mmd_subsample=args.mmd_subsample,
                 target_device=device,
+                target_dtype=train_dtype,
             )
             for k, v in teacher_baseline.items():
                 final_losses[k] = float(v.detach().cpu().item())
@@ -1095,7 +1435,17 @@ def main() -> None:
                         final_losses[key] / max(final_losses[baseline_key], 1e-8)
                     )
 
-        if wandb_run is not None:
+        should_log_wandb = (
+            wandb_run is not None
+            and (
+                step == total_target_steps - 1
+                or (
+                    args.wandb_every_n_steps > 0
+                    and step % args.wandb_every_n_steps == 0
+                )
+            )
+        )
+        if should_log_wandb:
             wandb_payload = {
                 "step": step,
                 "loss/total": final_losses["total"],
@@ -1165,6 +1515,8 @@ def main() -> None:
                     teacher_anchor_indices=teacher_anchor_indices,
                 ),
             )
+            saved_pt_paths.append(checkpoint_path)
+            saved_pt_paths = _prune_saved_pt_paths(saved_pt_paths, max_keep=2)
             print(f"[representation_distill] Saved checkpoint: {checkpoint_path}")
 
     synthetic_hidden = _assemble_full_synthetic_hidden(
@@ -1193,6 +1545,8 @@ def main() -> None:
             teacher_anchor_indices=teacher_anchor_indices,
         ),
     )
+    saved_pt_paths.append(args.output_path)
+    saved_pt_paths = _prune_saved_pt_paths(saved_pt_paths, max_keep=2)
     print(f"[representation_distill] Saved synthetic calibration hidden to {args.output_path}")
     if wandb_run is not None:
         wandb_run.summary.update(

@@ -5,7 +5,7 @@ PREFIX="${PREFIX:-$(pwd)}"
 BASE_SCRIPT="${BASE_SCRIPT:-${PREFIX}/scripts/data_distill/run_distill_compact_hidden.sh}"
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 # HIDDEN_PAYLOAD_PATH="${HIDDEN_PAYLOAD_PATH:-${PREFIX}/storage/data_distill_kimi/gqa-sample_at1.0-latest/teacher_hidden.pt}"
-HIDDEN_PAYLOAD_PATH="${HIDDEN_PAYLOAD_PATH:-storage/data_distill_kimi/mixed-num_1024-token_2048-sample_at1.0-0423143941/teacher_hidden.pt}"
+HIDDEN_PAYLOAD_PATH="${HIDDEN_PAYLOAD_PATH:-storage/data_distill_kimi/mixed-num_1024-token_2048-sample_at1.0-0424161212/teacher_hidden.pt}"
 WANDB_PROJECT="${WANDB_PROJECT:-maes}"
 WANDB_MODE="${WANDB_MODE:-online}"
 ABLATION_SUITE="${ABLATION_SUITE:-all}"  # all | diversity | distribution
@@ -43,7 +43,7 @@ if [[ "${ABLATION_SUITE}" == "all" || "${ABLATION_SUITE}" == "diversity" ]]; the
 fi
 
 if [[ "${ABLATION_SUITE}" == "all" || "${ABLATION_SUITE}" == "distribution" ]]; then
-    run_case "distribution" "full" "full" "full"
+    # run_case "distribution" "full" "full" "full"
     run_case "distribution" "moment_only" "full" "moment_only"
     run_case "distribution" "mmd_only" "full" "mmd_only"
 fi

@@ -40,15 +40,17 @@ export SCORES_PATH="${SCORES_PATH:-}"
 
 NUM_SAMPLES="${NUM_SAMPLES:-0}"
 USE_LMMS_EVAL=${USE_LMMS_EVAL:-0}
+
 # ── Task grid ──────────────────────────────────────────────────────────────────
 # All 14 tasks requested; override via SWEEP_TASKS env var.
-SWEEP_TASKS="${SWEEP_TASKS:-gqa textvqa chartqa mmstar mmbench mme realworldqa coco2017cap longvideobench}"
+SWEEP_TASKS="${SWEEP_TASKS:-textvqa chartqa gqa mmstar mmbench mme realworldqa coco2017cap longvideobench}"
 # mmvet video_mmmu videomme mvbench egoschema
 # ── Setting grids (same defaults as sweep_prune_eval_kimi_gqa.sh) ──────────────
-SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform}"
+SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform_coverage}"
 SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-second_attr_coverage}"
-SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-0 1}"
-SMOOTH_FN="${SMOOTH_FN:-sqrt}"
+SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-1}"
+NORMALIZE="${NORMALIZE:-0}"
+SMOOTH_FN="${SMOOTH_FN:-cbrt}" # sqrt cbrt fourth_root log
 SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act}"
 # 3proj_second_order down_saliency 3proj_saliency 3proj_grad wg
 
@@ -86,7 +88,7 @@ else
     qwen3.5-35b-a3b) export MODEL_PATH="Qwen/Qwen3.5-35B-A3B" ;;
   esac
 fi
-SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-mixed-num_342-token_2048-sample_at1.0-0421175527-teacher"  # -${SWEEP_TS}
+SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-mixed-num_342-token_2048-sample_at1.0-0421175527-teacher-normalize-max"  # -${SWEEP_TS}
 export OUTPUT_DIR="${SWEEP_BASE}"
 
 if [[ -d "${SWEEP_BASE}" ]]; then
@@ -140,8 +142,8 @@ echo "SUMMARY_FILE has been created: ${SUMMARY_FILE}"
   echo ""
   echo "SCORES_PATH: \`${SCORES_PATH}\`"
   echo ""
-  echo "| # | task | inter_method | intra_method | modality_aware | intra_expert_metric | smooth_fn | metric | detail | status | log |"
-  echo "|---|------|--------------|--------------|----------------|---------------------|-----------|--------|--------|--------|-----|"
+  echo "| # | task | inter_method | intra_method | modality_aware | normalize | intra_expert_metric | smooth_fn | metric | detail | status | log |"
+  echo "|---|------|--------------|--------------|----------------|----------------|---------------------|-----------|--------|--------|--------|-----|"
 } >> "${SUMMARY_FILE}"
 
 # ── Main sweep ─────────────────────────────────────────────────────────────────
@@ -175,6 +177,7 @@ for TASK in ${SWEEP_TASKS}; do
             INTER_METHOD="${INTER_METHOD}" \
             INTRA_METHOD="${INTRA_METHOD}" \
             MODALITY_AWARE="${MODALITY_AWARE}" \
+            NORMALIZE="${NORMALIZE}" \
             INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC}" \
             SMOOTH_FN="${SMOOTH_FN}" \
             MODEL_NAME="${MODEL_NAME}" \
@@ -214,7 +217,7 @@ for TASK in ${SWEEP_TASKS}; do
 
           REL_LOG="logs/$(basename "${RUN_LOG}")"
           {
-            echo "| ${RUN_IDX} | ${TASK} | ${INTER_METHOD} | ${INTRA_METHOD} | ${MODALITY_AWARE} | ${INTRA_EXPERT_METRIC} | ${SMOOTH_FN} | ${METRIC_VAL:-—} | ${METRIC_DETAIL:-—} | ${STATUS} | \`${REL_LOG}\` |"
+            echo "| ${RUN_IDX} | ${TASK} | ${INTER_METHOD} | ${INTRA_METHOD} | ${MODALITY_AWARE} | ${NORMALIZE} | ${INTRA_EXPERT_METRIC} | ${SMOOTH_FN} | ${METRIC_VAL:-—} | ${METRIC_DETAIL:-—} | ${STATUS} | \`${REL_LOG}\` |"
           } >> "${SUMMARY_FILE}"
 
         done

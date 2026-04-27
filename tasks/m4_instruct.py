@@ -356,7 +356,7 @@ def m4_instruct_transform(batch):
         batch["org_text"],
     ):
         images = [_load_image_from_zip(p) for p in image_paths]
-        processed_visuals.extend(images)
+        processed_visuals.append(images)
         processed_frames.append(num_images)
         processed_texts.append(question)
         processed_answers.append(answer)

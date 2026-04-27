@@ -58,8 +58,6 @@ def build_modality_budget_masks(
 
     for lid in range(L):
         for eid in range(E):
-            # if eid == E-1:
-            #     import ipdb; ipdb.set_trace()
                 
             t = text_scores[lid, eid].float().clamp_min(0.0)
             v = visual_scores[lid, eid].float().clamp_min(0.0)

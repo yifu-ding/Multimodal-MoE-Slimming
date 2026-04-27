@@ -1,34 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
-source scripts/select_least_used_gpu.sh # 自动选择显存使用量最少的 gpu
+source scripts/select_least_used_gpu.sh
 
 PREFIX="${PREFIX:-$(pwd)}"
 export PYTHONPATH="${PREFIX}"
 export HF_HOME="${HF_HOME:-/home/data/dyf/hf_cache}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
-HIDDEN_PAYLOAD_PATH="${HIDDEN_PAYLOAD_PATH:-${PREFIX}/storage/data_distill_kimi/gqa-sample_at1.0-latest/teacher_hidden.pt}"
 RUN_STAMP="${RUN_STAMP:-$(date +%m%d%H%M%S)}"
 OUTPUT_PATH="${OUTPUT_PATH:-}"
-LATEST_DISTILLED_LINK_DIR="${LATEST_DISTILLED_LINK_DIR:-$(dirname "${HIDDEN_PAYLOAD_PATH}")/distilled-latest}"
+LATEST_DISTILLED_LINK_DIR="${LATEST_DISTILLED_LINK_DIR:-${PREFIX}/storage/data_distill_kimi/online-distilled-latest}"
 
-# 合成集规模：之前 256 对 2048d 分布的 MMD / cov 估计偏紧，放大到 512
-SYNTHETIC_SIZE="${SYNTHETIC_SIZE:-1024}"  # 总规模
-SYNTHETIC_BATCH_SIZE="${SYNTHETIC_BATCH_SIZE:-64}"  # 每次优化用的 batch 规模
+TEACHER_LAYER="${TEACHER_LAYER:-0}"
+COMPRESSED_LENGTH="${COMPRESSED_LENGTH:-64}"
+COMPRESSION_MODE="${COMPRESSION_MODE:-sample}"
+MODALITY_AWARE_COMPRESSION="${MODALITY_AWARE_COMPRESSION:-0}"
+ATTN_TEMPERATURE="${ATTN_TEMPERATURE:-1.0}"
+
+TEACHER_DATASETS=(${TEACHER_DATASETS:-gqa coco m4_instruct})
+SAMPLES_PER_DATASET="${SAMPLES_PER_DATASET:-1024}"
+INPUT_BATCH_SIZE="${INPUT_BATCH_SIZE:-2}"
 TEACHER_BATCH_SIZE="${TEACHER_BATCH_SIZE:-64}"
+TOKEN_PER_SAMPLE="${TOKEN_PER_SAMPLE:-2048}"
+NUM_VIDEO_FRAMES="${NUM_VIDEO_FRAMES:-8}"
+VIDEO_MAX_LONG_SIDE="${VIDEO_MAX_LONG_SIDE:-480}"
 
-# 之前 2000 步明显没收敛（history 首尾 mmd/cov/mean/var 都还在上升）
+SYNTHETIC_SIZE="${SYNTHETIC_SIZE:-1024}"
+SYNTHETIC_BATCH_SIZE="${SYNTHETIC_BATCH_SIZE:-64}"
 TRAIN_STEPS="${TRAIN_STEPS:-8000}"
-# 权重改大、步数增多后，lr 1e-2 容易震荡；调小到 5e-3
 LR="${LR:-5e-3}"
 INIT_STD="${INIT_STD:-0.0}"
 
-# 新 loss 权重：
-#   - mmd / cov / mean / var 现在是按 modality(text/image/video) 分组再平均，
-#     所以 visual token 不会再"主导"损失，整体梯度会更均衡；
-#   - cov 之前是全部指标里偏离最大的一项，权重从 0.1 → 0.5；
-#   - div 在 loss 首尾实际 dominate 了优化器（其它项都在涨），权重 0.1 → 0.02，
-#     并配合 warmup 避免前期扰动。
 LAMBDA_MMD="${LAMBDA_MMD:-1.0}"
 LAMBDA_COV="${LAMBDA_COV:-2.0}"
 LAMBDA_DIV="${LAMBDA_DIV:-0.002}"
@@ -38,17 +40,14 @@ LAMBDA_BLOCK="${LAMBDA_BLOCK:-0.25}"
 
 USE_EMA_NORMALIZED_LOSSES="${USE_EMA_NORMALIZED_LOSSES:-1}"
 LOSS_EMA_DECAY="${LOSS_EMA_DECAY:-0.99}"
-RESUME_FROM="${RESUME_FROM:-}"
-RESET_OPTIMIZER_ON_RESUME="${RESET_OPTIMIZER_ON_RESUME:-0}"
-
-# 前 N 步把 lambda_div 从 0 线性提升到设定值，避免 div 在早期把合成 token 吹散
 DIV_WARMUP_STEPS="${DIV_WARMUP_STEPS:-0}"
 MMD_SUBSAMPLE="${MMD_SUBSAMPLE:-2048}"
-
 LOG_INTERVAL="${LOG_INTERVAL:-100}"
-CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-100}"  # 等于 0 则无中间 ckpt
+CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-100}"
 
 SEED="${SEED:-42}"
+SUBSET_SEED="${SUBSET_SEED:-42}"
+SHUFFLE_SEED="${SHUFFLE_SEED:-1234}"
 TRAIN_DEVICE="${TRAIN_DEVICE:-cuda}"
 TRAIN_DTYPE="${TRAIN_DTYPE:-bfloat16}"
 ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
@@ -60,23 +59,36 @@ WANDB_EVERY_N_STEPS="${WANDB_EVERY_N_STEPS:-10}"
 DIVERSITY_ABLATION="${DIVERSITY_ABLATION:-full}"
 DISTRIBUTION_ABLATION="${DISTRIBUTION_ABLATION:-full}"
 ABLATION_TAG="div-${DIVERSITY_ABLATION}_dist-${DISTRIBUTION_ABLATION}"
-WANDB_RUN_NAME="${WANDB_RUN_NAME:-distilled-${RUN_STAMP}-${ABLATION_TAG}}"
-OUTPUT_PATH="${OUTPUT_PATH:-$(dirname "${HIDDEN_PAYLOAD_PATH}")/distilled-${RUN_STAMP}-${ABLATION_TAG}/distilled_hidden.pt}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-online-distilled-${RUN_STAMP}-${ABLATION_TAG}}"
+OUTPUT_PATH="${OUTPUT_PATH:-${PREFIX}/storage/data_distill_kimi/online-distilled-${RUN_STAMP}-${ABLATION_TAG}/distilled_hidden.pt}"
 
 EXTRA_ARGS=("$@")
 
 CMD=(
-    python -m src.calibration.representation_distill.distill_synthetic_hidden
-    --teacher_cache_path "${HIDDEN_PAYLOAD_PATH}"
-    --output_path "${OUTPUT_PATH}"
+    python -m src.calibration.representation_distill.distill_synthetic_hidden_online
     --model_name_or_path "${MODEL_PATH}"
+    --output_path "${OUTPUT_PATH}"
+    --teacher_layer "${TEACHER_LAYER}"
+    --compressed_length "${COMPRESSED_LENGTH}"
+    --compression_mode "${COMPRESSION_MODE}"
+    --attn_temperature "${ATTN_TEMPERATURE}"
+    --samples_per_dataset "${SAMPLES_PER_DATASET}"
+    --teacher_datasets "${TEACHER_DATASETS[@]}"
+    --batch_size "${INPUT_BATCH_SIZE}"
+    --teacher_batch_size "${TEACHER_BATCH_SIZE}"
     --synthetic_size "${SYNTHETIC_SIZE}"
     --synthetic_batch_size "${SYNTHETIC_BATCH_SIZE}"
-    --teacher_batch_size "${TEACHER_BATCH_SIZE}"
     --train_steps "${TRAIN_STEPS}"
     --lr "${LR}"
     --seed "${SEED}"
+    --subset_seed "${SUBSET_SEED}"
+    --shuffle_seed "${SHUFFLE_SEED}"
+    --num_video_frames "${NUM_VIDEO_FRAMES}"
+    --video_max_long_side "${VIDEO_MAX_LONG_SIDE}"
+    --token_per_sample "${TOKEN_PER_SAMPLE}"
     --device "${TRAIN_DEVICE}"
+    --device_map "${DEVICE_MAP}"
+    --attn_implementation "${ATTN_IMPL}"
     --train_dtype "${TRAIN_DTYPE}"
     --init_std "${INIT_STD}"
     --lambda_mmd "${LAMBDA_MMD}"
@@ -90,8 +102,6 @@ CMD=(
     --div_warmup_steps "${DIV_WARMUP_STEPS}"
     --mmd_subsample "${MMD_SUBSAMPLE}"
     --log_interval "${LOG_INTERVAL}"
-    --attn_implementation "${ATTN_IMPL}"
-    --device_map "${DEVICE_MAP}"
     --wandb_every_n_steps "${WANDB_EVERY_N_STEPS}"
     --wandb_project "${WANDB_PROJECT}"
     --wandb_run_name "${WANDB_RUN_NAME}"
@@ -100,34 +110,32 @@ CMD=(
     --checkpoint_interval "${CHECKPOINT_INTERVAL}"
 )
 
+if [[ "${MODALITY_AWARE_COMPRESSION}" == "1" ]]; then
+    CMD+=(--modality_aware_compression)
+fi
+
 if [[ "${USE_EMA_NORMALIZED_LOSSES}" == "1" ]]; then
     CMD+=(--use_ema_normalized_losses)
 fi
 
-if [[ -n "${RESUME_FROM}" ]]; then
-    CMD+=(--resume_from "${RESUME_FROM}")
-fi
-
-if [[ "${RESET_OPTIMIZER_ON_RESUME}" == "1" ]]; then
-    CMD+=(--reset_optimizer_on_resume)
-fi
-
 CMD+=("${EXTRA_ARGS[@]}")
 
-echo "Teacher cache   : ${HIDDEN_PAYLOAD_PATH}"
 echo "Model           : ${MODEL_PATH}"
 echo "Output          : ${OUTPUT_PATH}"
+echo "Teacher layer   : ${TEACHER_LAYER}"
+echo "Teacher data    : ${TEACHER_DATASETS[*]}"
+echo "Samples/dataset : ${SAMPLES_PER_DATASET}"
+echo "Input batch     : ${INPUT_BATCH_SIZE}"
+echo "Teacher batch   : ${TEACHER_BATCH_SIZE}"
 echo "Synthetic M     : ${SYNTHETIC_SIZE}"
 echo "Synthetic batch : ${SYNTHETIC_BATCH_SIZE}"
 echo "Train steps     : ${TRAIN_STEPS}"
 echo "LR              : ${LR}"
 echo "Train dtype     : ${TRAIN_DTYPE}"
-echo "Lambdas         : mmd=${LAMBDA_MMD}  cov=${LAMBDA_COV}  mean=${LAMBDA_MEAN}  var=${LAMBDA_VAR}  div=${LAMBDA_DIV}  block=${LAMBDA_BLOCK} (warmup=${DIV_WARMUP_STEPS})"
-echo "Ablation        : diversity=${DIVERSITY_ABLATION}  distribution=${DISTRIBUTION_ABLATION}"
-echo "Resume          : from=${RESUME_FROM:-<none>}  reset_optimizer=${RESET_OPTIMIZER_ON_RESUME}"
-echo "Loss norm       : ema_normalized=${USE_EMA_NORMALIZED_LOSSES}  ema_decay=${LOSS_EMA_DECAY}"
-echo "Checkpoint      : every ${CHECKPOINT_INTERVAL} step(s)"
-echo "Wandb           : project=${WANDB_PROJECT}  run=${WANDB_RUN_NAME}  mode=${WANDB_MODE}  every ${WANDB_EVERY_N_STEPS} step(s)"
+echo "Compression     : mode=${COMPRESSION_MODE} modality_aware=${MODALITY_AWARE_COMPRESSION} length=${COMPRESSED_LENGTH}"
+echo "Lambdas         : mmd=${LAMBDA_MMD} cov=${LAMBDA_COV} mean=${LAMBDA_MEAN} var=${LAMBDA_VAR} div=${LAMBDA_DIV} block=${LAMBDA_BLOCK}"
+echo "Ablation        : diversity=${DIVERSITY_ABLATION} distribution=${DISTRIBUTION_ABLATION}"
+echo "Wandb           : project=${WANDB_PROJECT} run=${WANDB_RUN_NAME} mode=${WANDB_MODE} every ${WANDB_EVERY_N_STEPS} step(s)"
 echo "HF_HOME         : ${HF_HOME}"
 echo "Device map      : ${DEVICE_MAP}"
 echo "Train device    : ${TRAIN_DEVICE}"

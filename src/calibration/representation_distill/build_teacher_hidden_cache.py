@@ -235,6 +235,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     # 前向时的 DataLoader batch, 与蒸馏里的 teacher_batch_size 含义不同
     parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument(
+        "--samples_per_shard",
+        type=int,
+        default=64,
+        help="Accumulate this many extracted samples before writing one cache shard.",
+    )
     parser.add_argument("--token_per_sample", type=int, default=2048)
     parser.add_argument("--subset_seed", type=int, default=42)
     parser.add_argument("--seed", type=int, default=42)
@@ -319,12 +325,48 @@ def main() -> None:
     teacher_dtype = None
     sample_generator = torch.Generator()
     sample_generator.manual_seed(args.seed)
+    shard_hidden_buffer: List[torch.Tensor] = []
+    shard_label_buffer: List[torch.Tensor] = []
+    shard_position_buffer: List[torch.Tensor] = []
+    shard_next_block_buffer: List[torch.Tensor] = []
+    buffered_samples = 0
+
+    def _flush_shard_buffer(shard_idx: int) -> int:
+        nonlocal buffered_samples, total_samples
+        if buffered_samples == 0:
+            return shard_idx
+        shard_teacher_cache = torch.cat(shard_hidden_buffer, dim=0)
+        shard_modality_labels = torch.cat(shard_label_buffer, dim=0)
+        shard_position_ids = torch.cat(shard_position_buffer, dim=0)
+        shard_next_block_cache = (
+            torch.cat(shard_next_block_buffer, dim=0)
+            if shard_next_block_buffer
+            else None
+        )
+        shard_manifest.append(
+            _write_cache_shard(
+                shard_dir=shard_dir,
+                shard_idx=shard_idx,
+                teacher_cache=shard_teacher_cache,
+                modality_labels=shard_modality_labels,
+                position_ids=shard_position_ids,
+                next_block_cache=shard_next_block_cache,
+            )
+        )
+        total_samples += int(shard_teacher_cache.shape[0])
+        shard_hidden_buffer.clear()
+        shard_label_buffer.clear()
+        shard_position_buffer.clear()
+        shard_next_block_buffer.clear()
+        buffered_samples = 0
+        return shard_idx + 1
 
     # attention_weighted 压缩需要从 forward 里拿到 token 重要性
     need_attn = args.compression_mode == "attention_weighted"
 
     total_samples = 0
-    for shard_idx, batch in enumerate(tqdm(loader, desc="Extracting teacher cache", leave=False)):
+    shard_idx = 0
+    for batch in tqdm(loader, desc="Extracting teacher cache", leave=False):
         inputs = prepare_raw_batch_inputs(bundle, batch)
         inputs = move_inputs_to_model_device(bundle.model, inputs)
         compression_masks = None
@@ -372,17 +414,14 @@ def main() -> None:
             shard_next_block_cache = next_block_hidden.to(dtype=save_dtype).cpu()
         shard_modality_labels = result.modality_labels.cpu()
         shard_position_ids = result.position_ids.cpu()
-        shard_manifest.append(
-            _write_cache_shard(
-                shard_dir=shard_dir,
-                shard_idx=shard_idx,
-                teacher_cache=shard_teacher_cache,
-                modality_labels=shard_modality_labels,
-                position_ids=shard_position_ids,
-                next_block_cache=shard_next_block_cache,
-            )
-        )
-        total_samples += int(shard_teacher_cache.shape[0])
+        shard_hidden_buffer.append(shard_teacher_cache)
+        shard_label_buffer.append(shard_modality_labels)
+        shard_position_buffer.append(shard_position_ids)
+        if shard_next_block_cache is not None:
+            shard_next_block_buffer.append(shard_next_block_cache)
+        buffered_samples += int(shard_teacher_cache.shape[0])
+        if buffered_samples >= args.samples_per_shard:
+            shard_idx = _flush_shard_buffer(shard_idx)
         dataset_ids.extend(int(sample["dataset_id"]) for sample in batch)
         sample_manifest.extend(build_sample_manifest(batch))
         del inputs, extraction, result, shard_teacher_cache, shard_modality_labels, shard_position_ids
@@ -390,6 +429,8 @@ def main() -> None:
             del shard_next_block_cache, next_block_hidden
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    shard_idx = _flush_shard_buffer(shard_idx)
 
     # 3) 写入 manifest payload；真实 cache 已经按 shard 落盘
     _mode_suffix = "modality_aware_" if args.modality_aware_compression else "uniform_"
@@ -430,6 +471,7 @@ def main() -> None:
             "shuffle_seed": args.shuffle_seed,
             "attn_temperature": args.attn_temperature if need_attn else None,
             "cache_next_block_targets": bool(args.cache_next_block_targets),
+            "samples_per_shard": args.samples_per_shard,
             "shard_dir": os.path.basename(shard_dir),
             "created_at": utc_now_iso(),
         },

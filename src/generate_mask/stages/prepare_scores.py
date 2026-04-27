@@ -94,7 +94,7 @@ def prepare_scores(
                 dim=(1, 2), keepdim=True
             ).clamp_min(1e-12)
         intermediate_scores = (modality_scores["text"] + modality_scores["visual"]) / 2.0
-        _print("[prepare_scores] intermediate_scores is mean of text and visual scores")
+        _print(f"[prepare_scores] intermediate_scores is mean of text and visual scores, normalize={normalize}")
         L, E, I = intermediate_scores.shape
         intermediate_scores = (intermediate_scores, modality_scores)
     else:
