@@ -406,6 +406,7 @@ def load_model_bundle(
     *,
     device_map: str = "auto",
     attn_implementation: str = "flash_attention_2",
+    max_decoder_layer: int | None = None,
 ) -> ModelBundle:
     resolved_name_or_path = resolve_model_name_or_path(model_name_or_path)
     family = infer_model_family(model_name_or_path)
@@ -425,6 +426,7 @@ def load_model_bundle(
         model, processor = load_kimi_model(resolved_name_or_path,
                                             device_map=device_map,
                                             attn_implementation=attn_implementation,
+                                            max_decoder_layer=max_decoder_layer,
                                            )
         model_config = {
             "family": family,
@@ -529,6 +531,7 @@ def prepare_inputs(
 ) -> Dict[str, torch.Tensor]:
     processor = bundle.processor
     supports_vision = bool(bundle.model_config.get("supports_vision", True))
+    normalized_dataset = normalize_dataset_name(dataset_name)
     if bundle.family == "deepseek_vl":
         packed = []
         for i, text in enumerate(batch["model_input_org_text"]):
@@ -563,9 +566,29 @@ def prepare_inputs(
             batched.images_seq_mask = batched.images_seq_mask.bool()
         return batched
 
-    batched_messages = [
-        bundle.text_to_message(text) for text in batch["model_input_org_text"]
-    ]
+    batched_messages = []
+    for i, text in enumerate(batch["model_input_org_text"]):
+        if (
+            bundle.family == "qwen3"
+            and supports_vision
+            and normalized_dataset in ("video_mmmu", "m4_instruct")
+        ):
+            visuals = batch["model_input_visual"][i]
+            if not isinstance(visuals, list):
+                visuals = [visuals]
+            batched_messages.append(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            *({"type": "image", "image": "path/to/image"} for _ in visuals),
+                            {"type": "text", "text": text},
+                        ],
+                    }
+                ]
+            )
+        else:
+            batched_messages.append(bundle.text_to_message(text))
     if supports_vision:
         batched_messages = processor.apply_chat_template(
             batched_messages, add_generation_prompt=True, return_tensors="pt"
@@ -580,19 +603,20 @@ def prepare_inputs(
             batched_messages[i] + batch["model_input_full_answer"][i]
         )
         batched_messages[i] = batched_messages[i] + bundle.model_config["eos_token"]
-        if dataset_name in ("video_mmmu", "m4_instruct"):
+        if normalized_dataset in ("video_mmmu", "m4_instruct"):
             tmp.extend(batch["model_input_visual"][i])
-            frame_num = batch["model_input_frames"][i]
-            media_end_idx = batched_messages[i].find(
-                "<|media_start|>image<|media_content|><|media_pad|><|media_end|>"
-            )
-            batched_messages[i] = (
-                batched_messages[i][:media_end_idx]
-                + "<|media_start|>image<|media_content|><|media_pad|><|media_end|>"
-                * (frame_num - 1)
-                + batched_messages[i][media_end_idx:]
-            )
-    if supports_vision and dataset_name in ("video_mmmu", "m4_instruct"):
+            if bundle.family != "qwen3":
+                frame_num = batch["model_input_frames"][i]
+                media_end_idx = batched_messages[i].find(
+                    "<|media_start|>image<|media_content|><|media_pad|><|media_end|>"
+                )
+                batched_messages[i] = (
+                    batched_messages[i][:media_end_idx]
+                    + "<|media_start|>image<|media_content|><|media_pad|><|media_end|>"
+                    * (frame_num - 1)
+                    + batched_messages[i][media_end_idx:]
+                )
+    if supports_vision and normalized_dataset in ("video_mmmu", "m4_instruct"):
         batch["model_input_visual"] = tmp
     if supports_vision:
         inputs = processor(

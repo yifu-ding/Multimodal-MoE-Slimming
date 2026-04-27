@@ -28,6 +28,7 @@ from src.calibration.representation_distill.common import (
     compress_hidden_states,
     ensure_dir,
     extract_block_output,
+    get_decoder_layer,
     get_hidden_size,
     get_num_decoder_layers,
     move_inputs_to_model_device,
@@ -35,6 +36,7 @@ from src.calibration.representation_distill.common import (
     seed_everything,
     utc_now_iso,
 )
+from src.calibration.representation_distill.runtime.forward_from_hidden import forward_from_hidden
 from src.calibration.representation_distill.runtime.dump_original_data import (
     SUPPORTED_DATASETS,
     dump_original_data,
@@ -150,6 +152,40 @@ def _assert_cuda_runtime_compat(device_map: str) -> None:
     )
 
 
+def _build_shard_dir(output_path: str) -> str:
+    return os.path.join(
+        os.path.dirname(output_path),
+        f"{os.path.splitext(os.path.basename(output_path))[0]}_shards",
+    )
+
+
+def _write_cache_shard(
+    *,
+    shard_dir: str,
+    shard_idx: int,
+    teacher_cache: torch.Tensor,
+    modality_labels: torch.Tensor,
+    position_ids: torch.Tensor,
+    next_block_cache: torch.Tensor | None,
+) -> dict:
+    ensure_dir(shard_dir)
+    shard_name = f"shard_{shard_idx:06d}.pt"
+    shard_path = os.path.join(shard_dir, shard_name)
+    shard_payload = {
+        "teacher_cache": teacher_cache,
+        "modality_labels": modality_labels,
+        "position_ids": position_ids,
+        "num_samples": int(teacher_cache.shape[0]),
+    }
+    if next_block_cache is not None:
+        shard_payload["next_block_cache"] = next_block_cache
+    torch.save(shard_payload, shard_path)
+    return {
+        "path": os.path.join(os.path.basename(shard_dir), shard_name),
+        "num_samples": int(teacher_cache.shape[0]),
+    }
+
+
 # ---------------------------------------------------------------------------
 # CLI (命令行参数)
 # ---------------------------------------------------------------------------
@@ -207,6 +243,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video_max_long_side", type=int, default=480)
     # 写入磁盘的 teacher_cache 元素类型, 可与模型前向 dtype 不同以省空间
     parser.add_argument("--save_dtype", type=str, default="float32", choices=["float16", "bfloat16", "float32"])
+    parser.add_argument(
+        "--cache_next_block_targets",
+        action="store_true",
+        help=(
+            "Also cache the next decoder block output for the compressed teacher hidden states. "
+            "This lets distillation use block supervision without loading the teacher model online."
+        ),
+    )
     parser.add_argument("--device_map", type=str, default=None)
     parser.add_argument(
         "--attn_implementation",
@@ -235,11 +279,16 @@ def main() -> None:
         args.model_name_or_path,
         device_map=device_map,
         attn_implementation=args.attn_implementation,
+        max_decoder_layer=args.teacher_layer + (1 if args.cache_next_block_targets else 0),
     )
     num_layers = get_num_decoder_layers(bundle)
     if args.teacher_layer < 0 or args.teacher_layer >= num_layers:
         raise ValueError(
             f"Invalid teacher_layer={args.teacher_layer}; model has {num_layers} decoder layers."
+        )
+    if args.cache_next_block_targets and args.teacher_layer >= num_layers - 1:
+        raise ValueError(
+            "Cannot cache next-block targets for the final decoder layer because there is no subsequent block."
         )
 
     # 2) 从选定数据混合中导出原始样本列表 (路径, 文本等), 顺序已按脚本内逻辑固定
@@ -263,9 +312,8 @@ def main() -> None:
     )
 
     save_dtype = _parse_dtype(args.save_dtype)
-    cache_chunks = []
-    label_chunks = []
-    position_id_chunks = []
+    shard_dir = _build_shard_dir(args.output_path)
+    shard_manifest = []
     dataset_ids = []
     sample_manifest = []
     teacher_dtype = None
@@ -275,7 +323,8 @@ def main() -> None:
     # attention_weighted 压缩需要从 forward 里拿到 token 重要性
     need_attn = args.compression_mode == "attention_weighted"
 
-    for batch in tqdm(loader, desc="Extracting teacher cache", leave=False):
+    total_samples = 0
+    for shard_idx, batch in enumerate(tqdm(loader, desc="Extracting teacher cache", leave=False)):
         inputs = prepare_raw_batch_inputs(bundle, batch)
         inputs = move_inputs_to_model_device(bundle.model, inputs)
         compression_masks = None
@@ -301,23 +350,53 @@ def main() -> None:
             attn_importance=extraction.attn_importance,
             attn_temperature=args.attn_temperature,
         )
-        cache_chunks.append(result.hidden_states.to(dtype=save_dtype).cpu())
-        label_chunks.append(result.modality_labels.cpu())
-        position_id_chunks.append(result.position_ids.cpu())
+        shard_teacher_cache = result.hidden_states.to(dtype=save_dtype).cpu()
+        shard_next_block_cache = None
+        if args.cache_next_block_targets:
+            compressed_attention_mask = torch.ones(
+                result.hidden_states.shape[:2],
+                dtype=inputs["attention_mask"].dtype,
+                device=result.hidden_states.device,
+            )
+            next_block_layer = get_decoder_layer(bundle, args.teacher_layer + 1)
+            next_block_dtype = next(next_block_layer.parameters()).dtype
+            next_block_hidden = forward_from_hidden(
+                bundle=bundle,
+                hidden_states=result.hidden_states.to(dtype=next_block_dtype),
+                attention_mask=compressed_attention_mask,
+                start_layer=args.teacher_layer + 1,
+                end_layer=args.teacher_layer + 1,
+                position_ids=result.position_ids,
+                apply_final_norm=False,
+            )
+            shard_next_block_cache = next_block_hidden.to(dtype=save_dtype).cpu()
+        shard_modality_labels = result.modality_labels.cpu()
+        shard_position_ids = result.position_ids.cpu()
+        shard_manifest.append(
+            _write_cache_shard(
+                shard_dir=shard_dir,
+                shard_idx=shard_idx,
+                teacher_cache=shard_teacher_cache,
+                modality_labels=shard_modality_labels,
+                position_ids=shard_position_ids,
+                next_block_cache=shard_next_block_cache,
+            )
+        )
+        total_samples += int(shard_teacher_cache.shape[0])
         dataset_ids.extend(int(sample["dataset_id"]) for sample in batch)
         sample_manifest.extend(build_sample_manifest(batch))
+        del inputs, extraction, result, shard_teacher_cache, shard_modality_labels, shard_position_ids
+        if shard_next_block_cache is not None:
+            del shard_next_block_cache, next_block_hidden
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    # 3) 拼成完整张量与侧车信息, 写入 payload
-    teacher_cache = torch.cat(cache_chunks, dim=0)
-    modality_labels = torch.cat(label_chunks, dim=0)
-    position_ids = torch.cat(position_id_chunks, dim=0)
+    # 3) 写入 manifest payload；真实 cache 已经按 shard 落盘
     _mode_suffix = "modality_aware_" if args.modality_aware_compression else "uniform_"
     compression_mode_label = _mode_suffix + args.compression_mode
 
     payload = {
-        "teacher_cache": teacher_cache,
-        "modality_labels": modality_labels,
-        "position_ids": position_ids,
+        "shards": shard_manifest,
         "dataset_ids": torch.tensor(dataset_ids, dtype=torch.long),
         "sample_manifest": sample_manifest,
         "metadata": {
@@ -328,14 +407,16 @@ def main() -> None:
             "model_family": bundle.family,
             "teacher_layer": args.teacher_layer,
             "teacher_layer_type": "full_block_output",
+            "cached_next_block_layer": args.teacher_layer + 1 if args.cache_next_block_targets else None,
             "compressed_length": args.compressed_length,
             "compression_mode": compression_mode_label,
             "modality_lengths": modality_lengths,
             "hidden_size": get_hidden_size(bundle),
             "teacher_cache_dtype": str(save_dtype).replace("torch.", ""),
+            "next_block_cache_dtype": str(save_dtype).replace("torch.", "") if args.cache_next_block_targets else None,
             "teacher_model_output_dtype": teacher_dtype,
             "samples_per_dataset": args.samples_per_dataset,
-            "total_samples": int(teacher_cache.shape[0]),
+            "total_samples": total_samples,
             "token_per_sample": args.token_per_sample,
             "subset_seed": args.subset_seed,
             "dataset_id_to_name": {
@@ -348,6 +429,8 @@ def main() -> None:
             "video_max_long_side": args.video_max_long_side,
             "shuffle_seed": args.shuffle_seed,
             "attn_temperature": args.attn_temperature if need_attn else None,
+            "cache_next_block_targets": bool(args.cache_next_block_targets),
+            "shard_dir": os.path.basename(shard_dir),
             "created_at": utc_now_iso(),
         },
     }
