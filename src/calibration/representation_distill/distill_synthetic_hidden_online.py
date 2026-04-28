@@ -28,6 +28,7 @@ Loss 项 (详见 ``_compute_losses``): 按模态分组的 MMD / cov / mean / var
 import argparse
 import os
 import random
+import re
 import sys
 from typing import Dict, List, Sequence
 
@@ -167,6 +168,7 @@ def _build_output_payload(
     teacher_meta: dict,
     final_losses: dict[str, float] | None,
     history: list[dict],
+    training_state: dict | None,
 ) -> dict:
     # ``synthetic_hidden`` 已是 float32 CPU; ``metadata`` 记录超参与训练末期的标量 loss 历史
     payload = {
@@ -190,6 +192,7 @@ def _build_output_payload(
             "hidden_size": int(synthetic_hidden.shape[2]),
             "dtype": "float32",
             "lr": args.lr,
+            "resume_from": args.resume_from,
             "seed": args.seed,
             "train_dtype": args.train_dtype,
             "position_ids_strategy": "frozen_from_stream_init_samples",
@@ -204,6 +207,10 @@ def _build_output_payload(
             },
             "diversity_ablation": args.diversity_ablation,
             "distribution_ablation": args.distribution_ablation,
+            "use_ema_normalized_losses": args.use_ema_normalized_losses,
+            "loss_ema_decay": args.loss_ema_decay,
+            "checkpoint_interval": args.checkpoint_interval,
+            "max_checkpoints_to_keep": args.max_checkpoints_to_keep,
             "div_warmup_steps": args.div_warmup_steps,
             "mmd_subsample": args.mmd_subsample,
             "final_losses": final_losses,
@@ -211,6 +218,8 @@ def _build_output_payload(
             "created_at": utc_now_iso(),
         },
     }
+    if training_state is not None:
+        payload["training_state"] = training_state
     if synth_labels is not None:
         payload["modality_labels"] = synth_labels.detach().cpu()
     return payload
@@ -226,6 +235,7 @@ def _save_payload(
     teacher_meta: dict,
     final_losses: dict[str, float] | None,
     history: list[dict],
+    training_state: dict | None,
 ) -> dict:
     payload = _build_output_payload(
         synthetic_hidden=synthetic_hidden,
@@ -235,24 +245,78 @@ def _save_payload(
         teacher_meta=teacher_meta,
         final_losses=final_losses,
         history=history,
+        training_state=training_state,
     )
     torch.save(payload, output_path)
     return payload
 
 
 def _prune_saved_pt_paths(saved_paths: list[str], *, max_keep: int) -> list[str]:
-    if max_keep <= 0:
-        max_keep = 1
     retained: list[str] = []
     for path in saved_paths:
         if path not in retained:
             retained.append(path)
+    if max_keep <= 0:
+        return retained
     while len(retained) > max_keep:
         stale_path = retained.pop(0)
         if os.path.exists(stale_path):
             os.remove(stale_path)
             _log_stage(f"Removed old checkpoint: {stale_path}")
     return retained
+
+
+def _move_to_cpu(obj):
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: _move_to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_move_to_cpu(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_move_to_cpu(v) for v in obj)
+    return obj
+
+
+def _build_training_state(
+    *,
+    step: int,
+    optimizer: torch.optim.Optimizer | None,
+    loss_ema_state: dict[str, torch.Tensor] | None,
+) -> dict:
+    state = {
+        "global_step": int(step),
+    }
+    if optimizer is not None:
+        state["optimizer_state"] = _move_to_cpu(optimizer.state_dict())
+    if loss_ema_state is not None:
+        state["loss_ema_state"] = {
+            key: value.detach().cpu().float()
+            for key, value in loss_ema_state.items()
+        }
+    return state
+
+
+def _infer_resume_step(resume_payload: dict) -> int:
+    training_state = resume_payload.get("training_state")
+    if isinstance(training_state, dict) and "global_step" in training_state:
+        return int(training_state["global_step"])
+
+    metadata = resume_payload.get("metadata", {})
+    history = metadata.get("history")
+    if isinstance(history, list) and history:
+        last_entry = history[-1]
+        if isinstance(last_entry, dict) and "step" in last_entry:
+            return int(last_entry["step"]) + 1
+    return 0
+
+
+def _format_step_output_path(base_output_path: str, step: int) -> str:
+    directory = os.path.dirname(base_output_path)
+    filename = os.path.basename(base_output_path)
+    stem, ext = os.path.splitext(filename)
+    stem = re.sub(r"-step\d+$", "", stem)
+    return os.path.join(directory, f"{stem}-step{int(step)}{ext}")
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +476,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model_name_or_path", type=str, required=True)
     parser.add_argument("--output_path", type=str, required=True)
+    parser.add_argument("--resume_from", type=str, default=None)
     parser.add_argument("--teacher_layer", type=int, default=0)
     parser.add_argument("--compressed_length", type=int, default=64)
     parser.add_argument(
@@ -480,6 +545,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use_ema_normalized_losses", action="store_true")
     parser.add_argument("--loss_ema_decay", type=float, default=0.99)
     parser.add_argument("--checkpoint_interval", type=int, default=0)
+    parser.add_argument("--max_checkpoints_to_keep", type=int, default=0)
+    parser.add_argument("--reset_optimizer_on_resume", action="store_true")
     return parser
 
 
@@ -505,6 +572,10 @@ def main() -> None:
         f"synthetic_batch_size={args.synthetic_batch_size}, teacher_batch_size={args.teacher_batch_size}, "
         f"teacher_datasets={list(args.teacher_datasets)})."
     )
+    resume_payload = None
+    if args.resume_from:
+        _log_stage(f"Loading resume payload from {args.resume_from}.")
+        resume_payload = torch.load(args.resume_from, map_location="cpu")
 
     wandb_run = None
     if args.wandb_project and args.wandb_mode != "disabled":
@@ -609,20 +680,43 @@ def main() -> None:
         "created_at": utc_now_iso(),
     }
 
-    # ----- 阶段一: 用流式 teacher 填满 ``synthetic_size`` 的初始化池 (CPU 缓存再搬到训练 device) -----
-    _log_stage("Filling synthetic pool from streamed teacher hidden states.")
-    init_hidden_cpu, synth_labels_cpu, init_position_ids_cpu = _collect_stream_examples(
-        stream=stream,
-        target_count=args.synthetic_size,
-        bundle=bundle,
-        args=args,
-        train_dtype=train_dtype,
-        sample_generator=sample_generator,
-        desc="Initializing synthetic pool",
-    )
-    init_hidden = init_hidden_cpu.to(device=device, dtype=train_dtype)
-    synth_labels = synth_labels_cpu.to(device=device)
-    init_position_ids = init_position_ids_cpu.to(device=device, dtype=torch.long)
+    # ----- 阶段一: 初始化 synthetic pool；若 resume，则直接从已有 payload 恢复 -----
+    resume_training_state = {}
+    resume_start_step = 0
+    history: list[dict] = []
+    if resume_payload is not None:
+        init_hidden = resume_payload["synthetic_hidden"].to(device=device, dtype=train_dtype)
+        init_position_ids = resume_payload["position_ids"].to(device=device, dtype=torch.long)
+        synth_labels = resume_payload.get("modality_labels", None)
+        if synth_labels is not None:
+            synth_labels = synth_labels.to(device=device)
+        resume_training_state = resume_payload.get("training_state", {}) or {}
+        resume_start_step = _infer_resume_step(resume_payload)
+        history = list(resume_payload.get("metadata", {}).get("history", []))
+        if args.synthetic_size != init_hidden.shape[0]:
+            _log_stage(
+                f"Overriding synthetic_size from {args.synthetic_size} to resumed value {init_hidden.shape[0]}."
+            )
+            args.synthetic_size = int(init_hidden.shape[0])
+        if args.synthetic_batch_size > args.synthetic_size:
+            args.synthetic_batch_size = args.synthetic_size
+        _log_stage(f"Resuming online distillation from global_step={resume_start_step}.")
+    else:
+        _log_stage("Filling synthetic pool from streamed teacher hidden states.")
+        init_hidden_cpu, synth_labels_cpu, init_position_ids_cpu = _collect_stream_examples(
+            stream=stream,
+            target_count=args.synthetic_size,
+            bundle=bundle,
+            args=args,
+            train_dtype=train_dtype,
+            sample_generator=sample_generator,
+            desc="Initializing synthetic pool",
+        )
+        init_hidden = init_hidden_cpu.to(device=device, dtype=train_dtype)
+        synth_labels = synth_labels_cpu.to(device=device)
+        init_position_ids = init_position_ids_cpu.to(device=device, dtype=torch.long)
+    compressed_length = int(init_hidden.shape[1])
+    hidden_size = int(init_hidden.shape[2])
 
     # ----- 将初始化 hidden 拆成按模态的 ``nn.Parameter`` bank, 训练时只更新这些参数 -----
     # ``synth_template_labels`` / ``synth_template_bank_indices`` 把每条序列每个 token 映射到对应 bank 行,
@@ -630,14 +724,23 @@ def main() -> None:
     bank_params, synth_template_labels_flat, synth_template_bank_indices_flat = _build_synthetic_banks(
         init_hidden=init_hidden,
         init_labels=synth_labels,
-        init_std=args.init_std,
+        init_std=0.0 if resume_payload is not None else args.init_std,
     )
     synth_template_labels = synth_labels
     synth_template_bank_indices = synth_template_bank_indices_flat.view(
-        init_hidden.shape[0], init_hidden.shape[1]
+        args.synthetic_size, compressed_length
     )
     synth_position_ids = init_position_ids.clone()
-    synth_attention_mask = torch.ones(init_hidden.shape[:2], dtype=torch.long, device=device)
+    synth_attention_mask = torch.ones(
+        (args.synthetic_size, compressed_length),
+        dtype=torch.long,
+        device=device,
+    )
+    if resume_payload is None:
+        del init_hidden_cpu, synth_labels_cpu, init_position_ids_cpu
+    del init_hidden
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     effective_synth_batch_size = (
         args.synthetic_size if args.synthetic_batch_size <= 0
         else min(args.synthetic_batch_size, args.synthetic_size)
@@ -646,19 +749,47 @@ def main() -> None:
     # Adam 只作用于 ``bank_params``; ``position_ids`` 与模板 label 均不参与梯度
     optimizer = torch.optim.Adam(list(bank_params.parameters()), lr=args.lr)
     loss_ema_state: dict[str, torch.Tensor] | None = {} if args.use_ema_normalized_losses else None
-    history: list[dict] = []
     saved_pt_paths: list[str] = []
     final_losses = None
     next_block_dtype = None
     if args.lambda_block > 0:
         next_block_layer = get_decoder_layer(bundle, args.teacher_layer + 1)
         next_block_dtype = next(next_block_layer.parameters()).dtype
+    if resume_payload is not None:
+        if args.use_ema_normalized_losses:
+            resume_ema = resume_training_state.get("loss_ema_state")
+            if isinstance(resume_ema, dict):
+                loss_ema_state = {
+                    key: value.to(device=device, dtype=torch.float32)
+                    for key, value in resume_ema.items()
+                }
+        if (
+            not args.reset_optimizer_on_resume
+            and isinstance(resume_training_state, dict)
+            and "optimizer_state" in resume_training_state
+        ):
+            optimizer.load_state_dict(resume_training_state["optimizer_state"])
+            for state in optimizer.state.values():
+                for key, value in state.items():
+                    if isinstance(value, torch.Tensor):
+                        state[key] = value.to(device)
+        _log_stage(
+            f"Resume state restored (optimizer_reset={int(args.reset_optimizer_on_resume)})."
+        )
 
     # ----- 阶段二: 每步从数据流再抽一批 teacher, 与 synthetic 算 loss, 反传更新 bank -----
-    _log_stage(f"Entering optimization loop at step=0, target_step={args.train_steps}.")
+    total_target_steps = args.train_steps
+    if total_target_steps < resume_start_step:
+        raise ValueError(
+            f"train_steps={args.train_steps} is smaller than resumed global_step={resume_start_step}. "
+            "Set train_steps to the desired final global step."
+        )
+    _log_stage(f"Entering optimization loop at step={resume_start_step}, target_step={total_target_steps}.")
     progress = tqdm(
-        range(args.train_steps),
+        range(resume_start_step, total_target_steps),
         desc="Distilling compact hidden (online)",
+        initial=resume_start_step,
+        total=total_target_steps,
         dynamic_ncols=True,
         leave=True,
     )
@@ -692,8 +823,8 @@ def main() -> None:
             template_labels=synth_batch_labels,
             template_bank_indices=synth_batch_bank_indices,
             synthetic_size=synth_batch_indices.shape[0],
-            compressed_length=init_hidden.shape[1],
-            hidden_size=init_hidden.shape[2],
+            compressed_length=compressed_length,
+            hidden_size=hidden_size,
         )
 
         # ``_compute_losses`` 返回: ``mmd``, ``cov``, ``mean``, ``var``, ``div``, 以及可选的 ``mmd/mod*`` 等诊断键
@@ -770,7 +901,7 @@ def main() -> None:
         # 诊断: token norm, centroid 距离, diversity 余弦分位数等, 仅周期性写入 ``final_losses`` 与 history
         should_log_diagnostics = (
             step % args.log_interval == 0
-            or step == args.train_steps - 1
+            or step == total_target_steps - 1
         )
         if should_log_diagnostics:
             diagnostics = _compute_diagnostics(
@@ -787,7 +918,7 @@ def main() -> None:
         should_log_wandb = (
             wandb_run is not None
             and (
-                step == args.train_steps - 1
+                step == total_target_steps - 1
                 or (
                     args.wandb_every_n_steps > 0
                     and step % args.wandb_every_n_steps == 0
@@ -833,20 +964,17 @@ def main() -> None:
         if (
             args.checkpoint_interval > 0
             and (step + 1) % args.checkpoint_interval == 0
-            and step != args.train_steps - 1
+            and step != total_target_steps - 1
         ):
             checkpoint_hidden = _assemble_synthetic_hidden(
                 bank_params=bank_params,
                 template_labels=synth_template_labels,
                 template_bank_indices=synth_template_bank_indices,
                 synthetic_size=args.synthetic_size,
-                compressed_length=init_hidden.shape[1],
-                hidden_size=init_hidden.shape[2],
+                compressed_length=compressed_length,
+                hidden_size=hidden_size,
             )
-            checkpoint_path = os.path.join(
-                os.path.dirname(args.output_path),
-                f"{os.path.splitext(os.path.basename(args.output_path))[0]}-step{step + 1}.pt",
-            )
+            checkpoint_path = _format_step_output_path(args.output_path, step + 1)
             _save_payload(
                 output_path=checkpoint_path,
                 synthetic_hidden=checkpoint_hidden,
@@ -856,9 +984,17 @@ def main() -> None:
                 teacher_meta=teacher_meta,
                 final_losses=final_losses,
                 history=history,
+                training_state=_build_training_state(
+                    step=step + 1,
+                    optimizer=optimizer,
+                    loss_ema_state=loss_ema_state,
+                ),
             )
             saved_pt_paths.append(checkpoint_path)
-            saved_pt_paths = _prune_saved_pt_paths(saved_pt_paths, max_keep=2)
+            saved_pt_paths = _prune_saved_pt_paths(
+                saved_pt_paths,
+                max_keep=args.max_checkpoints_to_keep,
+            )
 
         # 释放本步 teacher GPU tensor, 降低峰值显存 (下一迭代会重新从 CPU 拉 batch)
         del teacher_batch_cpu, teacher_batch_labels_cpu, teacher_position_ids_cpu
@@ -872,11 +1008,12 @@ def main() -> None:
         template_labels=synth_template_labels,
         template_bank_indices=synth_template_bank_indices,
         synthetic_size=args.synthetic_size,
-        compressed_length=init_hidden.shape[1],
-        hidden_size=init_hidden.shape[2],
+        compressed_length=compressed_length,
+        hidden_size=hidden_size,
     )
+    final_output_path = _format_step_output_path(args.output_path, total_target_steps)
     _save_payload(
-        output_path=args.output_path,
+        output_path=final_output_path,
         synthetic_hidden=final_hidden,
         synth_position_ids=synth_position_ids,
         synth_labels=synth_labels,
@@ -884,10 +1021,18 @@ def main() -> None:
         teacher_meta=teacher_meta,
         final_losses=final_losses,
         history=history,
+        training_state=_build_training_state(
+            step=total_target_steps,
+            optimizer=optimizer,
+            loss_ema_state=loss_ema_state,
+        ),
     )
-    saved_pt_paths.append(args.output_path)
-    saved_pt_paths = _prune_saved_pt_paths(saved_pt_paths, max_keep=2)
-    _log_stage(f"Saved online distilled hidden to {args.output_path}")
+    saved_pt_paths.append(final_output_path)
+    saved_pt_paths = _prune_saved_pt_paths(
+        saved_pt_paths,
+        max_keep=args.max_checkpoints_to_keep,
+    )
+    _log_stage(f"Saved online distilled hidden to {final_output_path}")
 
 
 if __name__ == "__main__":
