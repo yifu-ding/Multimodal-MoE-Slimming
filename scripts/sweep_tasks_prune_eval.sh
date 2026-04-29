@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sweep TASK × INTER_METHOD × INTRA_METHOD × MODALITY_AWARE × INTRA_EXPERT_METRIC
+# Sweep TASK × INTER_METHOD × INTRA_METHOD × MODALITY_AWARE × SHARED_PROTECT × INTRA_EXPERT_METRIC
 # by calling run_prune_eval_kimi_gqa.sh (with TASK env var forwarded).
 #
 # Appends one markdown table row per run to a per-batch summary.md under:
@@ -10,15 +10,16 @@
 #   SWEEP_INTER_METHODS="uniform loss"
 #   SWEEP_INTRA_METHODS="uniform second_attr_coverage"
 #   SWEEP_MODALITY_AWARE="0 1"
+#   SWEEP_SHARED_PROTECT="0 1"
 #   SWEEP_INTRA_EXPERT_METRICS="gateup_act 3proj_act"
 #
 # Resume / skip already-done runs (default on):
 #   If summary.md already has a row with the same task, inter_method, intra_method,
-#   modality_aware, intra_expert_metric and status ``ok``, that combination is skipped.
+#   modality_aware, shared_protect, intra_expert_metric and status ``ok``, that combination is skipped.
 #   SWEEP_SKIP_DONE=0  — run everything (ignore summary)
 #
 # Other env vars are passed through to run_prune_eval_kimi_gqa.sh
-# (SCORES_PATH, PRUNE_RATIO, NUM_SAMPLES, ...).
+# (SCORES_PATH, PRUNE_RATIO, NUM_SAMPLES, EMA_SOURCE_KEY, ...).
 # MODEL_NAME selects the model; this script also sets MODEL_PATH to the default HF id unless you set
 # SWEEP_MODEL_PATH (so export MODEL_PATH=... in your shell is ignored in favor of MODEL_NAME).
 
@@ -43,13 +44,16 @@ USE_LMMS_EVAL=${USE_LMMS_EVAL:-0}
 
 # ── Task grid ──────────────────────────────────────────────────────────────────
 # All 14 tasks requested; override via SWEEP_TASKS env var.
-SWEEP_TASKS="${SWEEP_TASKS:-textvqa chartqa coco2017cap mmstar mmbench realworldqa gqa mme}"
+SWEEP_TASKS="${SWEEP_TASKS:-chartqa coco2017cap mmstar mmbench realworldqa gqa mme textvqa}"
 # mmvet video_mmmu videomme mvbench egoschema
 # ── Setting grids (same defaults as sweep_prune_eval_kimi_gqa.sh) ──────────────
 SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform}"
 SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-second_attr_coverage}"
 SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-1}"
+SWEEP_SHARED_PROTECT="${SWEEP_SHARED_PROTECT:-1}"
 NORMALIZE="${NORMALIZE:-0}"
+USE_EMA="${USE_EMA:-1}"
+EMA_SOURCE_KEY="${EMA_SOURCE_KEY:-ema_matrix}"
 SMOOTH_FN="${SMOOTH_FN:-cbrt}" # sqrt cbrt fourth_root log
 SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act}"
 # 3proj_second_order down_saliency 3proj_saliency 3proj_grad wg
@@ -88,11 +92,8 @@ else
     qwen3.5-35b-a3b) export MODEL_PATH="Qwen/Qwen3.5-35B-A3B" ;;
   esac
 fi
-<<<<<<< HEAD
-SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-mixed-num_342-token_2048-sample_at1.0-0421180638-teacher_hidden-new_ema"  # -${SWEEP_TS}
-=======
-SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-gqa-num_1024-token_2048-fill_0-0421-202239-second-cov"  # -${SWEEP_TS}
->>>>>>> 71e44c4394020d38b5a91b0c258efba0bea4e2c1
+SUFFIX="${SUFFIX:-}"
+SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-${SUFFIX}"  # -${SWEEP_TS}
 export OUTPUT_DIR="${SWEEP_BASE}"
 
 if [[ -d "${SWEEP_BASE}" ]]; then
@@ -146,8 +147,8 @@ echo "SUMMARY_FILE has been created: ${SUMMARY_FILE}"
   echo ""
   echo "SCORES_PATH: \`${SCORES_PATH}\`"
   echo ""
-  echo "| # | task | inter_method | intra_method | modality_aware | normalize | intra_expert_metric | smooth_fn | metric | detail | status | log |"
-  echo "|---|------|--------------|--------------|----------------|----------------|---------------------|-----------|--------|--------|--------|-----|"
+    echo "| # | task | inter_method | intra_method | modality_aware | shared_protect | normalize | ema_source_key | intra_expert_metric | smooth_fn | metric | detail | status | log |"
+    echo "|---|------|--------------|--------------|----------------|----------------|-----------|----------------|---------------------|-----------|--------|--------|--------|-----|"
 } >> "${SUMMARY_FILE}"
 
 # ── Main sweep ─────────────────────────────────────────────────────────────────
@@ -155,13 +156,14 @@ for TASK in ${SWEEP_TASKS}; do
   for INTER_METHOD in ${SWEEP_INTER_METHODS}; do
     for INTRA_METHOD in ${SWEEP_INTRA_METHODS}; do
       for MODALITY_AWARE in ${SWEEP_MODALITY_AWARE}; do
-        for INTRA_EXPERT_METRIC in ${SWEEP_INTRA_EXPERT_METRICS}; do
+        for SHARED_PROTECT in ${SWEEP_SHARED_PROTECT}; do
+          for INTRA_EXPERT_METRIC in ${SWEEP_INTRA_EXPERT_METRICS}; do
 
           # ── Skip-done check ──────────────────────────────────────────────────
           if [[ "${SWEEP_SKIP_DONE}" == "1" ]] && [[ -f "${SUMMARY_FILE}" ]]; then
-            if grep -F "| ${TASK} | ${INTER_METHOD} | ${INTRA_METHOD} | ${MODALITY_AWARE} | ${INTRA_EXPERT_METRIC} |" "${SUMMARY_FILE}" 2>/dev/null \
+            if grep -F "| ${TASK} | ${INTER_METHOD} | ${INTRA_METHOD} | ${MODALITY_AWARE} | ${SHARED_PROTECT} | ${NORMALIZE} | ${EMA_SOURCE_KEY} | ${INTRA_EXPERT_METRIC} | ${SMOOTH_FN} |" "${SUMMARY_FILE}" 2>/dev/null \
                  | grep -qF '| ok |'; then
-              echo "[sweep] Skip (already ok): TASK=${TASK} INTER=${INTER_METHOD} INTRA=${INTRA_METHOD} MODALITY=${MODALITY_AWARE} METRIC=${INTRA_EXPERT_METRIC}"
+              echo "[sweep] Skip (already ok): TASK=${TASK} INTER=${INTER_METHOD} INTRA=${INTRA_METHOD} MODALITY=${MODALITY_AWARE} SHARED=${SHARED_PROTECT} METRIC=${INTRA_EXPERT_METRIC}"
               SWEEP_SKIPPED=$((SWEEP_SKIPPED + 1))
               continue
             fi
@@ -169,19 +171,22 @@ for TASK in ${SWEEP_TASKS}; do
 
           # ── Run ──────────────────────────────────────────────────────────────
           RUN_IDX=$((RUN_IDX + 1))
-          TAG="$(printf '%04d' "${RUN_IDX}")_${SWEEP_ID}_${TASK}_${INTER_METHOD}_${INTRA_METHOD}_m${MODALITY_AWARE}_${INTRA_EXPERT_METRIC}"
+          TAG="$(printf '%04d' "${RUN_IDX}")_${SWEEP_ID}_${TASK}_${INTER_METHOD}_${INTRA_METHOD}_m${MODALITY_AWARE}_s${SHARED_PROTECT}_${INTRA_EXPERT_METRIC}"
           TAG="${TAG//[^a-zA-Z0-9._-]/_}"
           RUN_LOG="${SWEEP_LOG_DIR}/stdout_${TAG}.log"
 
           echo ""
-          echo "========== sweep run ${RUN_IDX}: ${MODEL_NAME} TASK=${TASK} INTER=${INTER_METHOD} INTRA=${INTRA_METHOD} MODALITY=${MODALITY_AWARE} METRIC=${INTRA_EXPERT_METRIC} =========="
+          echo "========== sweep run ${RUN_IDX}: ${MODEL_NAME} TASK=${TASK} INTER=${INTER_METHOD} INTRA=${INTRA_METHOD} MODALITY=${MODALITY_AWARE} SHARED=${SHARED_PROTECT} METRIC=${INTRA_EXPERT_METRIC} =========="
 
           set +e
           TASK="${TASK}" \
             INTER_METHOD="${INTER_METHOD}" \
             INTRA_METHOD="${INTRA_METHOD}" \
             MODALITY_AWARE="${MODALITY_AWARE}" \
+            SHARED_PROTECT="${SHARED_PROTECT}" \
             NORMALIZE="${NORMALIZE}" \
+            USE_EMA="${USE_EMA}" \
+            EMA_SOURCE_KEY="${EMA_SOURCE_KEY}" \
             INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC}" \
             SMOOTH_FN="${SMOOTH_FN}" \
             MODEL_NAME="${MODEL_NAME}" \
@@ -221,9 +226,10 @@ for TASK in ${SWEEP_TASKS}; do
 
           REL_LOG="logs/$(basename "${RUN_LOG}")"
           {
-            echo "| ${RUN_IDX} | ${TASK} | ${INTER_METHOD} | ${INTRA_METHOD} | ${MODALITY_AWARE} | ${NORMALIZE} | ${INTRA_EXPERT_METRIC} | ${SMOOTH_FN} | ${METRIC_VAL:-—} | ${METRIC_DETAIL:-—} | ${STATUS} | \`${REL_LOG}\` |"
+            echo "| ${RUN_IDX} | ${TASK} | ${INTER_METHOD} | ${INTRA_METHOD} | ${MODALITY_AWARE} | ${SHARED_PROTECT} | ${NORMALIZE} | ${EMA_SOURCE_KEY} | ${INTRA_EXPERT_METRIC} | ${SMOOTH_FN} | ${METRIC_VAL:-—} | ${METRIC_DETAIL:-—} | ${STATUS} | \`${REL_LOG}\` |"
           } >> "${SUMMARY_FILE}"
 
+          done
         done
       done
     done

@@ -53,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--align_inter", type=int, default=0)
     p.add_argument("--min_per_expert", type=int, default=0)
     p.add_argument("--modality_aware", action="store_true")
+    p.add_argument("--shared_protect", action="store_true")
     p.add_argument("--normalize", action="store_true")
     p.add_argument("--num_samples", type=int, default=0)
     p.add_argument("--start_idx", type=int, default=0)
@@ -60,6 +61,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max_new_tokens", type=int, default=32)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--smooth_fn", type=str, default="sqrt")
+    p.add_argument("--use_ema", type=int, default=1)
+    p.add_argument(
+        "--ema_source_key",
+        type=str,
+        default="ema_matrix",
+        help="Which tensor key in scores payload to use as EMA source (passed to prepare_scores).",
+    )
     return p
 
 
@@ -105,7 +113,10 @@ def main() -> None:
                     "min_per_expert": args.min_per_expert,
                 },
                 "modality_aware": args.modality_aware,
+                "shared_protect": args.shared_protect,
+                "use_ema": bool(args.use_ema),
                 "normalize": args.normalize,
+                "ema_source_key": args.ema_source_key,
                 "prune_hidden": False,
                 "prune_gqa": False,
                 "smooth_fn": args.smooth_fn,
@@ -239,6 +250,8 @@ def main() -> None:
         "intra_method": args.intra_method,
         "intra_expert_metric": args.intra_expert_metric,
         "modality_aware": args.modality_aware,
+        "shared_protect": args.shared_protect,
+        "use_ema": bool(args.use_ema),
         "saved_pruned_checkpoint": False,
     }
     # Include extra eval fields (correct, total, etc.)

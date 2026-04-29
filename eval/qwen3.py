@@ -182,6 +182,7 @@ class Qwen3_VL(lmms):
             modality_aware = bool(int(kwargs.get("modality_aware", 0)))
             normalize = bool(int(kwargs.get("normalize", 0)))
             smooth_fn = kwargs.get("smooth_fn", "sqrt")
+            ema_source_key = kwargs.get("ema_source_key", "ema_matrix")
             align_inter = int(kwargs.get("align_inter", 0))
             min_per_expert = int(kwargs.get("min_per_expert", 0))
             thresholds_path = kwargs.get("thresholds_path", None)
@@ -206,6 +207,7 @@ class Qwen3_VL(lmms):
                     },
                     "modality_aware": modality_aware,
                     "normalize": normalize,
+                    "ema_source_key": ema_source_key,
                     "prune_hidden": False,
                     "prune_gqa": False,
                     "smooth_fn": smooth_fn,
