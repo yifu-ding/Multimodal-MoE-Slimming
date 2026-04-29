@@ -18,7 +18,7 @@ class EarlyStopForward(RuntimeError):
 def ensure_dir(path: str) -> None:
     if not path:
         return
-    os.makedirs(path, exist_ok=True)
+    os.makedirs(os.path.realpath(path), exist_ok=True)
 
 
 def dump_json(path: str, payload: Dict[str, Any]) -> None:

@@ -53,11 +53,16 @@ def load_modality_channel_scores(
     }
     text_scores = channel_scores[f"{intra_expert_metric}_text"]
     visual_scores = channel_scores[f"{intra_expert_metric}_visual"]
-
+    '''
     ema_tensor = dict_to_tensor(
         _nested_to_layer_tensors(payload["ema_matrix"])
     ).to(device=device, dtype=torch.float32)
-    import ipdb; ipdb.set_trace()
+    '''
+    ema_tensor = dict_to_tensor(
+        _nested_to_layer_tensors(payload["ema_matrix_prior_corrected"])  # attention!!
+    ).to(device=device, dtype=torch.float32)
+    # '''
+    # import ipdb; ipdb.set_trace()
     return {
         "text": dict_to_tensor(text_scores).to(device=device, dtype=torch.float32),
         "visual": dict_to_tensor(visual_scores).to(device=device, dtype=torch.float32),
