@@ -80,6 +80,7 @@ def loop_2_score_collector(
                 if down_second_order_exact_visual is not None:
                     safe_add_with_ema(expert, ema, down_second_order_exact_visual, "down_second_order_exact_visual")
 
+        '''
         true_ablate = compute_true_ablate_attr(
             cnt_block=cnt_block,
             expert=expert_proxy,
@@ -92,3 +93,4 @@ def loop_2_score_collector(
                 )
             else:
                 safe_add_with_ema(expert, ema, true_ablate, "true_ablate")
+        '''

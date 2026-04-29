@@ -9,17 +9,17 @@ export HF_HOME="${HF_HOME:-/home/data/dyf/hf_cache}"
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 RUN_STAMP="${RUN_STAMP:-$(date +%m%d%H%M%S)}"
 OUTPUT_PATH="${OUTPUT_PATH:-}"
+RESUME_FROM="${RESUME_FROM:-}"
 LATEST_DISTILLED_LINK_DIR="${LATEST_DISTILLED_LINK_DIR:-${PREFIX}/storage/data_distill_kimi/online-distilled-latest}"
 
 TEACHER_LAYER="${TEACHER_LAYER:-0}"
-COMPRESSED_LENGTH="${COMPRESSED_LENGTH:-64}"
+COMPRESSED_LENGTH="${COMPRESSED_LENGTH:-1024}"
 COMPRESSION_MODE="${COMPRESSION_MODE:-sample}"
-MODALITY_AWARE_COMPRESSION="${MODALITY_AWARE_COMPRESSION:-0}"
+MODALITY_AWARE_COMPRESSION="${MODALITY_AWARE_COMPRESSION:-1}"
 ATTN_TEMPERATURE="${ATTN_TEMPERATURE:-1.0}"
 
 TEACHER_DATASETS=(${TEACHER_DATASETS:-gqa coco m4_instruct})
-SAMPLES_PER_DATASET="${SAMPLES_PER_DATASET:-1024}"
-INPUT_BATCH_SIZE="${INPUT_BATCH_SIZE:-2}"
+SAMPLES_PER_DATASET="${SAMPLES_PER_DATASET:-2048}"
 TEACHER_BATCH_SIZE="${TEACHER_BATCH_SIZE:-64}"
 TOKEN_PER_SAMPLE="${TOKEN_PER_SAMPLE:-2048}"
 NUM_VIDEO_FRAMES="${NUM_VIDEO_FRAMES:-8}"
@@ -38,12 +38,13 @@ LAMBDA_MEAN="${LAMBDA_MEAN:-1.0}"
 LAMBDA_VAR="${LAMBDA_VAR:-2.0}"
 LAMBDA_BLOCK="${LAMBDA_BLOCK:-0.25}"
 
-USE_EMA_NORMALIZED_LOSSES="${USE_EMA_NORMALIZED_LOSSES:-1}"
+USE_EMA_NORMALIZED_LOSSES="${USE_EMA_NORMALIZED_LOSSES:-1}"  # 不一定？
 LOSS_EMA_DECAY="${LOSS_EMA_DECAY:-0.99}"
 DIV_WARMUP_STEPS="${DIV_WARMUP_STEPS:-0}"
 MMD_SUBSAMPLE="${MMD_SUBSAMPLE:-2048}"
 LOG_INTERVAL="${LOG_INTERVAL:-100}"
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-100}"
+MAX_CHECKPOINTS_TO_KEEP="${MAX_CHECKPOINTS_TO_KEEP:-0}"
 
 SEED="${SEED:-42}"
 SUBSET_SEED="${SUBSET_SEED:-42}"
@@ -60,7 +61,7 @@ DIVERSITY_ABLATION="${DIVERSITY_ABLATION:-full}"  # no_div, full
 DISTRIBUTION_ABLATION="${DISTRIBUTION_ABLATION:-full}"  # moment_only, mmd_only, full   
 ABLATION_TAG="div-${DIVERSITY_ABLATION}_dist-${DISTRIBUTION_ABLATION}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-online-distilled-${RUN_STAMP}-${ABLATION_TAG}}"
-OUTPUT_PATH="${OUTPUT_PATH:-${PREFIX}/storage/data_distill_kimi/online-distilled-${RUN_STAMP}-${ABLATION_TAG}/distilled_hidden.pt}"
+OUTPUT_PATH="${OUTPUT_PATH:-${PREFIX}/storage/data_distill_kimi/online-distilled-${RUN_STAMP}-${ABLATION_TAG}/distilled_hidden-step${TRAIN_STEPS}.pt}"
 
 EXTRA_ARGS=("$@")
 
@@ -74,7 +75,6 @@ CMD=(
     --attn_temperature "${ATTN_TEMPERATURE}"
     --samples_per_dataset "${SAMPLES_PER_DATASET}"
     --teacher_datasets "${TEACHER_DATASETS[@]}"
-    --batch_size "${INPUT_BATCH_SIZE}"
     --teacher_batch_size "${TEACHER_BATCH_SIZE}"
     --synthetic_size "${SYNTHETIC_SIZE}"
     --synthetic_batch_size "${SYNTHETIC_BATCH_SIZE}"
@@ -108,7 +108,16 @@ CMD=(
     --wandb_mode "${WANDB_MODE}"
     --loss_ema_decay "${LOSS_EMA_DECAY}"
     --checkpoint_interval "${CHECKPOINT_INTERVAL}"
+    --max_checkpoints_to_keep "${MAX_CHECKPOINTS_TO_KEEP}"
 )
+
+if [[ -n "${RESUME_FROM}" ]]; then
+    CMD+=(--resume_from "${RESUME_FROM}")
+fi
+
+if [[ "${RESET_OPTIMIZER_ON_RESUME}" == "1" ]]; then
+    CMD+=(--reset_optimizer_on_resume)
+fi
 
 if [[ "${MODALITY_AWARE_COMPRESSION}" == "1" ]]; then
     CMD+=(--modality_aware_compression)
@@ -122,14 +131,16 @@ CMD+=("${EXTRA_ARGS[@]}")
 
 echo "Model           : ${MODEL_PATH}"
 echo "Output          : ${OUTPUT_PATH}"
+echo "Resume from     : ${RESUME_FROM:-<none>}"
 echo "Teacher layer   : ${TEACHER_LAYER}"
 echo "Teacher data    : ${TEACHER_DATASETS[*]}"
 echo "Samples/dataset : ${SAMPLES_PER_DATASET}"
-echo "Input batch     : ${INPUT_BATCH_SIZE}"
 echo "Teacher batch   : ${TEACHER_BATCH_SIZE}"
 echo "Synthetic M     : ${SYNTHETIC_SIZE}"
 echo "Synthetic batch : ${SYNTHETIC_BATCH_SIZE}"
 echo "Train steps     : ${TRAIN_STEPS}"
+echo "Checkpoint every: ${CHECKPOINT_INTERVAL}"
+echo "Keep checkpoints: ${MAX_CHECKPOINTS_TO_KEEP}"
 echo "LR              : ${LR}"
 echo "Train dtype     : ${TRAIN_DTYPE}"
 echo "Compression     : mode=${COMPRESSION_MODE} modality_aware=${MODALITY_AWARE_COMPRESSION} length=${COMPRESSED_LENGTH}"

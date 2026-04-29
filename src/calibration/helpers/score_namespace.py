@@ -93,6 +93,6 @@ EXPERT_METRICS = (
     "router_fillzero",
     "second_attr",
     "second_attr_fillzero",
-    # "true_ablate",
-    # "true_ablate_fillzero",
+    "true_ablate",
+    "true_ablate_fillzero",
 )

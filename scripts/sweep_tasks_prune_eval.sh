@@ -43,7 +43,7 @@ USE_LMMS_EVAL=${USE_LMMS_EVAL:-0}
 
 # ── Task grid ──────────────────────────────────────────────────────────────────
 # All 14 tasks requested; override via SWEEP_TASKS env var.
-SWEEP_TASKS="${SWEEP_TASKS:-textvqa chartqa gqa coco2017cap mmstar mmbench mme realworldqa}"
+SWEEP_TASKS="${SWEEP_TASKS:-textvqa chartqa coco2017cap mmstar mmbench realworldqa gqa mme}"
 # mmvet video_mmmu videomme mvbench egoschema
 # ── Setting grids (same defaults as sweep_prune_eval_kimi_gqa.sh) ──────────────
 SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform}"
@@ -88,7 +88,11 @@ else
     qwen3.5-35b-a3b) export MODEL_PATH="Qwen/Qwen3.5-35B-A3B" ;;
   esac
 fi
+<<<<<<< HEAD
 SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-mixed-num_342-token_2048-sample_at1.0-0421180638-teacher_hidden-new_ema"  # -${SWEEP_TS}
+=======
+SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-gqa-num_1024-token_2048-fill_0-0421-202239-second-cov"  # -${SWEEP_TS}
+>>>>>>> 71e44c4394020d38b5a91b0c258efba0bea4e2c1
 export OUTPUT_DIR="${SWEEP_BASE}"
 
 if [[ -d "${SWEEP_BASE}" ]]; then
