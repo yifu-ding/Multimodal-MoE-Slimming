@@ -92,6 +92,7 @@ def generate_masks(
 
     if not use_modality:
         result.update(mask_result)
+        result["ema_matrix"] = None
 
     else:
         if verbose:
@@ -110,7 +111,7 @@ def generate_masks(
             expertwise_scores=expertwise_scores,
             layerwise_keep_plan=layerwise_keep_plan,
             intra_layer_method=mask_method_kwargs.get("intra_layer_method", "uniform"),
-            ema_matrix=modality_scores.get("ema_matrix", None),
+            ema_matrix=modality_scores[ema_source_key],
             verbose=verbose,
         )
 
@@ -160,6 +161,9 @@ def generate_masks(
         result["k_visual"] = k_visual
         result["k_text"] = k_text
         result["K_E_inter"] = result["intermediate_masks"].sum(dim=-1)
+        result["ema_matrix"] = (
+            modality_scores['ema_matrix']
+        )
 
     align_inter = adjust_masks_kwargs.get("align_inter", 0)
     min_per_expert = adjust_masks_kwargs.get("min_per_expert", 0)
