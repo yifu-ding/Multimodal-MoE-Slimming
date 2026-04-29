@@ -53,6 +53,15 @@ def _save_score_artifacts(output_path: str, accumulator, args) -> None:
     print(f"[representation_distill] Saved scores: {scores_path}")
 
 
+def _prepare_output_path(output_path: str) -> str:
+    if output_path.endswith(".pt"):
+        scores_path = output_path
+        ensure_dir(os.path.dirname(os.path.abspath(scores_path)))
+        return scores_path
+    ensure_dir(output_path)
+    return os.path.join(output_path, "scores.pt")
+
+
 def _set_synthetic_modality_masks(
     cnt_block,
     attn_mask: torch.Tensor,
@@ -405,9 +414,24 @@ def main() -> None:
         raise ValueError(
             f"No target MoE layers remain after hidden start_layer={start_layer}."
         )
+    prepared_output_path = _prepare_output_path(args.output_path)
 
     has_modality_labels = modality_labels is not None
     has_position_ids = position_ids is not None
+    payload_args = SimpleNamespace(
+        loss_fn=args.loss_fn,
+        num_samples=int(hidden.shape[0]),
+        batch_size=args.batch_size,
+        dataset=hidden_payload["source"],
+        start_idx=0,
+        model_name_or_path=args.model_name_or_path,
+        subset_seed=None,
+        ema=args.ema,
+        fill_zero_for_unrouted=False,
+        source=hidden_payload["source"],
+        input_hidden_path=args.input_hidden_path,
+        start_layer=start_layer,
+    )
     if has_modality_labels and has_position_ids:
         loader = DataLoader(
             TensorDataset(hidden, attention_mask, modality_labels, position_ids),
@@ -456,22 +480,9 @@ def main() -> None:
         accumulator.layerwise_loss[layer_idx] = float(layer_loss)
         accumulator.absorb_layer_scores(layer_idx, cnt_block)
         print(f"[representation_distill] Layer {layer_idx}: layer loss={layer_loss:.6f}")
+        _save_score_artifacts(prepared_output_path, accumulator, payload_args)
 
-    payload_args = SimpleNamespace(
-        loss_fn=args.loss_fn,
-        num_samples=int(hidden.shape[0]),
-        batch_size=args.batch_size,
-        dataset=hidden_payload["source"],
-        start_idx=0,
-        model_name_or_path=args.model_name_or_path,
-        subset_seed=None,
-        ema=args.ema,
-        fill_zero_for_unrouted=False,
-        source=hidden_payload["source"],
-        input_hidden_path=args.input_hidden_path,
-        start_layer=start_layer,
-    )
-    _save_score_artifacts(args.output_path, accumulator, payload_args)
+    _save_score_artifacts(prepared_output_path, accumulator, payload_args)
 
 
 if __name__ == "__main__":

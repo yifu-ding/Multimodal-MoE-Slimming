@@ -5,9 +5,26 @@ source scripts/select_least_used_gpu.sh # 自动选择显存使用量最少的 g
 PREFIX="${PREFIX:-$(pwd)}"
 export PYTHONPATH="${PREFIX}"
 
+resolve_storage_path() {
+    local path="$1"
+    local broken_prefix="${PREFIX}/storage"
+    local fallback_prefix="/home/data/dyf/MARS-results/storage"
+    if [[ -n "${path}" && ! -e "${path}" && "${path}" == "${broken_prefix}"* ]]; then
+        local suffix="${path#${broken_prefix}}"
+        local candidate="${fallback_prefix}${suffix}"
+        if [[ -e "${candidate}" || -d "$(dirname "${candidate}")" ]]; then
+            echo "${candidate}"
+            return 0
+        fi
+    fi
+    echo "${path}"
+}
+
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 HIDDEN_PAYLOAD_PATH="${HIDDEN_PAYLOAD_PATH:-}"
+HIDDEN_PAYLOAD_PATH="$(resolve_storage_path "${HIDDEN_PAYLOAD_PATH}")"
 OUTPUT_PATH="${OUTPUT_PATH:-${HIDDEN_PAYLOAD_PATH%.pt}-scores.pt}"
+OUTPUT_PATH="$(resolve_storage_path "${OUTPUT_PATH}")"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 EMA="${EMA:-0.9}"
 LOSS_FN="${LOSS_FN:-rel_l2}"

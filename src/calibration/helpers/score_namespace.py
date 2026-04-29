@@ -4,10 +4,10 @@ ACTIVE_CHANNEL_METRICS = (
     "gateup_act_text",
     "gateup_act_visual",
     # three proj activation
-    # "3proj_act",
-    # "3proj_act_text",
-    # "3proj_act_visual",
-    # three proj second order
+    "3proj_act",
+    "3proj_act_text",
+    "3proj_act_visual",
+    # # three proj second order
     "3proj_second_order",
     "3proj_second_order_text",
     "3proj_second_order_visual",

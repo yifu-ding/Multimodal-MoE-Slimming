@@ -36,7 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--scores_path",
         type=str,
-        default="/home/dyf/code/distill/MAES/storage/data_distill_kimi/mixed-num_1024-token_2048-sample_at1.0-0423143941/teacher_hidden-scores.pt",
+        # default="/home/dyf/code/distill/MAES/storage/data_distill_kimi/mixed-num_1024-token_2048-sample_at1.0-0423143941/teacher_hidden-scores.pt",
+        required=True,
     )
     p.add_argument(
         "--output_dir",
@@ -48,7 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prune_ratio", type=float, default=0.50)
     p.add_argument("--thresholds_path", type=str, default=None)
     p.add_argument("--inter_method", type=str, default="uniform")
-    p.add_argument("--intra_method", type=str, default="second_attr_coverage")
+    p.add_argument("--intra_method", type=str, default="uniform")
     p.add_argument("--intra_expert_metric", type=str, default="gateup_act")
     p.add_argument("--align_inter", type=int, default=0)
     p.add_argument("--min_per_expert", type=int, default=0)
