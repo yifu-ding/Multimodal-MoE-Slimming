@@ -990,6 +990,7 @@ def main() -> None:
                     loss_ema_state=loss_ema_state,
                 ),
             )
+            _log_stage(f"Saved checkpoint to {os.path.abspath(checkpoint_path)}")
             saved_pt_paths.append(checkpoint_path)
             saved_pt_paths = _prune_saved_pt_paths(
                 saved_pt_paths,
