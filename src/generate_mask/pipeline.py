@@ -39,7 +39,9 @@ def generate_masks(
     modality_aware = bool(prune_kwargs.get("modality_aware", False))
     use_ema = bool(prune_kwargs.get("use_ema", True))
     normalize = bool(prune_kwargs.get("normalize", False))
-
+    ema_source_key = prune_kwargs.get("ema_source_key", "ema_matrix")
+    shared_protect = bool(prune_kwargs.get("shared_protect", True))
+    
     (
         intermediate_scores,
         expertwise_scores,
@@ -53,6 +55,7 @@ def generate_masks(
         mask_method_kwargs=mask_method_kwargs,
         smooth_fn=smooth_fn,
         modality_aware=modality_aware, 
+        ema_source_key=ema_source_key,
         normalize=normalize,
         device=device,
         verbose=verbose,
@@ -92,12 +95,18 @@ def generate_masks(
 
     else:
         if verbose:
-            _print("[Mask Building] Applying modality-conditioned channel budgeting.")
+            _print(
+                f"[Mask Building] Applying modality-conditioned channel budgeting,"
+                f" use_modality: {use_modality},"
+                f" shared_protect: {shared_protect},"
+                f" use_ema: {use_ema}."
+            )
 
         modality_masks, shared_masks, text_K_E, visual_K_E, k_visual, k_text = build_modality_budget_masks(
             modality_scores["text"],
             modality_scores["visual"],
             use_ema=use_ema,
+            shared_protect=shared_protect,
             expertwise_scores=expertwise_scores,
             layerwise_keep_plan=layerwise_keep_plan,
             intra_layer_method=mask_method_kwargs.get("intra_layer_method", "uniform"),

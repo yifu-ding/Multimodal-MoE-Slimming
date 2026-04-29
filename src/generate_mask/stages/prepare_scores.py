@@ -45,6 +45,7 @@ def _payload_get(payload: dict, key: str, default=None):
 
 def load_modality_channel_scores(
     payload, 
+    ema_source_key: str = "ema_matrix",
     device: str = "cpu",
     intra_expert_metric: str = "activation",
 ) -> dict:
@@ -53,15 +54,16 @@ def load_modality_channel_scores(
     }
     text_scores = channel_scores[f"{intra_expert_metric}_text"]
     visual_scores = channel_scores[f"{intra_expert_metric}_visual"]
-    '''
-    ema_tensor = dict_to_tensor(
-        _nested_to_layer_tensors(payload["ema_matrix"])
-    ).to(device=device, dtype=torch.float32)
-    '''
-    ema_tensor = dict_to_tensor(
-        _nested_to_layer_tensors(payload["ema_matrix_prior_corrected"])  # attention!!
-    ).to(device=device, dtype=torch.float32)
-    # '''
+    if ema_source_key == "ema_matrix":
+        ema_tensor = dict_to_tensor(
+            _nested_to_layer_tensors(payload["ema_matrix"])
+        ).to(device=device, dtype=torch.float32)
+    elif ema_source_key == "ema_matrix_prior_corrected":    
+        ema_tensor = dict_to_tensor( 
+            _nested_to_layer_tensors(payload["ema_matrix_prior_corrected"]) 
+        ).to(device=device, dtype=torch.float32)
+    else:
+        raise ValueError(f"Invalid ema_source_key: {ema_source_key}")
     # import ipdb; ipdb.set_trace()
     return {
         "text": dict_to_tensor(text_scores).to(device=device, dtype=torch.float32),
@@ -74,6 +76,7 @@ def prepare_scores(
     mask_method_kwargs: Dict[str, Any],
     smooth_fn: str = "sqrt",
     modality_aware: bool = False,
+    ema_source_key: str = "ema_matrix",
     normalize: bool = False,
     device: str = "cpu",
     verbose: bool = False,
@@ -90,7 +93,7 @@ def prepare_scores(
         
     intra_expert_metric = mask_method_kwargs.get("intra_expert_metric", "activation")
     if modality_aware:
-        modality_scores = load_modality_channel_scores(payload, device, intra_expert_metric)
+        modality_scores = load_modality_channel_scores(payload, ema_source_key, device, intra_expert_metric)
         if normalize:
             modality_scores["text"] = modality_scores["text"] / modality_scores["text"].sum(
                 dim=(1, 2), keepdim=True
@@ -99,7 +102,7 @@ def prepare_scores(
                 dim=(1, 2), keepdim=True
             ).clamp_min(1e-12)
         intermediate_scores = (modality_scores["text"] + modality_scores["visual"]) / 2.0
-        _print(f"[prepare_scores] intermediate_scores is mean of text and visual scores, normalize={normalize}")
+        _print(f"[prepare_scores] intermediate_scores is mean of text and visual scores, normalize={normalize}, ema_source_key={ema_source_key}")
         L, E, I = intermediate_scores.shape
         intermediate_scores = (intermediate_scores, modality_scores)
     else:
