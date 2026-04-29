@@ -36,13 +36,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--scores_path",
         type=str,
-        # default="/home/dyf/code/distill/MAES/storage/data_distill_kimi/mixed-num_1024-token_2048-sample_at1.0-0423143941/teacher_hidden-scores.pt",
-        required=True,
+        # default="storage/data_distill_kimi/mixed-num_1024-token_2048-sample_at1.0-0423143941/teacher_hidden-scores.pt",
+        default="storage/data_distill_kimi/mixed-num_342-token_2048-sample_at1.0-0421180638/teacher_hidden-new_ema.pt"
+        # default="storage/scores/kimi-vl-a3b_gqa-num_256-token_1024-fill_0-0424-182029/scores.pt"
+        # default="storage/scores/kimi-vl-a3b_gqa-num_16-token_1024-fill_0-0424-181932/scores.pt"
     )
     p.add_argument(
         "--output_dir",
         type=str,
-        default="/home/dyf/code/distill/MAES/observations/a1/results",
+        default="/home/dyf/code/distill/MAES/observations/a1/results/second",
     )
     p.add_argument("--output_name", type=str, default="")
 
@@ -56,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--smooth_fn", type=str, default="sqrt")
     p.add_argument("--normalize", action="store_true")
     p.add_argument("--modality_aware", action="store_true")
+    p.add_argument("--ema_source_key", type=str, default="ema_matrix")
     p.add_argument(
         "--use_ema",
         action=argparse.BooleanOptionalAction,
@@ -127,6 +130,7 @@ def _save_variant(
         "use_ema": use_ema,
         "normalize": args.normalize,
         "smooth_fn": args.smooth_fn,
+        "ema_source_key": args.ema_source_key,
     }
 
     result = generate_masks(
@@ -141,6 +145,10 @@ def _save_variant(
     result.setdefault("visual_K_E", None)
     result.setdefault("k_visual", None)
     result.setdefault("k_text", None)
+    if not use_ema:
+        result["ema_matrix"] = None
+    else:
+        result.setdefault("ema_matrix", None)
     result["scores_dir"] = args.scores_path
 
     payload = {
@@ -157,6 +165,7 @@ def _save_variant(
             "use_ema": use_ema,
         },
         "result": result,
+        "ema_matrix": result.get("ema_matrix"),
     }
 
     out_name = _auto_name(args, modality_aware=modality_aware, use_ema=use_ema)

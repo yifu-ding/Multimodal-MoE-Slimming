@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Sweep INTER_METHOD × INTRA_METHOD × MODALITY_AWARE × INTRA_EXPERT_METRIC by calling run_prune_eval_kimi_gqa.sh.
-# Appends one markdown table row per run to results/prune_eval_kimi_gqa_p50/summary.md (never overwrites).
+# Sweep PRUNE_RATIO × INTER_METHOD × INTRA_METHOD × MODALITY_AWARE × INTRA_EXPERT_METRIC via run_prune_eval_kimi_gqa.sh.
+# Appends one row per run to each ratio's results/prune_eval_p<RATIO>/<MODEL>/sweep_settings-*/summary.md (never overwrites).
 #
 # Override grids (space-separated):
+#   SWEEP_PRUNE_RATIOS="0.3 0.5"
 #   SWEEP_INTER_METHODS="uniform loss"
 #   SWEEP_INTRA_METHODS="uniform second_attr_coverage"
 #   SWEEP_MODALITY_AWARE="0 1"
@@ -19,11 +20,12 @@
 #   3proj_grad, 3proj_grad_text, 3proj_grad_visual
 #   wg, weight
 #
-# Other env vars are passed through to run_prune_eval_kimi_gqa.sh (SCORES_PATH, PRUNE_RATIO, NUM_SAMPLES, ...).
+# Prune-ratio sweep is the outer loop; each ratio writes under results/prune_eval_p<RATIO>/...
+# Other env vars are passed through to run_prune_eval_kimi_gqa.sh (SCORES_PATH, NUM_SAMPLES, ...).
 #
 # Skip already-finished settings (default on):
-#   If summary.md already has a row with the same inter_method, intra_method, modality_aware,
-#   intra_expert_metric and status ``ok``, that combination is skipped.
+#   If summary.md already has a row with the same prune_ratio, inter_method, intra_method,
+#   modality_aware, intra_expert_metric and status ``ok``, that combination is skipped.
 #   SWEEP_SKIP_DONE=0  — run everything (ignore summary)
 
 set -euo pipefail
@@ -39,6 +41,7 @@ export PYTHONPATH="${PREFIX}"
 # export SCORES_PATH="storage/prune/scores/kimi-vl-a3b_coco-rell2-fill1-0416-115847/scores.pt"
 # export SCORES_PATH="storage/prune/scores/kimi-vl-a3b_gqa-rell2-041513.pt"
 export SCORES_PATH="${SCORES_PATH:-}"
+SWEEP_PRUNE_RATIOS="${SWEEP_PRUNE_RATIOS:-0.1 0.2 0.3 0.4 0.5 0.6 0.7}"
 
 # Default grids (edit or override via env)
 # INTRA_METHOD = --intra_method (intra-layer planner); see run_prune_eval_kimi_gqa.sh
@@ -76,112 +79,140 @@ SMOOTH_FN="${SMOOTH_FN:-sqrt}"
 #   weight
 SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act 3proj_act down_second_order_exact down_second_order_approx 3proj_saliency 3proj_second_order}"
 # 3proj_act down_second_order 3proj_second_order down_saliency 3proj_saliency 3proj_grad
-
 SWEEP_TS="${SWEEP_TS:-$(date +%m%d%H%M)}"
 MODEL_NAME="${MODEL_NAME:-kimi}"
 SUFFIX="${SUFFIX:-}"
-SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-${SUFFIX}"
-
-SUMMARY_FILE="${SUMMARY_FILE:-${SWEEP_BASE}/summary.md}"
-SWEEP_LOG_DIR="${SWEEP_LOG_DIR:-${SWEEP_BASE}/logs}"
 SWEEP_SKIP_DONE="${SWEEP_SKIP_DONE:-1}"
-mkdir -p "${SWEEP_BASE}"
-mkdir -p "${SWEEP_LOG_DIR}"
-
-RUN_IDX=0
-SWEEP_SKIPPED=0
 SWEEP_ID="$(date +%Y%m%d_%H%M%S)"
 
-if [[ ! -f "${SUMMARY_FILE}" ]]; then
+TOTAL_APPENDED=0
+TOTAL_SKIPPED=0
+
+for PRUNE_RATIO in ${SWEEP_PRUNE_RATIOS}; do
+  SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p${PRUNE_RATIO}/${MODEL_NAME}/sweep_settings-${SUFFIX}"
+
+  if [[ -d "${SWEEP_BASE}" ]]; then
+    echo "warning: SWEEP_BASE already exists: ${SWEEP_BASE}" >&2
+    if [[ ! -t 0 ]]; then
+      echo "error: need interactive confirmation but stdin is not a terminal; exiting." >&2
+      exit 1
+    fi
+    while true; do
+      read -r -p "Continue reusing this directory? [y/n]: " reply
+      case "${reply}" in
+        [yY]) break ;;
+        [nN]) echo "Aborted." >&2; exit 1 ;;
+        *) echo "Please enter y or n." >&2 ;;
+      esac
+    done
+  fi
+
+  SUMMARY_FILE="${SWEEP_BASE}/summary.md"
+  SWEEP_LOG_DIR="${SWEEP_BASE}/logs"
+  mkdir -p "${SWEEP_BASE}"
+  mkdir -p "${SWEEP_LOG_DIR}"
+
+  RUN_IDX=0
+  SWEEP_SKIPPED=0
+
+  if [[ ! -f "${SUMMARY_FILE}" ]]; then
+    {
+      echo "# Prune + Eval sweep summary"
+      echo ""
+      echo "Auto-generated table; new runs are **appended** (this file is not overwritten)."
+      echo ""
+    } >> "${SUMMARY_FILE}"
+  fi
+
   {
-    echo "# Prune + Eval sweep summary"
     echo ""
-    echo "Auto-generated table; new runs are **appended** (this file is not overwritten)."
+    echo "## Sweep batch \`${SWEEP_ID}\` (prune_ratio=${PRUNE_RATIO})"
     echo ""
+    echo "Started: $(date -Iseconds)"
+    echo ""
+    echo "SCORES_PATH: \`${SCORES_PATH}\`"
+    echo ""
+    echo "| # | prune_ratio | inter_method | intra_method | modality_aware | intra_expert_metric | smooth_fn | accuracy | correct/total | status | log |"
+    echo "|---|-------------|--------------|--------------|----------------|---------------------|-----------|----------|---------------|--------|-----|"
   } >> "${SUMMARY_FILE}"
-fi
 
-{
-  echo ""
-  echo "## Sweep batch \`${SWEEP_ID}\`"
-  echo ""
-  echo "Started: $(date -Iseconds)"
-  echo ""
-  echo "SCORES_PATH: \`${SCORES_PATH}\`"
-  echo ""
-  echo "| # | inter_method | intra_method | modality_aware | intra_expert_metric | smooth_fn | accuracy | correct/total | status | log |"
-  echo "|---|--------------|--------------|----------------|---------------------|-----------|----------|---------------|--------|-----|"
-} >> "${SUMMARY_FILE}"
-
-for INTER_METHOD in ${SWEEP_INTER_METHODS}; do
-  for INTRA_METHOD in ${SWEEP_INTRA_METHODS}; do
-    for MODALITY_AWARE in ${SWEEP_MODALITY_AWARE}; do
-      for INTRA_EXPERT_METRIC in ${SWEEP_INTRA_EXPERT_METRICS}; do
-        if [[ "${SWEEP_SKIP_DONE}" == "1" ]] && [[ -f "${SUMMARY_FILE}" ]]; then
-          if grep -F "| ${INTER_METHOD} | ${INTRA_METHOD} | ${MODALITY_AWARE} | ${INTRA_EXPERT_METRIC} |" "${SUMMARY_FILE}" 2>/dev/null | grep -qF '| ok |'; then
-            echo "[sweep] Skip (already in summary with ok): INTER=${INTER_METHOD} INTRA=${INTRA_METHOD} MODALITY=${MODALITY_AWARE} METRIC=${INTRA_EXPERT_METRIC}"
-            SWEEP_SKIPPED=$((SWEEP_SKIPPED + 1))
-            continue
+  for INTER_METHOD in ${SWEEP_INTER_METHODS}; do
+    for INTRA_METHOD in ${SWEEP_INTRA_METHODS}; do
+      for MODALITY_AWARE in ${SWEEP_MODALITY_AWARE}; do
+        for INTRA_EXPERT_METRIC in ${SWEEP_INTRA_EXPERT_METRICS}; do
+          if [[ "${SWEEP_SKIP_DONE}" == "1" ]] && [[ -f "${SUMMARY_FILE}" ]]; then
+            if grep -F "| ${PRUNE_RATIO} | ${INTER_METHOD} | ${INTRA_METHOD} | ${MODALITY_AWARE} | ${INTRA_EXPERT_METRIC} |" "${SUMMARY_FILE}" 2>/dev/null | grep -qF '| ok |'; then
+              echo "[sweep] Skip (already in summary with ok): PRUNE=${PRUNE_RATIO} INTER=${INTER_METHOD} INTRA=${INTRA_METHOD} MODALITY=${MODALITY_AWARE} METRIC=${INTRA_EXPERT_METRIC}"
+              SWEEP_SKIPPED=$((SWEEP_SKIPPED + 1))
+              continue
+            fi
           fi
-        fi
 
-        RUN_IDX=$((RUN_IDX + 1))
-        TAG="$(printf '%04d' "${RUN_IDX}")_${SWEEP_ID}_${INTER_METHOD}_${INTRA_METHOD}_m${MODALITY_AWARE}_${INTRA_EXPERT_METRIC}"
-        # sanitize filename
-        TAG="${TAG//[^a-zA-Z0-9._-]/_}"
-        RUN_LOG="${SWEEP_LOG_DIR}/stdout_${TAG}.log"
+          RUN_IDX=$((RUN_IDX + 1))
+          TAG="$(printf '%04d' "${RUN_IDX}")_${SWEEP_ID}_p${PRUNE_RATIO}_${INTER_METHOD}_${INTRA_METHOD}_m${MODALITY_AWARE}_${INTRA_EXPERT_METRIC}"
+          # sanitize filename
+          TAG="${TAG//[^a-zA-Z0-9._-]/_}"
+          RUN_LOG="${SWEEP_LOG_DIR}/stdout_${TAG}.log"
 
-        echo ""
-        echo "========== sweep run ${RUN_IDX}: INTER=${INTER_METHOD} INTRA=${INTRA_METHOD} MODALITY=${MODALITY_AWARE} METRIC=${INTRA_EXPERT_METRIC} =========="
+          echo ""
+          echo "========== sweep run ${RUN_IDX} (p=${PRUNE_RATIO}): INTER=${INTER_METHOD} INTRA=${INTRA_METHOD} MODALITY=${MODALITY_AWARE} METRIC=${INTRA_EXPERT_METRIC} =========="
 
-        set +e
-        TASK="${TASK:-gqa}" \
-          INTER_METHOD="${INTER_METHOD}" \
-          INTRA_METHOD="${INTRA_METHOD}" \
-          MODALITY_AWARE="${MODALITY_AWARE}" \
-          INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC}" \
-          SMOOTH_FN="${SMOOTH_FN}" \
-          PREFIX="${PREFIX}" \
-          OUTPUT_DIR="${SWEEP_BASE}" \
-          TIMESTAMP="${TAG}" \
-          LOG_FILE="${RUN_LOG}" \
-          bash "${SCRIPT_DIR}/run_prune_eval_kimi_gqa.sh"
-        EXIT_CODE=$?
-        set -e
+          set +e
+          TASK="${TASK:-gqa}" \
+            PRUNE_RATIO="${PRUNE_RATIO}" \
+            INTER_METHOD="${INTER_METHOD}" \
+            INTRA_METHOD="${INTRA_METHOD}" \
+            MODALITY_AWARE="${MODALITY_AWARE}" \
+            INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC}" \
+            SMOOTH_FN="${SMOOTH_FN}" \
+            PREFIX="${PREFIX}" \
+            OUTPUT_DIR="${SWEEP_BASE}" \
+            TIMESTAMP="${TAG}" \
+            LOG_FILE="${RUN_LOG}" \
+            bash "${SCRIPT_DIR}/run_prune_eval_kimi_gqa.sh"
+          EXIT_CODE=$?
+          set -e
 
-        ACC_LINE="$(grep '\[Run\] Accuracy:' "${RUN_LOG}" | tail -n 1 || true)"
-        # Example: [Run] Accuracy: 0.6120  (612/1000)
-        if [[ -n "${ACC_LINE}" ]]; then
-          ACC="$(echo "${ACC_LINE}" | sed -n 's/.*Accuracy: \([0-9.]*\).*/\1/p')"
-          DETAIL="$(echo "${ACC_LINE}" | sed -n 's/.*(\([^)]*\)).*/\1/p')"
-          STATUS="ok"
-        else
-          ACC=""
-          DETAIL=""
-          if [[ "${EXIT_CODE}" -eq 0 ]]; then
-            STATUS="no_accuracy_line"
+          ACC_LINE="$(grep '\[Run\] Accuracy:' "${RUN_LOG}" | tail -n 1 || true)"
+          # Example: [Run] Accuracy: 0.6120  (612/1000)
+          if [[ -n "${ACC_LINE}" ]]; then
+            ACC="$(echo "${ACC_LINE}" | sed -n 's/.*Accuracy: \([0-9.]*\).*/\1/p')"
+            DETAIL="$(echo "${ACC_LINE}" | sed -n 's/.*(\([^)]*\)).*/\1/p')"
+            STATUS="ok"
           else
-            STATUS="exit_${EXIT_CODE}"
+            ACC=""
+            DETAIL=""
+            if [[ "${EXIT_CODE}" -eq 0 ]]; then
+              STATUS="no_accuracy_line"
+            else
+              STATUS="exit_${EXIT_CODE}"
+            fi
           fi
-        fi
 
-        REL_LOG="logs/$(basename "${RUN_LOG}")"
-        {
-          echo "| ${RUN_IDX} | ${INTER_METHOD} | ${INTRA_METHOD} | ${MODALITY_AWARE} | ${INTRA_EXPERT_METRIC} | ${SMOOTH_FN} | ${ACC:-—} | ${DETAIL:-—} | ${STATUS} | \`${REL_LOG}\` |"
-        } >> "${SUMMARY_FILE}"
+          REL_LOG="logs/$(basename "${RUN_LOG}")"
+          {
+            echo "| ${RUN_IDX} | ${PRUNE_RATIO} | ${INTER_METHOD} | ${INTRA_METHOD} | ${MODALITY_AWARE} | ${INTRA_EXPERT_METRIC} | ${SMOOTH_FN} | ${ACC:-—} | ${DETAIL:-—} | ${STATUS} | \`${REL_LOG}\` |"
+          } >> "${SUMMARY_FILE}"
 
+        done
       done
     done
   done
+
+  {
+    echo ""
+    echo "Finished: $(date -Iseconds)"
+    echo ""
+    echo "**Batch stats:** appended_rows=${RUN_IDX}, skipped_already_ok=${SWEEP_SKIPPED}"
+    echo ""
+  } >> "${SUMMARY_FILE}"
+
+  TOTAL_APPENDED=$((TOTAL_APPENDED + RUN_IDX))
+  TOTAL_SKIPPED=$((TOTAL_SKIPPED + SWEEP_SKIPPED))
+
+  echo ""
+  echo "[sweep] prune_ratio=${PRUNE_RATIO}: appended ${RUN_IDX} row(s), skipped ${SWEEP_SKIPPED} (already ok) -> ${SUMMARY_FILE}"
 done
 
-{
-  echo ""
-  echo "Finished: $(date -Iseconds)"
-  echo ""
-  echo "**Batch stats:** appended_rows=${RUN_IDX}, skipped_already_ok=${SWEEP_SKIPPED}"
-  echo ""
-} >> "${SUMMARY_FILE}"
-
 echo ""
-echo "[sweep] This batch: appended ${RUN_IDX} row(s), skipped ${SWEEP_SKIPPED} (already ok) -> ${SUMMARY_FILE}"
+echo "[sweep] All prune ratios: total appended ${TOTAL_APPENDED} row(s), total skipped ${TOTAL_SKIPPED} (already ok)"
