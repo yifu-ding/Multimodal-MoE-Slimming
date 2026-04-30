@@ -54,22 +54,34 @@ def load_modality_channel_scores(
     }
     text_scores = channel_scores[f"{intra_expert_metric}_text"]
     visual_scores = channel_scores[f"{intra_expert_metric}_visual"]
-    if ema_source_key == "ema_matrix":
-        ema_tensor = dict_to_tensor(
+    ema_tensors = {}
+    if "ema_matrix" in payload:
+        ema_tensors["ema_matrix"] = dict_to_tensor(
             _nested_to_layer_tensors(payload["ema_matrix"])
         ).to(device=device, dtype=torch.float32)
-    elif ema_source_key == "ema_matrix_prior_corrected":    
-        ema_tensor = dict_to_tensor( 
-            _nested_to_layer_tensors(payload["ema_matrix_prior_corrected"]) 
+    if "ema_matrix_prior_corrected" in payload:
+        ema_tensors["ema_matrix_prior_corrected"] = dict_to_tensor(
+            _nested_to_layer_tensors(payload["ema_matrix_prior_corrected"])
         ).to(device=device, dtype=torch.float32)
-    else:
+
+    if ema_source_key not in {"ema_matrix", "ema_matrix_prior_corrected"}:
         raise ValueError(f"Invalid ema_source_key: {ema_source_key}")
-    # import ipdb; ipdb.set_trace()
-    return {
+
+    if ema_source_key not in ema_tensors:
+        raise KeyError(
+            f"Requested EMA source '{ema_source_key}' not found in scores payload. "
+            f"Available EMA keys: {sorted(ema_tensors.keys())}"
+        )
+
+    result = {
         "text": dict_to_tensor(text_scores).to(device=device, dtype=torch.float32),
         "visual": dict_to_tensor(visual_scores).to(device=device, dtype=torch.float32),
-        "ema_matrix": ema_tensor,
     }
+    result.update(ema_tensors)
+    # Backward-compatible alias: downstream code may still read modality_scores["ema_matrix"]
+    # to get the currently selected EMA tensor.
+    result["ema_matrix"] = ema_tensors[ema_source_key]
+    return result
 
 def prepare_scores(
     scores_dir: str,

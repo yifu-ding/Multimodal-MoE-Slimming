@@ -53,7 +53,7 @@ SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-1}"
 SWEEP_SHARED_PROTECT="${SWEEP_SHARED_PROTECT:-1}"
 NORMALIZE="${NORMALIZE:-0}"
 USE_EMA="${USE_EMA:-1}"
-EMA_SOURCE_KEY="${EMA_SOURCE_KEY:-ema_matrix}"
+EMA_SOURCE_KEY="${EMA_SOURCE_KEY:-ema_matrix_prior_corrected}"
 SMOOTH_FN="${SMOOTH_FN:-cbrt}" # sqrt cbrt fourth_root log
 SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act}"
 # 3proj_second_order down_saliency 3proj_saliency 3proj_grad wg
