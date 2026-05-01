@@ -44,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--output_dir",
         type=str,
-        default="/home/dyf/code/distill/MAES/observations/a1/results/second",
+        default="/home/dyf/code/distill/MAES/observations/a1/results/unified",
     )
     p.add_argument("--output_name", type=str, default="")
 

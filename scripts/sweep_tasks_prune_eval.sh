@@ -31,7 +31,7 @@ cd "${REPO_ROOT}"
 
 PREFIX="${PREFIX:-${REPO_ROOT}}"
 export PYTHONPATH="${PREFIX}"
-
+PRUNE_RATIO="${PRUNE_RATIO:-0.5}"
 # export SCORES_PATH="storage/prune/scores/kimi-vl-a3b_gqa-rell2-041513.pt"
 # export SCORES_PATH="storage/prune/scores/kimi-vl-a3b_coco-rell2-fill1-0416-115847.pt"
 # export SCORES_PATH="storage/data_distill_kimi/gqa-sample_at1.0-0418234400/distilled-0419142618/scores-step4000.pt"
@@ -48,12 +48,12 @@ SWEEP_TASKS="${SWEEP_TASKS:-chartqa coco2017cap mmstar mmbench realworldqa gqa m
 # mmvet video_mmmu videomme mvbench egoschema
 # ── Setting grids (same defaults as sweep_prune_eval_kimi_gqa.sh) ──────────────
 SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform}"
-SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-second_attr_coverage}"
+SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-second_attr_fillzero_coverage}"
 SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-1}"
 SWEEP_SHARED_PROTECT="${SWEEP_SHARED_PROTECT:-1}"
 NORMALIZE="${NORMALIZE:-0}"
 USE_EMA="${USE_EMA:-1}"
-EMA_SOURCE_KEY="${EMA_SOURCE_KEY:-ema_matrix}"
+EMA_SOURCE_KEY="${EMA_SOURCE_KEY:-ema_matrix_prior_corrected}"  # ema_matrix_prior_corrected
 SMOOTH_FN="${SMOOTH_FN:-cbrt}" # sqrt cbrt fourth_root log
 SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act}"
 # 3proj_second_order down_saliency 3proj_saliency 3proj_grad wg
@@ -93,7 +93,7 @@ else
   esac
 fi
 SUFFIX="${SUFFIX:-}"
-SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-${SUFFIX}"  # -${SWEEP_TS}
+SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p${PRUNE_RATIO}/sweep_tasks-${MODEL_NAME}-${SUFFIX}"  # -${SWEEP_TS}
 export OUTPUT_DIR="${SWEEP_BASE}"
 
 if [[ -d "${SWEEP_BASE}" ]]; then
@@ -187,6 +187,7 @@ for TASK in ${SWEEP_TASKS}; do
             NORMALIZE="${NORMALIZE}" \
             USE_EMA="${USE_EMA}" \
             EMA_SOURCE_KEY="${EMA_SOURCE_KEY}" \
+            PRUNE_RATIO="${PRUNE_RATIO}" \
             INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC}" \
             SMOOTH_FN="${SMOOTH_FN}" \
             MODEL_NAME="${MODEL_NAME}" \
