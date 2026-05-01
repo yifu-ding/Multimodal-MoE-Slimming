@@ -423,6 +423,43 @@ def _collect_stream_examples(
     )
 
 
+def _compute_teacher_baseline_losses(
+    *,
+    teacher_batch: torch.Tensor,
+    teacher_labels: torch.Tensor | None,
+    stream: _RoundRobinDatasetStream,
+    bundle,
+    args,
+    train_dtype: torch.dtype,
+    sample_generator: torch.Generator,
+) -> dict[str, torch.Tensor]:
+    """Compute an online teacher-vs-teacher baseline for contextual ratio metrics."""
+    ref_batch, ref_labels, _ = _collect_stream_examples(
+        stream=stream,
+        target_count=int(teacher_batch.shape[0]),
+        bundle=bundle,
+        args=args,
+        train_dtype=train_dtype,
+        sample_generator=sample_generator,
+        desc=None,
+    )
+    ref_batch = ref_batch.to(device=teacher_batch.device, dtype=teacher_batch.dtype)
+    ref_labels = ref_labels.to(device=teacher_batch.device)
+    ref_losses = _compute_losses(
+        teacher_batch,
+        ref_batch,
+        teacher_labels,
+        ref_labels,
+        mmd_subsample=args.mmd_subsample,
+    )
+    return {
+        "baseline/mmd_teacher_teacher": ref_losses["mmd"].detach(),
+        "baseline/cov_teacher_teacher": ref_losses["cov"].detach(),
+        "baseline/mean_teacher_teacher": ref_losses["mean"].detach(),
+        "baseline/var_teacher_teacher": ref_losses["var"].detach(),
+    }
+
+
 def _forward_next_block(
     *,
     bundle,
@@ -618,6 +655,8 @@ def main() -> None:
         wandb_run.define_metric("step")
         wandb_run.define_metric("loss/*", step_metric="step")
         wandb_run.define_metric("diag/*", step_metric="step")
+        wandb_run.define_metric("baseline/*", step_metric="step")
+        wandb_run.define_metric("ratio/*", step_metric="step")
         wandb_run.define_metric("schedule/*", step_metric="step")
 
     from observations.common import load_model_bundle, resolve_model_name_or_path
@@ -914,7 +953,6 @@ def main() -> None:
             for k, v in diagnostics.items():
                 final_losses[k] = float(v.detach().cpu().item())
 
-        # 注意: 在线版未实现 teacher-teacher baseline ratio (离线 ``distill_synthetic_hidden`` 中有)
         should_log_wandb = (
             wandb_run is not None
             and (
@@ -925,6 +963,23 @@ def main() -> None:
                 )
             )
         )
+        if should_log_wandb:
+            teacher_baseline = _compute_teacher_baseline_losses(
+                teacher_batch=teacher_batch,
+                teacher_labels=teacher_batch_labels,
+                stream=stream,
+                bundle=bundle,
+                args=args,
+                train_dtype=train_dtype,
+                sample_generator=sample_generator,
+            )
+            for k, v in teacher_baseline.items():
+                final_losses[k] = float(v.detach().cpu().item())
+            for key in ("mmd", "cov", "mean", "var"):
+                baseline_key = f"baseline/{key}_teacher_teacher"
+                final_losses[f"ratio/{key}_vs_teacher_teacher"] = (
+                    final_losses[key] / max(final_losses[baseline_key], 1e-8)
+                )
         if should_log_wandb:
             wandb_payload = {
                 "step": step,

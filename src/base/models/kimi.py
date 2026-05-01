@@ -709,10 +709,11 @@ def vl_forward(
     sample_layer = None
     if len(self.language_model.model.layers) > 0:
         sample_layer = self.language_model.model.layers[min(1, len(self.language_model.model.layers) - 1)]
+    sample_gate = getattr(sample_layer.mlp, "gate", None) if sample_layer is not None else None
     if sample_layer is not None and (
         hasattr(sample_layer.mlp, "gate_dict")
         or hasattr(sample_layer.mlp, "freq_save_dir")
-        or hasattr(sample_layer.mlp.gate, "topk_save_dir")
+        or hasattr(sample_gate, "topk_save_dir")
         or moe_layer_skip != -1
         or record_mask
         or enable_tau_skip
@@ -739,6 +740,7 @@ def vl_forward(
     for idx, layer in enumerate(self.language_model.model.layers):
         layer.input_ids = input_ids
         layer.start_idx = start_idx
+        layer_gate = getattr(layer.mlp, "gate", None)
         if (
             self.config.text_config.n_routed_experts is not None
             and idx >= self.config.text_config.first_k_dense_replace
@@ -769,8 +771,8 @@ def vl_forward(
                 and layer.mlp.freq_save_dir is not None
             )
             or (
-                hasattr(layer.mlp.gate, "topk_save_dir")
-                and layer.mlp.gate.topk_save_dir is not None
+                hasattr(layer_gate, "topk_save_dir")
+                and layer_gate.topk_save_dir is not None
             )
             or moe_layer_skip != -1
             or enable_tau_skip
@@ -781,10 +783,12 @@ def vl_forward(
             layer.mlp.moe_media_mask = (
                 moe_media_mask[:, None] if moe_media_mask is not None else None
             )
-            layer.mlp.gate.moe_text_index = layer.mlp.moe_text_mask.squeeze(-1).nonzero(
+            if layer_gate is None:
+                continue
+            layer_gate.moe_text_index = layer.mlp.moe_text_mask.squeeze(-1).nonzero(
                 as_tuple=True
             )[0][:, None]
-            layer.mlp.gate.moe_media_index = layer.mlp.moe_media_mask.squeeze(
+            layer_gate.moe_media_index = layer.mlp.moe_media_mask.squeeze(
                 -1
             ).nonzero(as_tuple=True)[0][:, None]
 

@@ -10,8 +10,16 @@
 #
 # Direct execution also exports in that subshell and prints the line to copy:
 #   bash scripts/select_least_used_gpu.sh
+#
+# If CUDA_VISIBLE_DEVICES is already non-empty in the environment, this script
+# prints a warning and does nothing (does not override your setting).
 
 set -euo pipefail
+
+if [[ -n "${CUDA_VISIBLE_DEVICES-}" ]]; then
+  echo "select_least_used_gpu: warning: CUDA_VISIBLE_DEVICES is already set to '${CUDA_VISIBLE_DEVICES}'; leaving it unchanged (skip auto pick)." >&2
+  return 0 2>/dev/null || exit 0
+fi
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
   echo "select_least_used_gpu: nvidia-smi not found" >&2

@@ -58,10 +58,10 @@ WANDB_PROJECT="${WANDB_PROJECT:-maes}"
 WANDB_MODE="${WANDB_MODE:-online}"
 WANDB_EVERY_N_STEPS="${WANDB_EVERY_N_STEPS:-10}"
 DIVERSITY_ABLATION="${DIVERSITY_ABLATION:-no_div}"  # no_div, full
-DISTRIBUTION_ABLATION="${DISTRIBUTION_ABLATION:-mmd_only}"  # moment_only, mmd_only, full   
+DISTRIBUTION_ABLATION="${DISTRIBUTION_ABLATION:-full}"  # moment_only, mmd_only, full   
 ABLATION_TAG="div-${DIVERSITY_ABLATION}_dist-${DISTRIBUTION_ABLATION}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-online-distilled-${RUN_STAMP}-${ABLATION_TAG}}"
-OUTPUT_PATH="${OUTPUT_PATH:-${PREFIX}/storage/data_distill_kimi/online-distilled-${RUN_STAMP}-${ABLATION_TAG}/distilled_hidden-step${TRAIN_STEPS}.pt}"
+OUTPUT_PATH="${OUTPUT_PATH:-${PREFIX}/storage/data_distill_kimi/online-distilled-${RUN_STAMP}-${ABLATION_TAG}-blk_${LAMBDA_BLOCK}/distilled_hidden-step${TRAIN_STEPS}.pt}"
 RESET_OPTIMIZER_ON_RESUME="${RESET_OPTIMIZER_ON_RESUME:-0}"
 
 EXTRA_ARGS=("$@")
