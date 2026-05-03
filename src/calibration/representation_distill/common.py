@@ -637,8 +637,9 @@ def extract_block_output(
     inputs: Dict[str, Any],
     layer_idx: int,
     capture_attn_importance: bool = False,
+    capture_input: bool = False,
 ) -> BlockExtractionResult:
-    """Extract the output of decoder block *layer_idx*.
+    """Extract the input or output of decoder block *layer_idx*.
 
     When *capture_attn_importance* is True, also hooks into the self-attention
     sub-layer to compute a per-token importance score (L2-norm of the attention
@@ -662,12 +663,18 @@ def extract_block_output(
                 _capture_attn, with_kwargs=True,
             )
 
-    # --- hook block output and early-stop ----------------------------------
-    def _capture_and_stop(module, args, kwargs, output):
-        state["output"] = unwrap_output(output).detach()
+    def _capture_input(module, args, kwargs):
+        hidden = unwrap_output(args[0]).detach()
+        state["hidden"] = hidden
+
+    def _capture_output(module, args, kwargs, output):
+        state["hidden"] = unwrap_output(output).detach()
         raise EarlyStopForward()
 
-    handle = block.register_forward_hook(_capture_and_stop, with_kwargs=True)
+    pre_handle = None
+    if capture_input:
+        pre_handle = block.register_forward_pre_hook(_capture_input, with_kwargs=True)
+    handle = block.register_forward_hook(_capture_output, with_kwargs=True)
     try:
         with torch.no_grad():
             bundle.model(**inputs, use_cache=False, return_dict=True)
@@ -675,15 +682,25 @@ def extract_block_output(
         pass
     finally:
         handle.remove()
+        if pre_handle is not None:
+            pre_handle.remove()
         if attn_handle is not None:
             attn_handle.remove()
 
-    if "output" not in state:
-        raise RuntimeError(f"Failed to capture output of layer {layer_idx}.")
+    if "hidden" not in state:
+        raise RuntimeError(f"Failed to capture hidden states for layer {layer_idx}.")
     return BlockExtractionResult(
-        hidden_states=state["output"],
+        hidden_states=state["hidden"],
         attn_importance=state.get("attn_importance"),
     )
+
+
+def resolve_hidden_start_layer(teacher_meta: Dict[str, Any]) -> int:
+    teacher_layer = int(teacher_meta["teacher_layer"])
+    teacher_layer_type = teacher_meta.get("teacher_layer_type", "full_block_output")
+    if teacher_layer_type in {"full_block_input", "block_input"}:
+        return teacher_layer
+    return teacher_layer + 1
 
 
 def build_sample_manifest(samples: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:

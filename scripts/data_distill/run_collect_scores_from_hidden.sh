@@ -33,6 +33,27 @@ DEVICE_MAP="${DEVICE_MAP:-cuda:0}"
 
 EXTRA_ARGS=("$@")
 
+START_LAYER_INFO=""
+if [[ -n "${HIDDEN_PAYLOAD_PATH}" && -f "${HIDDEN_PAYLOAD_PATH}" ]]; then
+    START_LAYER_INFO="$(
+        HIDDEN_PAYLOAD_PATH="${HIDDEN_PAYLOAD_PATH}" python - <<'PY'
+import os
+import torch
+from src.calibration.representation_distill.common import resolve_hidden_start_layer
+
+path = os.environ["HIDDEN_PAYLOAD_PATH"]
+payload = torch.load(path, map_location="cpu", weights_only=False)
+meta = payload.get("metadata", {})
+teacher_layer = meta.get("teacher_layer")
+teacher_layer_type = meta.get("teacher_layer_type")
+if teacher_layer is None:
+    print("unknown")
+else:
+    print(resolve_hidden_start_layer(meta))
+PY
+    )"
+fi
+
 CMD=(
     python -m src.calibration.representation_distill.collect_channel_scores_from_synth
     --model_name_or_path "${MODEL_PATH}"
@@ -49,6 +70,7 @@ CMD+=("${EXTRA_ARGS[@]}")
 
 echo "Model          : ${MODEL_PATH}"
 echo "Hidden payload : ${HIDDEN_PAYLOAD_PATH}"
+echo "Start layer    : ${START_LAYER_INFO:-unknown}"
 echo "Output         : ${OUTPUT_PATH}"
 echo "Batch size     : ${BATCH_SIZE}"
 echo "HF_HOME        : ${HF_HOME}"

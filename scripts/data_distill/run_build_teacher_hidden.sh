@@ -7,6 +7,7 @@ export PYTHONPATH="${PREFIX}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 TEACHER_LAYER="${TEACHER_LAYER:-0}"
+CACHE_BLOCK_INPUT="${CACHE_BLOCK_INPUT:-1}"
 COMPRESSED_LENGTH="${COMPRESSED_LENGTH:-2048}"  # sequence length  # 只压缩 seqlen
 SAMPLES_PER_DATASET="${SAMPLES_PER_DATASET:-171}"  # 多少条，这个在cache过程中是不变的（不压缩条数）
 BATCH_SIZE="${BATCH_SIZE:-2}"
@@ -69,11 +70,16 @@ if [[ "${CACHE_NEXT_BLOCK_TARGETS}" == "1" ]]; then
     CMD+=(--cache_next_block_targets)
 fi
 
+if [[ "${CACHE_BLOCK_INPUT}" == "1" ]]; then
+    CMD+=(--cache_block_input)
+fi
+
 CMD+=("${EXTRA_ARGS[@]}")
 
 echo "Model              : ${MODEL_PATH}"
 echo "Output             : ${OUTPUT_PATH}"
 echo "Teacher layer      : ${TEACHER_LAYER}"
+echo "Cache block input  : ${CACHE_BLOCK_INPUT}"
 echo "Compressed length  : ${COMPRESSED_LENGTH}"
 echo "Samples/dataset    : ${SAMPLES_PER_DATASET}"
 echo "Batch size         : ${BATCH_SIZE}"

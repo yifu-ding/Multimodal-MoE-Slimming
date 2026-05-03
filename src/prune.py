@@ -1,4 +1,4 @@
-"""Structural channel pruning for Kimi-VL and InternVL/GPT-OSS MoE experts."""
+"""Structural channel pruning for Kimi-VL, Qwen3-VL-MoE, and InternVL/GPT-OSS MoE experts."""
 
 from typing import Dict
 
@@ -24,6 +24,17 @@ def _is_gpt_oss_moe_layer(layer: nn.Module, config) -> bool:
         getattr(config, "num_local_experts", 0) > 0
         and hasattr(layer, "mlp")
         and hasattr(layer.mlp, "router")
+        and hasattr(layer.mlp, "experts")
+    )
+
+
+def _is_qwen3_moe_layer(layer_idx: int, layer: nn.Module, config) -> bool:
+    return (
+        layer_idx not in getattr(config, "mlp_only_layers", [])
+        and getattr(config, "num_experts", 0) > 0
+        and (layer_idx + 1) % int(getattr(config, "decoder_sparse_step", 1)) == 0
+        and hasattr(layer, "mlp")
+        and hasattr(layer.mlp, "gate")
         and hasattr(layer.mlp, "experts")
     )
 
@@ -88,6 +99,24 @@ def _shrink_gpt_oss_router_for_active_experts(module: nn.Module, keep_mask: torc
     )
     router.num_experts = n_active
     router.top_k = min(int(router.top_k), n_active)
+    return old_num_experts - n_active
+
+
+def _shrink_qwen3_router_for_active_experts(module: nn.Module, keep_mask: torch.Tensor) -> int:
+    keep_mask = keep_mask.to(dtype=torch.bool)
+    gate = module.gate
+    old_num_experts = int(keep_mask.numel())
+    n_active = int(keep_mask.sum().item())
+    if n_active == 0:
+        raise RuntimeError("All experts in this layer were fully pruned.")
+
+    keep_idx = torch.nonzero(keep_mask.to(gate.weight.device), as_tuple=False).view(-1)
+    gate.weight = nn.Parameter(gate.weight.data.index_select(0, keep_idx).contiguous())
+    module.num_experts = n_active
+    gate.out_features = n_active
+    if hasattr(gate, "num_experts"):
+        gate.num_experts = n_active
+    module.top_k = min(int(module.top_k), n_active)
     return old_num_experts - n_active
 
 
@@ -160,6 +189,63 @@ class PrunedGptOssExperts(nn.Module):
         return next_states.view(batch_size, -1, self.hidden_size)
 
 
+class PrunedQwen3Expert(nn.Module):
+    def __init__(
+        self,
+        *,
+        gate_proj: nn.Linear,
+        up_proj: nn.Linear,
+        down_proj: nn.Linear,
+        act_fn,
+    ) -> None:
+        super().__init__()
+        self.gate_proj = gate_proj
+        self.up_proj = up_proj
+        self.down_proj = down_proj
+        self.act_fn = act_fn
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+class PrunedQwen3Experts(nn.Module):
+    def __init__(self, experts: list[PrunedQwen3Expert], hidden_size: int) -> None:
+        super().__init__()
+        self.experts = nn.ModuleList(experts)
+        self.num_experts = len(experts)
+        self.hidden_size = int(hidden_size)
+
+    def __len__(self) -> int:
+        return len(self.experts)
+
+    def __iter__(self):
+        return iter(self.experts)
+
+    def __getitem__(self, idx: int) -> PrunedQwen3Expert:
+        return self.experts[idx]
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_indices: torch.Tensor,
+        routing_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        next_states = torch.zeros_like(hidden_states)
+        expert_mask = torch.nn.functional.one_hot(
+            router_indices, num_classes=self.num_experts
+        ).permute(2, 1, 0)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        for expert_tensor in expert_hit:
+            expert_idx = int(expert_tensor[0].item())
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            if token_idx.numel() == 0:
+                continue
+            out = self.experts[expert_idx](hidden_states[token_idx])
+            weighted = out * routing_weights[token_idx, top_k_pos, None]
+            next_states.index_add_(0, token_idx, weighted.to(next_states.dtype))
+        return next_states
+
+
 def _make_linear(
     weight: torch.Tensor,
     bias: torch.Tensor | None,
@@ -186,6 +272,9 @@ def _make_linear(
 def _resolve_model_layout(model: nn.Module, config):
     if hasattr(model, "language_model") and hasattr(model.language_model, "model"):
         return "kimi", model.language_model.model.layers
+    if hasattr(model, "model") and hasattr(model.model, "language_model"):
+        if getattr(config, "num_experts", 0) > 0:
+            return "qwen3", model.model.language_model.layers
     if hasattr(model, "model") and hasattr(model.model, "language_model"):
         if getattr(config, "num_local_experts", 0) > 0:
             return "gpt_oss", model.model.language_model.layers
@@ -222,6 +311,8 @@ def apply_structural_pruning(
         pbar.update(1)
         if model_layout == "kimi":
             is_moe_layer = _is_kimi_moe_layer(layer_idx, config)
+        elif model_layout == "qwen3":
+            is_moe_layer = _is_qwen3_moe_layer(layer_idx, layer, config)
         else:
             is_moe_layer = _is_gpt_oss_moe_layer(layer, config)
         if not is_moe_layer:
@@ -286,6 +377,63 @@ def apply_structural_pruning(
                 keep_eids = torch.nonzero(layer_active_expert, as_tuple=False).view(-1).tolist()
                 layer.mlp.experts = nn.ModuleList([layer.mlp.experts[eid] for eid in keep_eids])
                 shrink_gate_cnt += _shrink_kimi_router_for_active_experts(
+                    layer.mlp, layer_active_expert
+                )
+            continue
+
+        if model_layout == "qwen3":
+            experts = layer.mlp.experts
+            old_num_experts = int(experts.num_experts)
+            if layer_mask.shape[0] != old_num_experts:
+                raise RuntimeError(
+                    f"Layer {layer_idx}: mask expert dim={int(layer_mask.shape[0])} "
+                    f"but model has {old_num_experts} experts."
+                )
+
+            new_experts = []
+            layer_active_expert = torch.zeros(old_num_experts, dtype=torch.bool)
+            for eid in range(old_num_experts):
+                m_inter = layer_mask[eid].to(device=experts.gate_up_proj.device, dtype=torch.bool)
+                I_old = int(experts.down_proj.shape[1])
+                H = int(experts.gate_up_proj.shape[1])
+                I_prime = int(m_inter.sum().item())
+                if I_prime == 0:
+                    params_removed += int(I_old * H * 3)
+                    continue
+
+                layer_active_expert[eid] = True
+                keep_idx = torch.nonzero(m_inter, as_tuple=False).view(-1)
+                pair_idx = torch.stack((keep_idx * 2, keep_idx * 2 + 1), dim=1).reshape(-1)
+
+                gate_up_w = experts.gate_up_proj.data[eid][:, pair_idx]
+                down_w = experts.down_proj.data[eid][m_inter, :]
+
+                gate_w = gate_up_w[:, ::2].transpose(0, 1).contiguous()
+                up_w = gate_up_w[:, 1::2].transpose(0, 1).contiguous()
+                down_w = down_w.transpose(0, 1).contiguous()
+
+                params_removed += int((I_old - I_prime) * H * 3)
+                params_kept += int(I_prime * H * 3)
+
+                new_experts.append(
+                    PrunedQwen3Expert(
+                        gate_proj=_make_linear(gate_w, None, H, I_prime),
+                        up_proj=_make_linear(up_w, None, H, I_prime),
+                        down_proj=_make_linear(down_w, None, I_prime, H),
+                        act_fn=experts.act_fn,
+                    )
+                )
+
+            n_active = int(layer_active_expert.sum().item())
+            if n_active == 0:
+                raise RuntimeError(
+                    f"All experts in layer {layer_idx} were fully pruned. "
+                    "Adjust masks to keep at least one expert."
+                )
+            inactive_experts += old_num_experts - n_active
+            layer.mlp.experts = PrunedQwen3Experts(new_experts, hidden_size=H)
+            if n_active != old_num_experts:
+                shrink_gate_cnt += _shrink_qwen3_router_for_active_experts(
                     layer.mlp, layer_active_expert
                 )
             continue

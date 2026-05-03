@@ -30,6 +30,7 @@ from src.calibration.helpers.utils import (
 )
 from src.calibration.helpers.helpers import compute_block_loss
 from src.calibration.representation_distill.common import ensure_dir
+from src.calibration.representation_distill.common import resolve_hidden_start_layer
 from src.calibration.representation_distill.common import sort_sequence_by_position_ids
 from src.calibration.representation_distill.runtime.forward_from_hidden import forward_from_hidden
 
@@ -341,7 +342,7 @@ def _load_hidden_payload(input_hidden_path: str):
             "modality_labels": modality_labels,
             "position_ids": position_ids,
             "teacher_meta": teacher_meta,
-            "start_layer": int(teacher_meta["teacher_layer"]) + 1,
+            "start_layer": resolve_hidden_start_layer(teacher_meta),
             "source": "synthetic_hidden",
         }
 
@@ -363,7 +364,7 @@ def _load_hidden_payload(input_hidden_path: str):
             "modality_labels": modality_labels,
             "position_ids": position_ids,
             "teacher_meta": metadata,
-            "start_layer": int(metadata["teacher_layer"]) + 1,
+            "start_layer": resolve_hidden_start_layer(metadata),
             "source": "teacher_cache",
         }
 
@@ -372,7 +373,7 @@ def _load_hidden_payload(input_hidden_path: str):
         return {
             "manifest": payload,
             "teacher_meta": metadata,
-            "start_layer": int(metadata["teacher_layer"]) + 1,
+            "start_layer": resolve_hidden_start_layer(metadata),
             "source": "teacher_cache",
             "num_samples": total_samples,
             "is_sharded": True,

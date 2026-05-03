@@ -24,6 +24,7 @@ from src.calibration.representation_distill.common import (
     MODALITY_TEXT,
     MODALITY_VIDEO,
     ensure_dir,
+    resolve_hidden_start_layer,
     seed_everything,
     sort_sequence_by_position_ids,
     utc_now_iso,
@@ -1278,7 +1279,7 @@ def main() -> None:
         )
 
     if args.lambda_block > 0:
-        block_constraint_layer = int(teacher_meta["teacher_layer"]) + 1
+        block_constraint_layer = resolve_hidden_start_layer(teacher_meta)
         try:
             teacher_store.fetch_next_block_indices(
                 teacher_anchor_indices[:1],

@@ -109,14 +109,26 @@ def build_modality_budget_masks(
             else:
                 # no shared protect
                 total_budget = int(text_K_E[lid, eid] + visual_K_E[lid, eid])
-                topk = int(round(total_budget * 0.5))
                 all_idx = torch.arange(I, device=text_scores.device)
-
                 chosen: Set[int] = set()
-                chosen.update(_pick_topk(v, all_idx, topk))
-                chosen.update(_pick_topk(t, all_idx, topk))
-                k_visual_tensor[lid, eid] = topk
-                k_text_tensor[lid, eid] = topk
+
+                if not use_ema:
+                    topk_vis = int(round(total_budget * 0.5))
+                    topk_text = int(round(total_budget * 0.5))
+                    
+                else:
+                    affinity = float(ema_matrix[lid, eid].item())
+                    assert affinity >= -1.0 and affinity <= 1.0, f"affinity should be in [-1.0, 1.0], but got {affinity}"
+                    norm_vis_ema = (affinity + 1.0) / 2.0
+                    topk_vis = int(round(total_budget * norm_vis_ema))
+                    norm_text_ema = 1.0 - norm_vis_ema
+                    topk_text = int(round(total_budget * norm_text_ema))
+                    
+                chosen.update(_pick_topk(v, all_idx, topk_vis))
+                chosen.update(_pick_topk(t, all_idx, topk_text))
+                k_visual_tensor[lid, eid] = topk_vis
+                k_text_tensor[lid, eid] = topk_text
+                
                 if chosen:
                     chosen_idx = torch.tensor(sorted(chosen), device=text_scores.device, dtype=torch.long)
                     masks[lid, eid].index_fill_(0, chosen_idx, True)

@@ -49,10 +49,12 @@ SWEEP_TASKS="${SWEEP_TASKS:-chartqa coco2017cap mmstar mmbench realworldqa gqa m
 # ── Setting grids (same defaults as sweep_prune_eval_kimi_gqa.sh) ──────────────
 SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform}"
 SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-second_attr_fillzero_coverage}"
+
 SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-1}"
-SWEEP_SHARED_PROTECT="${SWEEP_SHARED_PROTECT:-1}"
-NORMALIZE="${NORMALIZE:-0}"
+SWEEP_SHARED_PROTECT="${SWEEP_SHARED_PROTECT:-0}"
 USE_EMA="${USE_EMA:-1}"
+
+NORMALIZE="${NORMALIZE:-0}"
 EMA_SOURCE_KEY="${EMA_SOURCE_KEY:-ema_matrix_prior_corrected}"  # ema_matrix_prior_corrected
 SMOOTH_FN="${SMOOTH_FN:-cbrt}" # sqrt cbrt fourth_root log
 SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act}"

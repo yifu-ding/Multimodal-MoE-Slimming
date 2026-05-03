@@ -198,6 +198,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output_path", type=str, required=True)
     # 取第几层 decoder block 的输出作为教师表征
     parser.add_argument("--teacher_layer", type=int, default=0)
+    parser.add_argument(
+        "--cache_block_input",
+        action="store_true",
+        help="Cache the input hidden states of teacher_layer instead of that block's output.",
+    )
     # 沿序列维压缩后的 token 数, 控制缓存体积与下游蒸馏成本
     parser.add_argument("--compressed_length", type=int, default=64)
     parser.add_argument(
@@ -285,7 +290,7 @@ def main() -> None:
         args.model_name_or_path,
         device_map=device_map,
         attn_implementation=args.attn_implementation,
-        max_decoder_layer=args.teacher_layer + (1 if args.cache_next_block_targets else 0),
+        max_decoder_layer=args.teacher_layer + (0 if args.cache_block_input else (1 if args.cache_next_block_targets else 0)),
     )
     num_layers = get_num_decoder_layers(bundle)
     if args.teacher_layer < 0 or args.teacher_layer >= num_layers:
@@ -376,6 +381,7 @@ def main() -> None:
         extraction: BlockExtractionResult = extract_block_output(
             bundle, inputs, layer_idx=args.teacher_layer,
             capture_attn_importance=need_attn,
+            capture_input=args.cache_block_input,
         )
         hidden = extraction.hidden_states
         # 记录模型前向实际 dtype, 与 save_dtype 区分
@@ -400,14 +406,15 @@ def main() -> None:
                 dtype=inputs["attention_mask"].dtype,
                 device=result.hidden_states.device,
             )
-            next_block_layer = get_decoder_layer(bundle, args.teacher_layer + 1)
+            next_block_layer_idx = args.teacher_layer if args.cache_block_input else args.teacher_layer + 1
+            next_block_layer = get_decoder_layer(bundle, next_block_layer_idx)
             next_block_dtype = next(next_block_layer.parameters()).dtype
             next_block_hidden = forward_from_hidden(
                 bundle=bundle,
                 hidden_states=result.hidden_states.to(dtype=next_block_dtype),
                 attention_mask=compressed_attention_mask,
-                start_layer=args.teacher_layer + 1,
-                end_layer=args.teacher_layer + 1,
+                start_layer=next_block_layer_idx,
+                end_layer=next_block_layer_idx,
                 position_ids=result.position_ids,
                 apply_final_norm=False,
             )
@@ -447,8 +454,10 @@ def main() -> None:
             "processor_name": bundle.processor.__class__.__name__,
             "model_family": bundle.family,
             "teacher_layer": args.teacher_layer,
-            "teacher_layer_type": "full_block_output",
-            "cached_next_block_layer": args.teacher_layer + 1 if args.cache_next_block_targets else None,
+            "teacher_layer_type": "full_block_input" if args.cache_block_input else "full_block_output",
+            "cached_next_block_layer": (
+                args.teacher_layer if args.cache_block_input else args.teacher_layer + 1
+            ) if args.cache_next_block_targets else None,
             "compressed_length": args.compressed_length,
             "compression_mode": compression_mode_label,
             "modality_lengths": modality_lengths,
