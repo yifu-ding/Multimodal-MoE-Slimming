@@ -3,6 +3,8 @@ import os
 import torch.nn as nn
 import types
 from typing import Optional
+import torch.nn.functional as F
+
 import torch
 from src.base.shared_utils import angle_loss
 from .utils import unwrap_output
@@ -161,7 +163,8 @@ def compute_block_loss(
     if token_mask is not None:
         mask_f = mask_f * token_mask.float()
 
-    # 以下完全不变
+    rel_l2_inv_base_mean = None
+
     if loss_fn == "l2":
         token_mse = (pred.float() - teacher_target.float()).pow(2).mean(dim=-1)
         return (token_mse * mask_f).sum()
@@ -176,6 +179,12 @@ def compute_block_loss(
 
     if loss_fn == "cosine":
         return (angle_loss(pred, teacher_target) * mask_f).sum()
+
+    if loss_fn == "kl_div":
+        pred_logprob = F.log_softmax(pred.float(), dim=-1)
+        teacher_prob = F.softmax(teacher_target.float(), dim=-1)
+        token_kl = F.kl_div(pred_logprob, teacher_prob, reduction="none").sum(dim=-1)
+        return (token_kl * mask_f).sum(), rel_l2_inv_base_mean
 
     raise ValueError(f"Unsupported loss_fn for second-order scoring: {loss_fn}")
 
