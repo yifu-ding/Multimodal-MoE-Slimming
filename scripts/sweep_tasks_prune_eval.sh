@@ -95,7 +95,7 @@ else
   esac
 fi
 SUFFIX="${SUFFIX:-}"
-SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p${PRUNE_RATIO}/sweep_tasks-${MODEL_NAME}-${SUFFIX}"  # -${SWEEP_TS}
+SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p0/sweep_tasks-${MODEL_NAME}-${SUFFIX}"  # -${SWEEP_TS}
 export OUTPUT_DIR="${SWEEP_BASE}"
 
 if [[ -d "${SWEEP_BASE}" ]]; then
