@@ -49,10 +49,10 @@ SWEEP_TASKS="${SWEEP_TASKS:-chartqa coco2017cap mmstar mmbench realworldqa gqa m
 # ── Setting grids (same defaults as sweep_prune_eval_kimi_gqa.sh) ──────────────
 SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform}"
 SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-second_attr_coverage}"
-SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-1}"
-SWEEP_SHARED_PROTECT="${SWEEP_SHARED_PROTECT:-1}"
+SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-1}"  # ablation: modality_aware
+SWEEP_SHARED_PROTECT="${SWEEP_SHARED_PROTECT:-1}"  # ablation: shared
 NORMALIZE="${NORMALIZE:-0}"
-USE_EMA="${USE_EMA:-1}"
+USE_EMA="${USE_EMA:-1}"  # ablation: use_ema
 EMA_SOURCE_KEY="${EMA_SOURCE_KEY:-ema_matrix_prior_corrected}"
 SMOOTH_FN="${SMOOTH_FN:-cbrt}" # sqrt cbrt fourth_root log
 SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act}"
@@ -93,7 +93,7 @@ else
   esac
 fi
 SUFFIX="${SUFFIX:-}"
-SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p50/sweep_tasks-${MODEL_NAME}-${SUFFIX}"  # -${SWEEP_TS}
+SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p0/sweep_tasks-${MODEL_NAME}-${SUFFIX}"  # -${SWEEP_TS}
 export OUTPUT_DIR="${SWEEP_BASE}"
 
 if [[ -d "${SWEEP_BASE}" ]]; then
