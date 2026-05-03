@@ -47,7 +47,7 @@ USE_LMMS_EVAL=${USE_LMMS_EVAL:-0}
 SWEEP_TASKS="${SWEEP_TASKS:-chartqa coco2017cap mmstar mmbench realworldqa gqa mme textvqa}"
 # mmvet video_mmmu videomme mvbench egoschema
 # ── Setting grids (same defaults as sweep_prune_eval_kimi_gqa.sh) ──────────────
-SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-loss_smooth_2}"
+SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform}"
 SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-second_attr_fillzero_coverage}"
 
 SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-1}"
@@ -57,7 +57,7 @@ USE_EMA="${USE_EMA:-1}"
 
 NORMALIZE="${NORMALIZE:-0}"
 EMA_SOURCE_KEY="${EMA_SOURCE_KEY:-ema_matrix_prior_corrected}"  # ema_matrix_prior_corrected
-LAYERWISE_LOSS_KEY="${LAYERWISE_LOSS_KEY:-layerwise_second_order_sum}"
+LAYERWISE_LOSS_KEY="${LAYERWISE_LOSS_KEY:-layerwise_loss}"
 SMOOTH_FN="${SMOOTH_FN:-cbrt}" # sqrt cbrt fourth_root log
 SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act}"
 # 3proj_second_order down_saliency 3proj_saliency 3proj_grad wg

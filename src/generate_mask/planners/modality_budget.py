@@ -345,24 +345,31 @@ def build_modality_budget_masks(
                 })
         
         if expertwise_budget_normalize:
-            expert_target_budgets = _allocate_layer_expert_budgets(
-                raw_targets=_normalize_expertwise_raw_targets(
-                    raw_targets=raw_targets,
-                    target_total=int(layer_target_budgets[lid].item()),
-                    min_budgets=min_budgets,
-                    max_budgets=max_budgets,
-                ),
-                min_budgets=min_budgets,
-                max_budgets=max_budgets,
-                target_total=int(layer_target_budgets[lid].item()),
-            )
-        else:
+            # expert_target_budgets = _allocate_layer_expert_budgets(
+            #     raw_targets=_normalize_expertwise_raw_targets(
+            #         raw_targets=raw_targets,
+            #         target_total=int(layer_target_budgets[lid].item()),
+            #         min_budgets=min_budgets,
+            #         max_budgets=max_budgets,
+            #     ),
+            #     min_budgets=min_budgets,
+            #     max_budgets=max_budgets,
+            #     target_total=int(layer_target_budgets[lid].item()),
+            # )
             expert_target_budgets = _allocate_layer_expert_budgets(
                 raw_targets=raw_targets,
                 min_budgets=min_budgets,
                 max_budgets=max_budgets,
                 target_total=int(layer_target_budgets[lid].item()),
             )
+        else:
+            # expert_target_budgets = _allocate_layer_expert_budgets(
+            #     raw_targets=raw_targets,
+            #     min_budgets=min_budgets,
+            #     max_budgets=max_budgets,
+            #     target_total=int(layer_target_budgets[lid].item()),
+            # )
+            expert_target_budgets = raw_targets
 
         for eid in range(E):
             item = layer_items[eid]
