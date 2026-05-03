@@ -345,6 +345,7 @@ def build_modality_budget_masks(
                 })
         
         if expertwise_budget_normalize:
+            # 注释部分错的，不需要额外 norm 一次
             # expert_target_budgets = _allocate_layer_expert_budgets(
             #     raw_targets=_normalize_expertwise_raw_targets(
             #         raw_targets=raw_targets,
@@ -369,7 +370,7 @@ def build_modality_budget_masks(
             #     max_budgets=max_budgets,
             #     target_total=int(layer_target_budgets[lid].item()),
             # )
-            expert_target_budgets = raw_targets
+            expert_target_budgets = raw_targets  # 不norm就直接用raw，不需要额外 norm 一次
 
         for eid in range(E):
             item = layer_items[eid]
