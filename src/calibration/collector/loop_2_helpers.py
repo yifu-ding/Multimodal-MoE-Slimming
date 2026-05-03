@@ -160,10 +160,9 @@ def compute_block_loss(
     token_mask: Optional[torch.Tensor] = None,  # 如果指定了模态的话
 ) -> torch.Tensor:
     mask_f = attn_mask.float()
+    rel_l2_inv_base_mean = None
     if token_mask is not None:
         mask_f = mask_f * token_mask.float()
-
-    rel_l2_inv_base_mean = None
 
     if loss_fn == "l2":
         token_mse = (pred.float() - teacher_target.float()).pow(2).mean(dim=-1)
@@ -184,7 +183,7 @@ def compute_block_loss(
         pred_logprob = F.log_softmax(pred.float(), dim=-1)
         teacher_prob = F.softmax(teacher_target.float(), dim=-1)
         token_kl = F.kl_div(pred_logprob, teacher_prob, reduction="none").sum(dim=-1)
-        return (token_kl * mask_f).sum(), rel_l2_inv_base_mean
+        return (token_kl * mask_f).sum()
 
     raise ValueError(f"Unsupported loss_fn for second-order scoring: {loss_fn}")
 
