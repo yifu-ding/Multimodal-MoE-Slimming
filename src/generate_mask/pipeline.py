@@ -114,7 +114,7 @@ def generate_masks(
             ema_matrix=modality_scores[ema_source_key],
             verbose=verbose,
         )
-        import ipdb; ipdb.set_trace()
+        # import ipdb; ipdb.set_trace()
         if thresholds_path is not None:
             thresh_data = torch.load(
                 thresholds_path, map_location=device, weights_only=False

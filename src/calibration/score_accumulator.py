@@ -36,6 +36,7 @@ class ScoreAccumulator:
 
         self.hit_counts: Dict[int, torch.Tensor] = {}
         self.layerwise_loss: Dict[int, float] = {}
+        self.layerwise_second_order_sum: Dict[int, float] = {}
 
         for layer_idx in self.layers:
             e = layer_to_num_experts[layer_idx]

@@ -1,3 +1,4 @@
+import time
 
 import torch
 from .utils import *
@@ -5,10 +6,27 @@ from .loop_1_score_collector import *
 from .loop_2_score_collector import *
 from src.calibration.helpers.utils import split_fused_gate_up_tensor
 
-def collect_scores_from_moe_module(cnt_block, 
-                            ema: float = 0.9, 
+
+def collect_scores_from_moe_module(cnt_block,
+                            ema: float = 0.9,
                             _kwargs: dict = None) -> None:
-    fill_zero_for_unrouted = False if _kwargs is None else bool(_kwargs.get("fill_zero_for_unrouted", False))
+    kw = {} if _kwargs is None else _kwargs
+    # profile = bool(kw.get("profile_inner_collector", False))
+    profile = True
+
+    def _mark():
+        return time.perf_counter()
+
+    t_prev = _mark() if profile else None
+
+    def _elapsed_ms():
+        nonlocal t_prev
+        now = _mark()
+        delta_ms = (now - t_prev) * 1000.0
+        t_prev = now
+        return delta_ms
+
+    fill_zero_for_unrouted = bool(kw.get("fill_zero_for_unrouted", False))
     experts = getattr(cnt_block.mlp, "experts", None)
     is_fused = is_fused_expert_container(experts)
     fused_metric_stacks = {}
@@ -58,6 +76,8 @@ def collect_scores_from_moe_module(cnt_block,
         up_grad_w = None
         gate_grad_w = None
 
+    t_prep_ms = _elapsed_ms() if profile else None
+
     expert_records, debug_down_input_hits, debug_gateup_hits, debug_total_experts = (
         loop_1_score_collector(
             expert_iter,
@@ -76,7 +96,9 @@ def collect_scores_from_moe_module(cnt_block,
         )
     )
 
-    loop_2_score_collector(
+    t_loop1_ms = _elapsed_ms() if profile else None
+
+    second_order_sum = loop_2_score_collector(
         expert_records,
         cnt_block=cnt_block,
         experts=experts,
@@ -86,6 +108,9 @@ def collect_scores_from_moe_module(cnt_block,
         _kwargs=_kwargs,
     )
 
+    t_loop2_ms = _elapsed_ms() if profile else None
+
+    t_fused_commit_ms = None
     if is_fused:
         num_experts = experts.gate_up_proj.shape[0]
         device = experts.gate_up_proj.device
@@ -120,3 +145,21 @@ def collect_scores_from_moe_module(cnt_block,
                     current[eid].mul_(ema).add_(value, alpha=1.0 - ema)
             setattr(experts, key, current)
         clear_fused_saved_tensors(experts)
+        if profile:
+            t_fused_commit_ms = _elapsed_ms()
+
+    if profile:
+        parts = [
+            ("prep_fused_or_iter", t_prep_ms),
+            ("loop_1_score_collector", t_loop1_ms),
+            ("loop_2_score_collector", t_loop2_ms),
+        ]
+        if t_fused_commit_ms is not None:
+            parts.append(("fused_commit_clear", t_fused_commit_ms))
+        total = sum(x for _, x in parts if x is not None)
+        lines = [f"[inner_collector profile] total={total:.3f}ms"] + [
+            f"  {name}: {ms:.3f}ms" for name, ms in parts if ms is not None
+        ]
+        print("\n".join(lines), flush=True)
+
+    return second_order_sum

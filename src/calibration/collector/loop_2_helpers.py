@@ -215,6 +215,72 @@ def patch_expert_output_alpha(expert: nn.Module, alpha: torch.Tensor):
     return state
 
 
+def patch_expert_output_alpha_vector(experts, alpha: torch.Tensor):
+    if hasattr(experts, "gate_up_proj") and hasattr(experts, "down_proj"):
+        state = {"container": experts, "forward": experts.forward}
+
+        def _forward_with_alpha_vector(
+            self,
+            hidden_states: torch.Tensor,
+            router_indices: torch.Tensor,
+            routing_weights: torch.Tensor,
+            _alpha=alpha,
+        ):
+            fused_layout = get_fused_expert_layout(self)
+            if fused_layout == "gpt_oss":
+                batch_size = hidden_states.shape[0]
+                hidden_size = hidden_states.shape[-1]
+                hidden_states = hidden_states.reshape(-1, hidden_size)
+            next_states = torch.zeros_like(hidden_states)
+            num_classes = self.num_experts + 1 if fused_layout == "gpt_oss" else self.num_experts
+            expert_mask = torch.nn.functional.one_hot(
+                router_indices, num_classes=num_classes
+            ).permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+            for expert_tensor in expert_hit:
+                current_expert_idx = int(expert_tensor[0].item())
+                if current_expert_idx == self.num_experts:
+                    continue
+                top_k_pos, token_idx = torch.where(expert_mask[current_expert_idx])
+                current_state = hidden_states[token_idx]
+                current_hidden_states = _run_single_fused_expert(
+                    self,
+                    current_expert_idx,
+                    current_state,
+                    output_alpha=_alpha[current_expert_idx],
+                )
+                if fused_layout == "gpt_oss":
+                    expert_routing_weights = routing_weights[token_idx, current_expert_idx]
+                else:
+                    expert_routing_weights = routing_weights[token_idx, top_k_pos]
+                current_hidden_states = current_hidden_states * expert_routing_weights[:, None]
+                next_states.index_add_(0, token_idx, current_hidden_states.to(next_states.dtype))
+            if fused_layout == "gpt_oss":
+                return next_states.view(batch_size, -1, hidden_size)
+            return next_states
+
+        experts.forward = types.MethodType(_forward_with_alpha_vector, experts)
+        return state
+
+    states = []
+    for expert_idx, expert in enumerate(experts):
+        states.append(
+            {
+                "expert": expert,
+                "forward": expert.forward,
+                "expert_idx": expert_idx,
+            }
+        )
+        base_forward = expert.forward
+
+        def _forward_with_alpha(self, x, _alpha=alpha, _expert_idx=expert_idx, _base_forward=base_forward):
+            out = _base_forward(x)
+            return out * _alpha[_expert_idx].to(device=out.device, dtype=out.dtype)
+
+        expert.forward = types.MethodType(_forward_with_alpha, expert)
+    return {"states": states}
+
+
 def patch_expert_channel_alpha(expert: nn.Module, alpha: torch.Tensor):
     """
     在 expert.down_proj 的输入（即 intermediate activation）上
@@ -268,6 +334,11 @@ def _restore_patched_expert(state: dict) -> None:
     container = state.get("container")
     if container is not None:
         container.forward = state["forward"]
+        return
+    states = state.get("states")
+    if states is not None:
+        for item in states:
+            item["expert"].forward = item["forward"]
         return
     state["expert"].forward = state["forward"]
 
@@ -380,6 +451,75 @@ def compute_expert_second_order(
         cnt_block.zero_grad(set_to_none=True)
 
     return second_value
+
+
+def compute_expert_second_order_batched(
+    cnt_block: nn.Module,
+    experts,
+    has_activation_mask,
+    _kwargs: dict,
+):
+    context = get_block_eval_context(_kwargs)
+    if context is None:
+        return None
+
+    device = context["teacher_target"].device
+    has_activation = torch.as_tensor(has_activation_mask, device=device, dtype=torch.bool)
+    num_experts = int(has_activation.numel())
+    active_indices = has_activation.nonzero(as_tuple=False).flatten()
+    alpha = torch.ones(num_experts, device=device, dtype=torch.float32, requires_grad=True)
+    state = patch_expert_output_alpha_vector(experts, alpha=alpha)
+
+    try:
+        cnt_block.zero_grad(set_to_none=True)
+        with suspend_tensor_saving(cnt_block):
+            with torch.enable_grad():
+                with torch.autocast(
+                    device_type=context["autocast_device_type"],
+                    dtype=context["autocast_dtype"],
+                    enabled=context["autocast_enabled"],
+                ):
+                    pred = unwrap_output(cnt_block(*context["in_args"], **context["in_kwargs"]))
+                    loss = compute_block_loss(
+                        pred=pred,
+                        teacher_target=context["teacher_target"],
+                        attn_mask=context["attn_mask"],
+                        loss_fn=context["loss_fn"],
+                        eps=context["loss_eps"],
+                    )
+                d1 = torch.autograd.grad(loss, alpha, create_graph=True, allow_unused=True)[0]
+                if d1 is None:
+                    second_value = torch.zeros(num_experts, dtype=torch.float32, device=device)
+                elif d1.requires_grad:
+                    active_count = int(active_indices.numel())
+                    if active_count == 0:
+                        second_value = torch.zeros(num_experts, dtype=torch.float32, device=device)
+                    else:
+                        grad_outputs = torch.eye(active_count, device=device, dtype=d1.dtype)
+                        d2_rows = torch.autograd.grad(
+                            d1[active_indices],
+                            alpha,
+                            grad_outputs=grad_outputs,
+                            is_grads_batched=True,
+                            retain_graph=False,
+                            create_graph=False,
+                            allow_unused=True,
+                        )[0]
+                        if d2_rows is None:
+                            second_value = (-d1).detach().float().clamp_min(0.0)
+                        else:
+                            d2_diag = d2_rows[:, active_indices].diag()
+                            second_value = torch.zeros(num_experts, dtype=torch.float32, device=device)
+                            second_value[active_indices] = (
+                                -d1[active_indices] + 0.5 * d2_diag
+                            ).detach().float().clamp_min(0.0)
+                else:
+                    second_value = (-d1).detach().float().clamp_min(0.0)
+    finally:
+        _restore_patched_expert(state)
+        cnt_block.zero_grad(set_to_none=True)
+
+    return second_value.masked_fill(~has_activation, 0.0)
 
 
 def compute_true_ablate_attr(

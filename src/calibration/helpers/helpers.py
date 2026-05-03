@@ -44,6 +44,9 @@ def compute_block_loss(
     if loss_fn == "cosine":
         return (angle_loss(pred, teacher_target) * mask_f).sum(), rel_l2_inv_base_mean
 
+    if loss_fn == 'kl_div':
+        return (F.kl_div(pred, teacher_target, reduction='none') * mask_f).sum(), rel_l2_inv_base_mean
+
     raise ValueError(f"Unsupported loss_fn: {loss_fn}")
 
 

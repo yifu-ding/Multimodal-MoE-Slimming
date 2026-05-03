@@ -121,7 +121,9 @@ def _synthetic_block_forward(
     fused_expert_state = patch_qwen_fused_experts_forward(cnt_block)
 
     total_loss = 0.0
+    total_second_order_sum = 0.0
     total_batches = 0
+    profile_one_batch = os.getenv("PROFILE_ONE_BATCH", "0") == "1"
     device_type = block_device.type
     autocast_enabled = device_type == "cuda" and dtype in (torch.float16, torch.bfloat16)
 
@@ -185,7 +187,7 @@ def _synthetic_block_forward(
             total_loss += float(loss_sum.detach().float().item())
             total_batches += 1
 
-            collect_scores_from_moe_module(
+            second_order_sum = collect_scores_from_moe_module(
                 cnt_block,
                 ema=saliency_ema,
                 _kwargs={
@@ -209,7 +211,10 @@ def _synthetic_block_forward(
                     "moe_media_mask": (modality_batch >= 1).to(torch.bool) if modality_batch is not None else torch.zeros_like(attn_batch, dtype=torch.bool),
                 },
             )
+            total_second_order_sum += second_order_sum
             clear_block_saved_tensors(cnt_block)
+            if profile_one_batch:
+                break
     finally:
         teacher_handle.remove()
         for handle in copied_handles:
@@ -222,7 +227,7 @@ def _synthetic_block_forward(
             experts.forward = original_forward
         clear_block_saved_tensors(cnt_block)
 
-    return total_loss / max(total_batches, 1)
+    return (total_loss / max(total_batches, 1), total_second_order_sum / max(total_batches, 1))
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -526,7 +531,7 @@ def main() -> None:
                 position_ids=position_ids,
                 batch_size=args.batch_size,
             )
-        layer_loss = _synthetic_block_forward(
+        layer_loss, layer_second_order_sum = _synthetic_block_forward(
             bundle=bundle,
             cnt_block=cnt_block,
             layer_idx=layer_idx,
@@ -539,8 +544,9 @@ def main() -> None:
             has_position_ids=has_position_ids,
         )
         accumulator.layerwise_loss[layer_idx] = float(layer_loss)
+        accumulator.layerwise_second_order_sum[layer_idx] = float(layer_second_order_sum)
         accumulator.absorb_layer_scores(layer_idx, cnt_block)
-        print(f"[representation_distill] Layer {layer_idx}: layer loss={layer_loss:.6f}")
+        print(f"[representation_distill] Layer {layer_idx}: layer loss={layer_loss:.6e}, layer second_order_sum={layer_second_order_sum:.6e}")
         _save_score_artifacts(prepared_output_path, accumulator, payload_args)
 
     _save_score_artifacts(prepared_output_path, accumulator, payload_args)
