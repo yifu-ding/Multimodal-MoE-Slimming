@@ -51,7 +51,7 @@ SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform}"
 SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-second_attr_fillzero_coverage}"
 
 SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-1}"
-SWEEP_SHARED_PROTECT="${SWEEP_SHARED_PROTECT:-0}"
+SWEEP_SHARED_PROTECT="${SWEEP_SHARED_PROTECT:-1}"
 USE_EMA="${USE_EMA:-1}"
 
 NORMALIZE="${NORMALIZE:-0}"
@@ -95,7 +95,7 @@ else
   esac
 fi
 SUFFIX="${SUFFIX:-}"
-SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p0/sweep_tasks-${MODEL_NAME}-${SUFFIX}"  # -${SWEEP_TS}
+SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p${PRUNE_RATIO}/sweep_tasks-${MODEL_NAME}-${SUFFIX}"  # -${SWEEP_TS}
 export OUTPUT_DIR="${SWEEP_BASE}"
 
 if [[ -d "${SWEEP_BASE}" ]]; then

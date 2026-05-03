@@ -1,4 +1,5 @@
 import contextlib
+import os
 import torch.nn as nn
 import types
 from typing import Optional
@@ -467,6 +468,9 @@ def compute_expert_second_order_batched(
     has_activation = torch.as_tensor(has_activation_mask, device=device, dtype=torch.bool)
     num_experts = int(has_activation.numel())
     active_indices = has_activation.nonzero(as_tuple=False).flatten()
+    chunk_size = int(os.getenv("SECOND_ORDER_CHUNK_SIZE", "8"))
+    if chunk_size <= 0:
+        raise ValueError(f"SECOND_ORDER_CHUNK_SIZE must be positive, got {chunk_size}")
     alpha = torch.ones(num_experts, device=device, dtype=torch.float32, requires_grad=True)
     state = patch_expert_output_alpha_vector(experts, alpha=alpha)
 
@@ -495,24 +499,34 @@ def compute_expert_second_order_batched(
                     if active_count == 0:
                         second_value = torch.zeros(num_experts, dtype=torch.float32, device=device)
                     else:
-                        grad_outputs = torch.eye(active_count, device=device, dtype=d1.dtype)
-                        d2_rows = torch.autograd.grad(
-                            d1[active_indices],
-                            alpha,
-                            grad_outputs=grad_outputs,
-                            is_grads_batched=True,
-                            retain_graph=False,
-                            create_graph=False,
-                            allow_unused=True,
-                        )[0]
-                        if d2_rows is None:
+                        d2_diag = torch.zeros(active_count, dtype=torch.float32, device=device)
+                        missing_hessian = False
+                        for start in range(0, active_count, chunk_size):
+                            end = min(start + chunk_size, active_count)
+                            chunk_indices = active_indices[start:end]
+                            grad_outputs = torch.eye(end - start, device=device, dtype=d1.dtype)
+                            d2_rows = torch.autograd.grad(
+                                d1[chunk_indices],
+                                alpha,
+                                grad_outputs=grad_outputs,
+                                is_grads_batched=True,
+                                retain_graph=end < active_count,
+                                create_graph=False,
+                                allow_unused=True,
+                            )[0]
+                            if d2_rows is None:
+                                missing_hessian = True
+                                break
+                            local_positions = torch.arange(end - start, device=device)
+                            d2_diag[start:end] = d2_rows[local_positions, chunk_indices].detach().float()
+
+                        if missing_hessian:
                             second_value = (-d1).detach().float().clamp_min(0.0)
                         else:
-                            d2_diag = d2_rows[:, active_indices].diag()
                             second_value = torch.zeros(num_experts, dtype=torch.float32, device=device)
                             second_value[active_indices] = (
-                                -d1[active_indices] + 0.5 * d2_diag
-                            ).detach().float().clamp_min(0.0)
+                                -d1[active_indices].detach().float() + 0.5 * d2_diag
+                            ).clamp_min(0.0)
                 else:
                     second_value = (-d1).detach().float().clamp_min(0.0)
     finally:

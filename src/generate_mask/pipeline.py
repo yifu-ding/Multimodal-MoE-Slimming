@@ -1,3 +1,4 @@
+import os
 from time import time
 from typing import Any, Dict, Optional
 
@@ -114,12 +115,15 @@ def generate_masks(
             ema_matrix=modality_scores[ema_source_key],
             verbose=verbose,
         )
-        # import ipdb; ipdb.set_trace()
+        if os.environ.get("DEBUG", "0") == "1":
+            ema_matrix = modality_scores[ema_source_key]
+            print(f"ema_matrix: {ema_matrix.shape}, ema.mean={ema_matrix.mean()}, ema.std={ema_matrix.std()}")
+            import ipdb; ipdb.set_trace()
+
         if thresholds_path is not None:
             thresh_data = torch.load(
                 thresholds_path, map_location=device, weights_only=False
             )
-
             n_override = 0
             for lid_pos, layer_idx in enumerate(layers):
                 ratios = thresh_data["actual_keep_ratio"].get(layer_idx, None)  # 取实际的 keep_ratio

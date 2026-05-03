@@ -11,8 +11,8 @@ def collect_scores_from_moe_module(cnt_block,
                             ema: float = 0.9,
                             _kwargs: dict = None) -> None:
     kw = {} if _kwargs is None else _kwargs
-    # profile = bool(kw.get("profile_inner_collector", False))
-    profile = True
+    profile = bool(kw.get("profile_inner_collector", False))
+    # profile = True
 
     def _mark():
         return time.perf_counter()

@@ -1,5 +1,6 @@
 import argparse
 import copy
+import math
 import os
 import sys
 from types import SimpleNamespace
@@ -100,6 +101,7 @@ def _synthetic_block_forward(
     start_layer: int,
     loss_fn: str,
     dtype: torch.dtype,
+    total_batches_expected: int | None = None,
     has_modality_labels: bool = False,
     has_position_ids: bool = False,
 ) -> float:
@@ -128,7 +130,12 @@ def _synthetic_block_forward(
     autocast_enabled = device_type == "cuda" and dtype in (torch.float16, torch.bfloat16)
 
     try:
-        iterator = tqdm(dataloader, desc=f"HiddenCal L{layer_idx}", leave=False)
+        iterator = tqdm(
+            dataloader,
+            total=total_batches_expected,
+            desc=f"HiddenCal L{layer_idx}",
+            leave=False,
+        )
         for batch_tuple in iterator:
             if has_modality_labels and has_position_ids:
                 hidden_batch, attn_batch, modality_batch, position_ids_batch = batch_tuple
@@ -521,6 +528,7 @@ def main() -> None:
         )
         cnt_block = copy.deepcopy(teacher_block)
         block_dtype = next(teacher_block.parameters()).dtype
+        total_batches_expected = math.ceil(num_samples / args.batch_size)
         if is_sharded:
             loader = _iter_sharded_hidden_batches(hidden_payload, args.batch_size)
         else:
@@ -540,6 +548,7 @@ def main() -> None:
             start_layer=start_layer,
             loss_fn=args.loss_fn,
             dtype=block_dtype,
+            total_batches_expected=total_batches_expected,
             has_modality_labels=has_modality_labels,
             has_position_ids=has_position_ids,
         )

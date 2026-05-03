@@ -6,6 +6,20 @@ from .loop_2_helpers import *
 from src.calibration.helpers.score_namespace import ACTIVE_CHANNEL_METRICS as CHANNEL_METRICS
 
 
+def _format_cuda_mem_stats() -> str:
+    if not torch.cuda.is_available():
+        return "cuda_mem=unavailable"
+    device = torch.cuda.current_device()
+    allocated_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
+    reserved_mb = torch.cuda.memory_reserved(device) / (1024 ** 2)
+    max_allocated_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+    return (
+        f"cuda_mem_allocated={allocated_mb:.1f}MB "
+        f"cuda_mem_reserved={reserved_mb:.1f}MB "
+        f"cuda_mem_max_allocated={max_allocated_mb:.1f}MB"
+    )
+
+
 def loop_2_score_collector(
     expert_records,
     *,
@@ -145,7 +159,8 @@ def loop_2_score_collector(
         print(
             f"[loop_2 second_order profile] impl={second_order_impl} "
             f"layer={layer_idx} batch={batch_idx} "
-            f"compute_second_attr={second_attr_compute_ms:.3f}ms",
+            f"compute_second_attr={second_attr_compute_ms:.3f}ms "
+            f"{_format_cuda_mem_stats()}",
             flush=True,
         )
 
