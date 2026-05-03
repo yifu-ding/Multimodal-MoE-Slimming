@@ -65,6 +65,7 @@ INTRA_METHOD="${INTRA_METHOD:-second_attr_coverage}"
 MODALITY_AWARE="${MODALITY_AWARE:-1}"  # 是否开启双模态
 SHARED_PROTECT="${SHARED_PROTECT:-1}"  # 双模态时是否保留 shared channels
 NORMALIZE="${NORMALIZE:-0}"  # 是否对 text / visual 分模态做层级归一化
+EXPERTWISE_BUDGET_NORMALIZE="${EXPERTWISE_BUDGET_NORMALIZE:-0}"  # 是否先按层归一化 expert raw budget 再分配
 USE_EMA="${USE_EMA:-1}"  # 是否使用 EMA affinity 分配 modality budget
 # scores payload 里用作 EMA 源的 tensor 键名, 与 ``pipeline.prepare_scores(..., ema_source_key=...)`` 一致
 EMA_SOURCE_KEY="${EMA_SOURCE_KEY:-ema_matrix}"
@@ -193,6 +194,7 @@ if [[ "${USE_LMMS_EVAL}" == "1" ]]; then
         MODEL_ARGS+=",modality_aware=${MODALITY_AWARE}"
         MODEL_ARGS+=",shared_protect=${SHARED_PROTECT}"
         MODEL_ARGS+=",normalize=${NORMALIZE}"
+        MODEL_ARGS+=",expertwise_budget_normalize=${EXPERTWISE_BUDGET_NORMALIZE}"
         MODEL_ARGS+=",use_ema=${USE_EMA}"
         MODEL_ARGS+=",ema_source_key=${EMA_SOURCE_KEY}"
         MODEL_ARGS+=",smooth_fn=${SMOOTH_FN}"
@@ -254,6 +256,10 @@ else
         CMD+=(--normalize)
     fi
 
+    if [[ "${EXPERTWISE_BUDGET_NORMALIZE}" == "1" ]]; then
+        CMD+=(--expertwise_budget_normalize)
+    fi
+
     CMD+=(--ema_source_key "${EMA_SOURCE_KEY}")
 
     if [[ -n "${SUBSET_SEED}" ]]; then
@@ -282,7 +288,8 @@ echo "Intra       : ${INTRA_METHOD}"
 echo "Metric      : ${INTRA_EXPERT_METRIC}"
 echo "Modality    : ${MODALITY_AWARE}"
 echo "Shared prot : ${SHARED_PROTECT}"
-# echo "Normalize   : ${NORMALIZE}" # 非关键，恒 0
+echo "Normalize   : ${NORMALIZE}"
+echo "Expert norm : ${EXPERTWISE_BUDGET_NORMALIZE}"
 echo "Use EMA     : ${USE_EMA}"
 echo "EMA source  : ${EMA_SOURCE_KEY}"
 echo "Smooth fn   : ${SMOOTH_FN}"

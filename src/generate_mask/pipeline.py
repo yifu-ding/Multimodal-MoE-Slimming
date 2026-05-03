@@ -42,6 +42,7 @@ def generate_masks(
     normalize = bool(prune_kwargs.get("normalize", False))
     ema_source_key = prune_kwargs.get("ema_source_key", "ema_matrix")
     shared_protect = bool(prune_kwargs.get("shared_protect", True))
+    expertwise_budget_normalize = bool(prune_kwargs.get("expertwise_budget_normalize", False))
     
     (
         intermediate_scores,
@@ -110,6 +111,7 @@ def generate_masks(
             use_ema=use_ema,
             shared_protect=shared_protect,
             expertwise_scores=expertwise_scores,
+            expertwise_budget_normalize=expertwise_budget_normalize, 
             layerwise_keep_plan=layerwise_keep_plan,
             intra_layer_method=mask_method_kwargs.get("intra_layer_method", "uniform"),
             ema_matrix=modality_scores[ema_source_key],

@@ -249,6 +249,7 @@ class KimiVL(lmms):
             intra_expert_metric = kwargs.get("intra_expert_metric", "activation")
             modality_aware = bool(int(kwargs.get("modality_aware", 0)))
             normalize = bool(int(kwargs.get("normalize", 0)))
+            expertwise_budget_normalize = bool(int(kwargs.get("expertwise_budget_normalize", 0)))
             smooth_fn = kwargs.get("smooth_fn", "sqrt")
             ema_source_key = kwargs.get("ema_source_key", "ema_matrix")
             align_inter = int(kwargs.get("align_inter", 0))
@@ -275,6 +276,7 @@ class KimiVL(lmms):
                     },
                     "modality_aware": modality_aware,
                     "normalize": normalize,
+                    "expertwise_budget_normalize": expertwise_budget_normalize,
                     "ema_source_key": ema_source_key,
                     "prune_hidden": False,
                     "prune_gqa": False,

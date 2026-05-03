@@ -52,6 +52,7 @@ SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-second_attr_fillzero_coverage}"
 
 SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-1}"
 SWEEP_SHARED_PROTECT="${SWEEP_SHARED_PROTECT:-1}"
+EXPERTWISE_BUDGET_NORMALIZE="${EXPERTWISE_BUDGET_NORMALIZE:-0}"
 USE_EMA="${USE_EMA:-1}"
 
 NORMALIZE="${NORMALIZE:-0}"
@@ -149,8 +150,8 @@ echo "SUMMARY_FILE has been created: ${SUMMARY_FILE}"
   echo ""
   echo "SCORES_PATH: \`${SCORES_PATH}\`"
   echo ""
-    echo "| # | task | inter_method | intra_method | modality_aware | shared_protect | normalize | ema_source_key | intra_expert_metric | smooth_fn | metric | detail | status | log |"
-    echo "|---|------|--------------|--------------|----------------|----------------|-----------|----------------|---------------------|-----------|--------|--------|--------|-----|"
+    echo "| # | task | inter_method | intra_method | modality_aware | shared_protect | expertwise_budget_normalize | normalize | ema_source_key | intra_expert_metric | smooth_fn | metric | detail | status | log |"
+    echo "|---|------|--------------|--------------|----------------|----------------|-----------------------------|-----------|----------------|---------------------|-----------|--------|--------|--------|-----|"
 } >> "${SUMMARY_FILE}"
 
 # ── Main sweep ─────────────────────────────────────────────────────────────────
@@ -163,7 +164,7 @@ for TASK in ${SWEEP_TASKS}; do
 
           # ── Skip-done check ──────────────────────────────────────────────────
           if [[ "${SWEEP_SKIP_DONE}" == "1" ]] && [[ -f "${SUMMARY_FILE}" ]]; then
-            if grep -F "| ${TASK} | ${INTER_METHOD} | ${INTRA_METHOD} | ${MODALITY_AWARE} | ${SHARED_PROTECT} | ${NORMALIZE} | ${EMA_SOURCE_KEY} | ${INTRA_EXPERT_METRIC} | ${SMOOTH_FN} |" "${SUMMARY_FILE}" 2>/dev/null \
+            if grep -F "| ${TASK} | ${INTER_METHOD} | ${INTRA_METHOD} | ${MODALITY_AWARE} | ${SHARED_PROTECT} | ${EXPERTWISE_BUDGET_NORMALIZE} | ${NORMALIZE} | ${EMA_SOURCE_KEY} | ${INTRA_EXPERT_METRIC} | ${SMOOTH_FN} |" "${SUMMARY_FILE}" 2>/dev/null \
                  | grep -qF '| ok |'; then
               echo "[sweep] Skip (already ok): TASK=${TASK} INTER=${INTER_METHOD} INTRA=${INTRA_METHOD} MODALITY=${MODALITY_AWARE} SHARED=${SHARED_PROTECT} METRIC=${INTRA_EXPERT_METRIC}"
               SWEEP_SKIPPED=$((SWEEP_SKIPPED + 1))
@@ -187,6 +188,7 @@ for TASK in ${SWEEP_TASKS}; do
             MODALITY_AWARE="${MODALITY_AWARE}" \
             SHARED_PROTECT="${SHARED_PROTECT}" \
             NORMALIZE="${NORMALIZE}" \
+            EXPERTWISE_BUDGET_NORMALIZE="${EXPERTWISE_BUDGET_NORMALIZE}" \
             USE_EMA="${USE_EMA}" \
             EMA_SOURCE_KEY="${EMA_SOURCE_KEY}" \
             PRUNE_RATIO="${PRUNE_RATIO}" \
@@ -229,7 +231,7 @@ for TASK in ${SWEEP_TASKS}; do
 
           REL_LOG="logs/$(basename "${RUN_LOG}")"
           {
-            echo "| ${RUN_IDX} | ${TASK} | ${INTER_METHOD} | ${INTRA_METHOD} | ${MODALITY_AWARE} | ${SHARED_PROTECT} | ${NORMALIZE} | ${EMA_SOURCE_KEY} | ${INTRA_EXPERT_METRIC} | ${SMOOTH_FN} | ${METRIC_VAL:-—} | ${METRIC_DETAIL:-—} | ${STATUS} | \`${REL_LOG}\` |"
+            echo "| ${RUN_IDX} | ${TASK} | ${INTER_METHOD} | ${INTRA_METHOD} | ${MODALITY_AWARE} | ${SHARED_PROTECT} | ${EXPERTWISE_BUDGET_NORMALIZE} | ${NORMALIZE} | ${EMA_SOURCE_KEY} | ${INTRA_EXPERT_METRIC} | ${SMOOTH_FN} | ${METRIC_VAL:-—} | ${METRIC_DETAIL:-—} | ${STATUS} | \`${REL_LOG}\` |"
           } >> "${SUMMARY_FILE}"
 
           done

@@ -55,6 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--modality_aware", action="store_true")
     p.add_argument("--shared_protect", action="store_true")
     p.add_argument("--normalize", action="store_true")
+    p.add_argument("--expertwise_budget_normalize", action="store_true")
     p.add_argument("--num_samples", type=int, default=0)
     p.add_argument("--start_idx", type=int, default=0)
     p.add_argument("--subset_seed", type=int, default=None)
@@ -116,6 +117,7 @@ def main() -> None:
                 "shared_protect": args.shared_protect,
                 "use_ema": bool(args.use_ema),
                 "normalize": args.normalize,
+                "expertwise_budget_normalize": args.expertwise_budget_normalize,
                 "ema_source_key": args.ema_source_key,
                 "prune_hidden": False,
                 "prune_gqa": False,

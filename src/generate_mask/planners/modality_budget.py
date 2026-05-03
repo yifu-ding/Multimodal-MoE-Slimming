@@ -206,11 +206,35 @@ def _allocate_layer_expert_budgets(
     return budgets
 
 
+def _normalize_expertwise_raw_targets(
+    raw_targets: torch.Tensor,
+    target_total: int,
+    min_budgets: torch.Tensor,
+    max_budgets: torch.Tensor,
+) -> torch.Tensor:
+    raw_targets = raw_targets.to(dtype=torch.float32)
+    min_budgets_f = min_budgets.to(dtype=torch.float32)
+    max_budgets_f = max_budgets.to(dtype=torch.float32)
+
+    clamped = torch.maximum(raw_targets, min_budgets_f)
+    clamped = torch.minimum(clamped, max_budgets_f)
+    current_total = float(clamped.sum().item())
+    if current_total <= 0.0:
+        return clamped
+
+    scale = float(target_total) / current_total
+    normalized = clamped * scale
+    normalized = torch.maximum(normalized, min_budgets_f)
+    normalized = torch.minimum(normalized, max_budgets_f)
+    return normalized
+
+
 def build_modality_budget_masks(
     text_scores: torch.Tensor,
     visual_scores: torch.Tensor,
     use_ema: bool,
     shared_protect: bool, 
+    expertwise_budget_normalize: bool,
     expertwise_scores: torch.Tensor | None,
     layerwise_keep_plan: torch.Tensor,
     intra_layer_method: str,
@@ -241,7 +265,6 @@ def build_modality_budget_masks(
     # 计算文本和视觉各自的 tentative masks
     text_tentative, text_K_E = _tentative(text_scores)
     visual_tentative, visual_K_E = _tentative(visual_scores)
-    # target_budget = (text_K_E + visual_K_E)/2
     
     if verbose:
         _print(f"[Modality-aware Budget] before: text: {text_K_E[0]}, \n visual: {visual_K_E[0]}")
@@ -320,13 +343,26 @@ def build_modality_budget_masks(
                     "norm_text_ema": norm_text_ema,
                     "all_idx": all_idx,
                 })
-
-        expert_target_budgets = _allocate_layer_expert_budgets(
-            raw_targets=raw_targets,
-            min_budgets=min_budgets,
-            max_budgets=max_budgets,
-            target_total=int(layer_target_budgets[lid].item()),
-        )
+        
+        if expertwise_budget_normalize:
+            expert_target_budgets = _allocate_layer_expert_budgets(
+                raw_targets=_normalize_expertwise_raw_targets(
+                    raw_targets=raw_targets,
+                    target_total=int(layer_target_budgets[lid].item()),
+                    min_budgets=min_budgets,
+                    max_budgets=max_budgets,
+                ),
+                min_budgets=min_budgets,
+                max_budgets=max_budgets,
+                target_total=int(layer_target_budgets[lid].item()),
+            )
+        else:
+            expert_target_budgets = _allocate_layer_expert_budgets(
+                raw_targets=raw_targets,
+                min_budgets=min_budgets,
+                max_budgets=max_budgets,
+                target_total=int(layer_target_budgets[lid].item()),
+            )
 
         for eid in range(E):
             item = layer_items[eid]
