@@ -3,6 +3,7 @@ import copy
 import os
 import sys
 from types import SimpleNamespace
+from typing import Iterable
 
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "..", ".."))
@@ -60,6 +61,13 @@ def _prepare_output_path(output_path: str) -> str:
         return scores_path
     ensure_dir(output_path)
     return os.path.join(output_path, "scores.pt")
+
+
+def _torch_load_cpu(path: str) -> dict:
+    try:
+        return torch.load(path, map_location="cpu", mmap=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
 
 
 def _set_synthetic_modality_masks(
@@ -249,7 +257,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _load_hidden_payload(input_hidden_path: str):
-    payload = torch.load(input_hidden_path, map_location="cpu")
+    payload = _torch_load_cpu(input_hidden_path)
     metadata = payload.get("metadata", {})
 
     modality_labels = payload.get("modality_labels", None)
@@ -359,10 +367,69 @@ def _load_hidden_payload(input_hidden_path: str):
             "source": "teacher_cache",
         }
 
+    if "shards" in payload:
+        total_samples = int(metadata.get("total_samples", sum(int(s["num_samples"]) for s in payload["shards"])))
+        return {
+            "manifest": payload,
+            "teacher_meta": metadata,
+            "start_layer": int(metadata["teacher_layer"]) + 1,
+            "source": "teacher_cache",
+            "num_samples": total_samples,
+            "is_sharded": True,
+            "input_hidden_path": input_hidden_path,
+        }
+
     raise ValueError(
         f"Unsupported hidden payload at {input_hidden_path}. "
-        "Expected keys `synthetic_hidden` or `teacher_cache`."
+        "Expected keys `synthetic_hidden`, `teacher_cache`, or `shards`."
     )
+
+
+def _build_tensor_dataloader(
+    *,
+    hidden: torch.Tensor,
+    attention_mask: torch.Tensor,
+    modality_labels: torch.Tensor | None,
+    position_ids: torch.Tensor | None,
+    batch_size: int,
+) -> DataLoader:
+    if modality_labels is not None and position_ids is not None:
+        dataset = TensorDataset(hidden, attention_mask, modality_labels, position_ids)
+    elif modality_labels is not None:
+        dataset = TensorDataset(hidden, attention_mask, modality_labels)
+    elif position_ids is not None:
+        dataset = TensorDataset(hidden, attention_mask, position_ids)
+    else:
+        dataset = TensorDataset(hidden, attention_mask)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+
+def _iter_sharded_hidden_batches(hidden_payload: dict, batch_size: int) -> Iterable:
+    manifest = hidden_payload["manifest"]
+    cache_root = os.path.dirname(hidden_payload["input_hidden_path"])
+    for shard in manifest["shards"]:
+        shard_path = shard["path"]
+        if not os.path.isabs(shard_path):
+            shard_path = os.path.join(cache_root, shard_path)
+        shard_payload = _torch_load_cpu(shard_path)
+        hidden = shard_payload["teacher_cache"]
+        attention_mask = torch.ones(hidden.shape[:2], dtype=torch.long)
+        modality_labels = shard_payload.get("modality_labels")
+        position_ids = shard_payload.get("position_ids")
+        if position_ids is not None:
+            position_ids = position_ids.to(dtype=torch.long)
+            hidden, position_ids, modality_labels = sort_sequence_by_position_ids(
+                hidden, position_ids, modality_labels,
+            )
+        shard_loader = _build_tensor_dataloader(
+            hidden=hidden,
+            attention_mask=attention_mask,
+            modality_labels=modality_labels,
+            position_ids=position_ids,
+            batch_size=batch_size,
+        )
+        for batch_tuple in shard_loader:
+            yield batch_tuple
 
 
 def main() -> None:
@@ -388,11 +455,8 @@ def main() -> None:
         attn_implementation=args.attn_implementation,
     )
     hidden_payload = _load_hidden_payload(args.input_hidden_path)
-    hidden = hidden_payload["hidden"]
-    attention_mask = hidden_payload["attention_mask"]
-    modality_labels = hidden_payload.get("modality_labels", None)
-    position_ids = hidden_payload.get("position_ids", None)
     start_layer = hidden_payload["start_layer"]
+    is_sharded = bool(hidden_payload.get("is_sharded", False))
 
     layer_to_num_experts, layer_to_num_channels = discover_layer_structure(bundle)
     accumulator = ScoreAccumulator(layer_to_num_experts, layer_to_num_channels)
@@ -416,11 +480,21 @@ def main() -> None:
         )
     prepared_output_path = _prepare_output_path(args.output_path)
 
-    has_modality_labels = modality_labels is not None
-    has_position_ids = position_ids is not None
+    if is_sharded:
+        num_samples = int(hidden_payload["num_samples"])
+        has_modality_labels = True
+        has_position_ids = True
+    else:
+        hidden = hidden_payload["hidden"]
+        attention_mask = hidden_payload["attention_mask"]
+        modality_labels = hidden_payload.get("modality_labels", None)
+        position_ids = hidden_payload.get("position_ids", None)
+        num_samples = int(hidden.shape[0])
+        has_modality_labels = modality_labels is not None
+        has_position_ids = position_ids is not None
     payload_args = SimpleNamespace(
         loss_fn=args.loss_fn,
-        num_samples=int(hidden.shape[0]),
+        num_samples=num_samples,
         batch_size=args.batch_size,
         dataset=hidden_payload["source"],
         start_idx=0,
@@ -432,30 +506,6 @@ def main() -> None:
         input_hidden_path=args.input_hidden_path,
         start_layer=start_layer,
     )
-    if has_modality_labels and has_position_ids:
-        loader = DataLoader(
-            TensorDataset(hidden, attention_mask, modality_labels, position_ids),
-            batch_size=args.batch_size,
-            shuffle=False,
-        )
-    elif has_modality_labels:
-        loader = DataLoader(
-            TensorDataset(hidden, attention_mask, modality_labels),
-            batch_size=args.batch_size,
-            shuffle=False,
-        )
-    elif has_position_ids:
-        loader = DataLoader(
-            TensorDataset(hidden, attention_mask, position_ids),
-            batch_size=args.batch_size,
-            shuffle=False,
-        )
-    else:
-        loader = DataLoader(
-            TensorDataset(hidden, attention_mask),
-            batch_size=args.batch_size,
-            shuffle=False,
-        )
 
     for layer_idx in target_layers:
         teacher_block = (
@@ -465,6 +515,16 @@ def main() -> None:
         )
         cnt_block = copy.deepcopy(teacher_block)
         block_dtype = next(teacher_block.parameters()).dtype
+        if is_sharded:
+            loader = _iter_sharded_hidden_batches(hidden_payload, args.batch_size)
+        else:
+            loader = _build_tensor_dataloader(
+                hidden=hidden,
+                attention_mask=attention_mask,
+                modality_labels=modality_labels,
+                position_ids=position_ids,
+                batch_size=args.batch_size,
+            )
         layer_loss = _synthetic_block_forward(
             bundle=bundle,
             cnt_block=cnt_block,

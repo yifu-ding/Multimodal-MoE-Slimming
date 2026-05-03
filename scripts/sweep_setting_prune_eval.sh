@@ -107,6 +107,22 @@ TOTAL_SKIPPED=0
 for PRUNE_RATIO in ${SWEEP_PRUNE_RATIOS}; do
   SWEEP_BASE="${REPO_ROOT}/results/prune_eval_p${PRUNE_RATIO}/${MODEL_NAME}/sweep_settings-${SUFFIX}"
 
+  # if [[ -d "${SWEEP_BASE}" ]]; then
+  #   echo "warning: SWEEP_BASE already exists: ${SWEEP_BASE}" >&2
+  #   if [[ ! -t 0 ]]; then
+  #     echo "error: need interactive confirmation but stdin is not a terminal; exiting." >&2
+  #     exit 1
+  #   fi
+  #   while true; do
+  #     read -r -p "Continue reusing this directory? [y/n]: " reply
+  #     case "${reply}" in
+  #       [yY]) break ;;
+  #       [nN]) echo "Aborted." >&2; exit 1 ;;
+  #       *) echo "Please enter y or n." >&2 ;;
+  #     esac
+  #   done
+  # fi
+
   SUMMARY_FILE="${SWEEP_BASE}/summary.md"
   SWEEP_LOG_DIR="${SWEEP_BASE}/logs"
   mkdir -p "${SWEEP_BASE}"

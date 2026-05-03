@@ -31,7 +31,7 @@ cd "${REPO_ROOT}"
 
 PREFIX="${PREFIX:-${REPO_ROOT}}"
 export PYTHONPATH="${PREFIX}"
-
+PRUNE_RATIO="${PRUNE_RATIO:-0.5}"
 # export SCORES_PATH="storage/prune/scores/kimi-vl-a3b_gqa-rell2-041513.pt"
 # export SCORES_PATH="storage/prune/scores/kimi-vl-a3b_coco-rell2-fill1-0416-115847.pt"
 # export SCORES_PATH="storage/data_distill_kimi/gqa-sample_at1.0-0418234400/distilled-0419142618/scores-step4000.pt"
@@ -187,6 +187,7 @@ for TASK in ${SWEEP_TASKS}; do
             NORMALIZE="${NORMALIZE}" \
             USE_EMA="${USE_EMA}" \
             EMA_SOURCE_KEY="${EMA_SOURCE_KEY}" \
+            PRUNE_RATIO="${PRUNE_RATIO}" \
             INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC}" \
             SMOOTH_FN="${SMOOTH_FN}" \
             MODEL_NAME="${MODEL_NAME}" \
