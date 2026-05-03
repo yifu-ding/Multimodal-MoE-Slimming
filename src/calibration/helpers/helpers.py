@@ -44,8 +44,11 @@ def compute_block_loss(
     if loss_fn == "cosine":
         return (angle_loss(pred, teacher_target) * mask_f).sum(), rel_l2_inv_base_mean
 
-    if loss_fn == 'kl_div':
-        return (F.kl_div(pred, teacher_target, reduction='none') * mask_f).sum(), rel_l2_inv_base_mean
+    if loss_fn == "kl_div":
+        pred_logprob = F.log_softmax(pred.float(), dim=-1)
+        teacher_prob = F.softmax(teacher_target.float(), dim=-1)
+        token_kl = F.kl_div(pred_logprob, teacher_prob, reduction="none").sum(dim=-1)
+        return (token_kl * mask_f).sum(), rel_l2_inv_base_mean
 
     raise ValueError(f"Unsupported loss_fn: {loss_fn}")
 
@@ -158,4 +161,3 @@ def nested_counts_total(count_map):
         else:
             raise TypeError(f"Unsupported layer_counts type: {type(layer_counts)}")
     return total
-

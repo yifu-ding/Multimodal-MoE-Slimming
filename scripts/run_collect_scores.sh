@@ -36,11 +36,12 @@ MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 # deepseek-ai/deepseek-vl2-small
 
 DATASET="${DATASET:-gqa}"
-NUM_SAMPLES="${NUM_SAMPLES:-256}"
-TOKEN_PER_SAMPLE="${TOKEN_PER_SAMPLE:-1024}"
-BATCH_SIZE="${BATCH_SIZE:-4}"
+NUM_SAMPLES="${NUM_SAMPLES:-1024}"
+TOKEN_PER_SAMPLE="${TOKEN_PER_SAMPLE:-2048}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
 START_IDX="${START_IDX:-0}"
 SUBSET_SEED="${SUBSET_SEED:-42}"
+LOSS_FN="${LOSS_FN:-rel_l2}"
 LAYERS="${LAYERS:-}"  # 默认不传值，全部层calibration
 # LAYERS="${LAYERS:-1-6}"
 # LAYERS="${LAYERS:-7-13}"
@@ -93,7 +94,7 @@ case "${MODEL_TAG}" in
         ;;
 esac
 
-OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/scores/${MODEL_TAG}_${DATASET_TAG}-num_${NUM_SAMPLES}-token_${TOKEN_PER_SAMPLE}-fill_${FILL_ZERO_FOR_UNROUTED}-$(date +%m%d-%H%M%S)}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/scores/${MODEL_TAG}_${DATASET_TAG}-num_${NUM_SAMPLES}-token_${TOKEN_PER_SAMPLE}-${LOSS_FN}-$(date +%m%d-%H%M%S)}"
 
 EXTRA_ARGS=("$@")
 
@@ -107,6 +108,7 @@ CMD=(
     --batch_size         "${BATCH_SIZE}"
     --start_idx          "${START_IDX}"
     --subset_seed        "${SUBSET_SEED}"
+    --loss_fn            "${LOSS_FN}"
     --ema                "${EMA}"
 )
 
