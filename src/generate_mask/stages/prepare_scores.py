@@ -149,6 +149,7 @@ def prepare_scores(
 
     # ---- inter-layer loss ----
     inter_layer_method = mask_method_kwargs.get("inter_layer_method", "uniform")
+    layerwise_loss_key = mask_method_kwargs.get("layerwise_loss_key", "layerwise_second_order_sum")
     loss_based_kwargs: Dict[str, Any] = {
         "inter_layer_method": inter_layer_method,
         "smooth_fn": smooth_fn,
@@ -156,9 +157,19 @@ def prepare_scores(
         "layerwise_loss": None,
     }
     if "loss" in inter_layer_method:
-        raw = _payload_get(payload, "layerwise_loss")
+        if layerwise_loss_key not in {"layerwise_loss", "layerwise_second_order_sum"}:
+            raise ValueError(
+                f"Invalid layerwise_loss_key: {layerwise_loss_key}. "
+                "Expected one of: ['layerwise_loss', 'layerwise_second_order_sum']."
+            )
+        raw = _payload_get(payload, layerwise_loss_key)
         if raw is None:
-            raw = {}
+            available_keys = sorted(payload.keys())
+            metadata_keys = sorted(payload.get("metadata", {}).keys()) if isinstance(payload.get("metadata"), dict) else []
+            raise KeyError(
+                f"Requested layerwise_loss_key '{layerwise_loss_key}' not found in scores payload. "
+                f"Top-level keys: {available_keys}. Metadata keys: {metadata_keys}."
+            )
         loss_based_kwargs["layerwise_loss"] = torch.tensor(
             [raw[l] for l in sorted(raw.keys())], dtype=torch.float32, device=device
         )

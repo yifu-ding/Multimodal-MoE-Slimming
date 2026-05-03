@@ -292,7 +292,7 @@ def run_collection(args) -> None:
         current_teacher_block = teacher_block(bundle, layer_idx)
         copied_block = copy.deepcopy(current_teacher_block)
         block_dtype = next(current_teacher_block.parameters()).dtype
-        layer_loss = block_forward(
+        layer_loss, layer_second_order_sum = block_forward(
             bundle=bundle,
             cnt_block=copied_block,
             layer_idx=layer_idx,
@@ -305,6 +305,7 @@ def run_collection(args) -> None:
             verbose=True,
         )
         accumulator.layerwise_loss[layer_idx] = float(layer_loss)
+        accumulator.layerwise_second_order_sum[layer_idx] = float(layer_second_order_sum)
         accumulator.absorb_layer_scores(layer_idx, copied_block)
         save_score_artifacts(args.output_dir, accumulator, args)
         print(f"[calibration] Layer {layer_idx}: layer loss={layer_loss:.6f}. "

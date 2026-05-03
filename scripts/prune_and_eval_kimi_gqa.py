@@ -50,6 +50,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--inter_method", type=str, default="uniform")
     p.add_argument("--intra_method", type=str, default="uniform")
     p.add_argument("--intra_expert_metric", type=str, default="activation")
+    p.add_argument(
+        "--layerwise_loss_key",
+        type=str,
+        default="layerwise_second_order_sum",
+        choices=["layerwise_loss", "layerwise_second_order_sum"],
+        help="Which layerwise score key to use for loss-based inter-layer masking.",
+    )
     p.add_argument("--align_inter", type=int, default=0)
     p.add_argument("--min_per_expert", type=int, default=0)
     p.add_argument("--modality_aware", action="store_true")
@@ -108,6 +115,7 @@ def main() -> None:
                     "inter_layer_method": args.inter_method,
                     "intra_layer_method": args.intra_method,
                     "intra_expert_metric": args.intra_expert_metric,
+                    "layerwise_loss_key": args.layerwise_loss_key,
                 },
                 "adjust_masks_kwargs": {
                     "align_inter": args.align_inter,

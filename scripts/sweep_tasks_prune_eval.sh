@@ -47,16 +47,17 @@ USE_LMMS_EVAL=${USE_LMMS_EVAL:-0}
 SWEEP_TASKS="${SWEEP_TASKS:-chartqa coco2017cap mmstar mmbench realworldqa gqa mme textvqa}"
 # mmvet video_mmmu videomme mvbench egoschema
 # ── Setting grids (same defaults as sweep_prune_eval_kimi_gqa.sh) ──────────────
-SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-uniform}"
+SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-loss_smooth_2}"
 SWEEP_INTRA_METHODS="${SWEEP_INTRA_METHODS:-second_attr_fillzero_coverage}"
 
 SWEEP_MODALITY_AWARE="${SWEEP_MODALITY_AWARE:-1}"
 SWEEP_SHARED_PROTECT="${SWEEP_SHARED_PROTECT:-1}"
-EXPERTWISE_BUDGET_NORMALIZE="${EXPERTWISE_BUDGET_NORMALIZE:-0}"
+EXPERTWISE_BUDGET_NORMALIZE="${EXPERTWISE_BUDGET_NORMALIZE:-1}"
 USE_EMA="${USE_EMA:-1}"
 
 NORMALIZE="${NORMALIZE:-0}"
 EMA_SOURCE_KEY="${EMA_SOURCE_KEY:-ema_matrix_prior_corrected}"  # ema_matrix_prior_corrected
+LAYERWISE_LOSS_KEY="${LAYERWISE_LOSS_KEY:-layerwise_second_order_sum}"
 SMOOTH_FN="${SMOOTH_FN:-cbrt}" # sqrt cbrt fourth_root log
 SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act}"
 # 3proj_second_order down_saliency 3proj_saliency 3proj_grad wg
@@ -150,8 +151,8 @@ echo "SUMMARY_FILE has been created: ${SUMMARY_FILE}"
   echo ""
   echo "SCORES_PATH: \`${SCORES_PATH}\`"
   echo ""
-    echo "| # | task | inter_method | intra_method | modality_aware | shared_protect | expertwise_budget_normalize | normalize | ema_source_key | intra_expert_metric | smooth_fn | metric | detail | status | log |"
-    echo "|---|------|--------------|--------------|----------------|----------------|-----------------------------|-----------|----------------|---------------------|-----------|--------|--------|--------|-----|"
+    echo "| # | task | inter_method | intra_method | modality_aware | shared_protect | use_ema | expertwise_budget_normalize | ema_source_key | layerwise_loss_key | intra_expert_metric | smooth_fn | metric | detail | status | log |"
+    echo "|---|------|--------------|--------------|----------------|----------------|---------|-----------------------------|----------------|--------------------|---------------------|-----------|--------|--------|--------|-----|"
 } >> "${SUMMARY_FILE}"
 
 # ── Main sweep ─────────────────────────────────────────────────────────────────
@@ -164,7 +165,7 @@ for TASK in ${SWEEP_TASKS}; do
 
           # ── Skip-done check ──────────────────────────────────────────────────
           if [[ "${SWEEP_SKIP_DONE}" == "1" ]] && [[ -f "${SUMMARY_FILE}" ]]; then
-            if grep -F "| ${TASK} | ${INTER_METHOD} | ${INTRA_METHOD} | ${MODALITY_AWARE} | ${SHARED_PROTECT} | ${EXPERTWISE_BUDGET_NORMALIZE} | ${NORMALIZE} | ${EMA_SOURCE_KEY} | ${INTRA_EXPERT_METRIC} | ${SMOOTH_FN} |" "${SUMMARY_FILE}" 2>/dev/null \
+            if grep -F "| ${TASK} | ${INTER_METHOD} | ${INTRA_METHOD} | ${MODALITY_AWARE} | ${SHARED_PROTECT} | ${USE_EMA} | ${EXPERTWISE_BUDGET_NORMALIZE} | ${EMA_SOURCE_KEY} | ${LAYERWISE_LOSS_KEY} | ${INTRA_EXPERT_METRIC} | ${SMOOTH_FN} |" "${SUMMARY_FILE}" 2>/dev/null \
                  | grep -qF '| ok |'; then
               echo "[sweep] Skip (already ok): TASK=${TASK} INTER=${INTER_METHOD} INTRA=${INTRA_METHOD} MODALITY=${MODALITY_AWARE} SHARED=${SHARED_PROTECT} METRIC=${INTRA_EXPERT_METRIC}"
               SWEEP_SKIPPED=$((SWEEP_SKIPPED + 1))
@@ -191,6 +192,7 @@ for TASK in ${SWEEP_TASKS}; do
             EXPERTWISE_BUDGET_NORMALIZE="${EXPERTWISE_BUDGET_NORMALIZE}" \
             USE_EMA="${USE_EMA}" \
             EMA_SOURCE_KEY="${EMA_SOURCE_KEY}" \
+            LAYERWISE_LOSS_KEY="${LAYERWISE_LOSS_KEY}" \
             PRUNE_RATIO="${PRUNE_RATIO}" \
             INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC}" \
             SMOOTH_FN="${SMOOTH_FN}" \
@@ -231,7 +233,7 @@ for TASK in ${SWEEP_TASKS}; do
 
           REL_LOG="logs/$(basename "${RUN_LOG}")"
           {
-            echo "| ${RUN_IDX} | ${TASK} | ${INTER_METHOD} | ${INTRA_METHOD} | ${MODALITY_AWARE} | ${SHARED_PROTECT} | ${EXPERTWISE_BUDGET_NORMALIZE} | ${NORMALIZE} | ${EMA_SOURCE_KEY} | ${INTRA_EXPERT_METRIC} | ${SMOOTH_FN} | ${METRIC_VAL:-—} | ${METRIC_DETAIL:-—} | ${STATUS} | \`${REL_LOG}\` |"
+            echo "| ${RUN_IDX} | ${TASK} | ${INTER_METHOD} | ${INTRA_METHOD} | ${MODALITY_AWARE} | ${SHARED_PROTECT} | ${USE_EMA} | ${EXPERTWISE_BUDGET_NORMALIZE} | ${EMA_SOURCE_KEY} | ${LAYERWISE_LOSS_KEY} | ${INTRA_EXPERT_METRIC} | ${SMOOTH_FN} | ${METRIC_VAL:-—} | ${METRIC_DETAIL:-—} | ${STATUS} | \`${REL_LOG}\` |"
           } >> "${SUMMARY_FILE}"
 
           done

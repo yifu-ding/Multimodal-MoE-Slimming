@@ -55,7 +55,8 @@ def block_forward(
     total_batches = 0
     device_type = block_device.type
     autocast_enabled = device_type == "cuda" and dtype in (torch.float16, torch.bfloat16)
-
+    total_second_order_sum = 0.0
+    
     try:
         iterator = tqdm(dataloader, desc=f"Calibrating L{layer_idx}", disable=not verbose, leave=False)
         for batch in iterator:
@@ -118,7 +119,7 @@ def block_forward(
             total_loss += float(loss_sum.detach().float().item())
             total_batches += 1
 
-            collect_scores_from_moe_module(
+            second_order_sum = collect_scores_from_moe_module(
                 cnt_block,
                 ema=saliency_ema,
                 _kwargs={
@@ -142,6 +143,7 @@ def block_forward(
                     "moe_media_mask": moe_media_mask.view_as(attn_mask),
                 },
             )
+            total_second_order_sum += second_order_sum
             clear_block_saved_tensors(cnt_block)
     finally:
         teacher_handle.remove()
@@ -155,4 +157,4 @@ def block_forward(
             experts.forward = original_forward
         clear_block_saved_tensors(cnt_block)
 
-    return total_loss / max(total_batches, 1)
+    return total_loss / max(total_batches, 1), total_second_order_sum / max(total_batches, 1)

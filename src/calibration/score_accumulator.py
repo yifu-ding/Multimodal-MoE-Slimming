@@ -151,6 +151,7 @@ class ScoreAccumulator:
             "ema_matrix": ema_matrix,
             "ema_matrix_prior_corrected": ema_matrix_prior_corrected,
             "layerwise_loss": dict(self.layerwise_loss),
+            "layerwise_second_order_sum": dict(self.layerwise_second_order_sum),
             "metadata": {
                 "loss_fn": args.loss_fn,
                 "num_samples": args.num_samples,
