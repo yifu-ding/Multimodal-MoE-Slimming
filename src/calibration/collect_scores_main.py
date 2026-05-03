@@ -67,7 +67,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--loss_fn",
         type=str,
         default="rel_l2",
-        choices=["l2", "rel_l2", "cosine"],
+        choices=["l2", "rel_l2", "cosine", "kl_div"],
         help="Block reconstruction loss used during score collection (saved in scores.pt metadata).",
     )
     p.add_argument("--modality_aware", action="store_true")
