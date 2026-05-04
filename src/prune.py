@@ -403,13 +403,11 @@ def apply_structural_pruning(
 
                 layer_active_expert[eid] = True
                 keep_idx = torch.nonzero(m_inter, as_tuple=False).view(-1)
-                pair_idx = torch.stack((keep_idx * 2, keep_idx * 2 + 1), dim=1).reshape(-1)
-
-                gate_up_w = experts.gate_up_proj.data[eid][:, pair_idx]
+                gate_up_w = experts.gate_up_proj.data[eid]
                 down_w = experts.down_proj.data[eid][m_inter, :]
 
-                gate_w = gate_up_w[:, ::2].transpose(0, 1).contiguous()
-                up_w = gate_up_w[:, 1::2].transpose(0, 1).contiguous()
+                gate_w = gate_up_w[:, keep_idx].transpose(0, 1).contiguous()
+                up_w = gate_up_w[:, keep_idx + I_old].transpose(0, 1).contiguous()
                 down_w = down_w.transpose(0, 1).contiguous()
 
                 params_removed += int((I_old - I_prime) * H * 3)
