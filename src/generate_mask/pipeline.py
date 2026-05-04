@@ -43,6 +43,11 @@ def generate_masks(
     ema_source_key = prune_kwargs.get("ema_source_key", "ema_matrix")
     shared_protect = bool(prune_kwargs.get("shared_protect", True))
     expertwise_budget_normalize = bool(prune_kwargs.get("expertwise_budget_normalize", False))
+    text_only = bool(prune_kwargs.get("text_only", False))
+    visual_only = bool(prune_kwargs.get("visual_only", False))
+
+    if text_only and visual_only:
+        raise ValueError("`text_only` and `visual_only` cannot both be True.")
     
     (
         intermediate_scores,
@@ -110,6 +115,8 @@ def generate_masks(
             modality_scores["visual"],
             use_ema=use_ema,
             shared_protect=shared_protect,
+            text_only=text_only,
+            visual_only=visual_only,
             expertwise_scores=expertwise_scores,
             expertwise_budget_normalize=expertwise_budget_normalize, 
             layerwise_keep_plan=layerwise_keep_plan,

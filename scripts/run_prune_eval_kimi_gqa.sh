@@ -64,6 +64,8 @@ INTRA_METHOD="${INTRA_METHOD:-second_attr_coverage}"
 #   weight
 MODALITY_AWARE="${MODALITY_AWARE:-1}"  # 是否开启双模态
 SHARED_PROTECT="${SHARED_PROTECT:-1}"  # 双模态时是否保留 shared channels
+TEXT_ONLY="${TEXT_ONLY:-0}"  # ablation: 仅使用 text tentative mask
+VISUAL_ONLY="${VISUAL_ONLY:-0}"  # ablation: 仅使用 visual tentative mask
 NORMALIZE="${NORMALIZE:-0}"  # 是否对 text / visual 分模态做层级归一化
 EXPERTWISE_BUDGET_NORMALIZE="${EXPERTWISE_BUDGET_NORMALIZE:-0}"  # 是否先按层归一化 expert raw budget 再分配
 USE_EMA="${USE_EMA:-1}"  # 是否使用 EMA affinity 分配 modality budget
@@ -85,6 +87,9 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"
 SUBSET_SEED="${SUBSET_SEED:-}"
 
 USE_LMMS_EVAL="${USE_LMMS_EVAL:-0}"
+TAU_SKIP_PATH="${TAU_SKIP_PATH:-}"
+LAYER_IMPORTANCE_PATH="${LAYER_IMPORTANCE_PATH:-}"
+EXPERT_IMPORTANCE_PATH="${EXPERT_IMPORTANCE_PATH:-}"
 
 MODEL_NAME="${MODEL_NAME:-}"
 if [[ -n "${MODEL_NAME}" ]]; then
@@ -194,6 +199,8 @@ if [[ "${USE_LMMS_EVAL}" == "1" ]]; then
         MODEL_ARGS+=",intra_expert_metric=${INTRA_EXPERT_METRIC}"
         MODEL_ARGS+=",modality_aware=${MODALITY_AWARE}"
         MODEL_ARGS+=",shared_protect=${SHARED_PROTECT}"
+        MODEL_ARGS+=",text_only=${TEXT_ONLY}"
+        MODEL_ARGS+=",visual_only=${VISUAL_ONLY}"
         MODEL_ARGS+=",normalize=${NORMALIZE}"
         MODEL_ARGS+=",expertwise_budget_normalize=${EXPERTWISE_BUDGET_NORMALIZE}"
         MODEL_ARGS+=",use_ema=${USE_EMA}"
@@ -205,6 +212,15 @@ if [[ "${USE_LMMS_EVAL}" == "1" ]]; then
         if [[ -n "${THRESHOLDS_PATH}" ]]; then
             MODEL_ARGS+=",thresholds_path=${THRESHOLDS_PATH}"
         fi
+    fi
+    if [[ -n "${TAU_SKIP_PATH}" ]]; then
+        MODEL_ARGS+=",tau_skip_path=${TAU_SKIP_PATH}"
+    fi
+    if [[ -n "${LAYER_IMPORTANCE_PATH}" ]]; then
+        MODEL_ARGS+=",layer_importance_path=${LAYER_IMPORTANCE_PATH}"
+    fi
+    if [[ -n "${EXPERT_IMPORTANCE_PATH}" ]]; then
+        MODEL_ARGS+=",expert_importance_path=${EXPERT_IMPORTANCE_PATH}"
     fi
 
     LIMIT_ARG=""
@@ -255,6 +271,14 @@ else
         CMD+=(--shared_protect)
     fi
 
+    if [[ "${TEXT_ONLY}" == "1" ]]; then
+        CMD+=(--text_only)
+    fi
+
+    if [[ "${VISUAL_ONLY}" == "1" ]]; then
+        CMD+=(--visual_only)
+    fi
+
     if [[ "${NORMALIZE}" == "1" ]]; then
         CMD+=(--normalize)
     fi
@@ -267,6 +291,18 @@ else
 
     if [[ -n "${SUBSET_SEED}" ]]; then
         CMD+=(--subset_seed "${SUBSET_SEED}")
+    fi
+
+    if [[ -n "${TAU_SKIP_PATH}" ]]; then
+        CMD+=(--tau_skip_path "${TAU_SKIP_PATH}")
+    fi
+
+    if [[ -n "${LAYER_IMPORTANCE_PATH}" ]]; then
+        CMD+=(--layer_importance_path "${LAYER_IMPORTANCE_PATH}")
+    fi
+
+    if [[ -n "${EXPERT_IMPORTANCE_PATH}" ]]; then
+        CMD+=(--expert_importance_path "${EXPERT_IMPORTANCE_PATH}")
     fi
 
     if [[ -n "${THRESHOLDS_PATH}" ]]; then
@@ -291,6 +327,8 @@ echo "Intra       : ${INTRA_METHOD}"
 echo "Metric      : ${INTRA_EXPERT_METRIC}"
 echo "Modality    : ${MODALITY_AWARE}"
 echo "Shared prot : ${SHARED_PROTECT}"
+echo "Text only   : ${TEXT_ONLY}"
+echo "Visual only : ${VISUAL_ONLY}"
 echo "Normalize   : ${NORMALIZE}"
 echo "Expert norm : ${EXPERTWISE_BUDGET_NORMALIZE}"
 echo "Use EMA     : ${USE_EMA}"

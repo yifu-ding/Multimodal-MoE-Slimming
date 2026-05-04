@@ -14,13 +14,16 @@ from accelerate import Accelerator, DistributedType
 from lmms_eval.__main__ import cli_evaluate
 import lmms_eval.models
 import pickle
+from src.integrations import (
+    apply_optional_structural_pruning,
+    build_default_layer_gate_dict,
+)
 
 lmms_eval.models.AVAILABLE_CHAT_TEMPLATE_MODELS["kimi_vl"] = "eval.kimi.KimiVL"
 import os
 from pathlib import Path
 import decord
 import numpy as np
-from transformers import AutoConfig
 from PIL import Image
 
 
@@ -170,49 +173,18 @@ class KimiVL(lmms):
             model_kwargs["attn_implementation"] = attn_implementation
 
         if batch_size == 1 or kwargs.get("tau_skip_path", None) is None:
-            layer_gate_dict = {}
-            config = AutoConfig.from_pretrained(pretrained, trust_remote_code=True)
-            for i in range(config.text_config.num_hidden_layers):
-                if (
-                    i >= config.text_config.first_k_dense_replace
-                    and i % config.text_config.moe_layer_freq == 0
-                    and config.text_config.n_routed_experts is not None
-                ):
-                    layer_gate_dict[i] = {
-                        "text": config.text_config.num_experts_per_tok,
-                        "visual": config.text_config.num_experts_per_tok,
-                        "text_expert_num": config.text_config.n_routed_experts,
-                        "visual_expert_num": config.text_config.n_routed_experts,
-                    }
-
-            if kwargs.get("topk", None) is not None:
-                topk_text = kwargs.get(
-                    "topk_text", config.text_config.num_experts_per_tok
-                )
-                topk_visual = kwargs.get(
-                    "topk_visual", config.text_config.num_experts_per_tok
-                )
-                start = kwargs.get("start", 0)
-                end = kwargs.get("end", -1)
-                for i in range(start, end + 1):
-                    if i in layer_gate_dict:
-                        layer_gate_dict[i]["text"] = topk_text
-                        layer_gate_dict[i]["visual"] = topk_visual
-
-            if kwargs.get("expert_num", None) is not None:
-                text_expert_num = kwargs.get(
-                    "text_expert_num", config.text_config.n_routed_experts
-                )
-                visual_expert_num = kwargs.get(
-                    "visual_expert_num", config.text_config.n_routed_experts
-                )
-                start = kwargs.get("start", 0)
-                end = kwargs.get("end", -1)
-                for i in range(start, end + 1):
-                    if i in layer_gate_dict:
-                        layer_gate_dict[i]["text_expert_num"] = text_expert_num
-                        layer_gate_dict[i]["visual_expert_num"] = visual_expert_num
-
+            layer_gate_dict, _ = build_default_layer_gate_dict(
+                pretrained,
+                trust_remote_code=True,
+                topk=kwargs.get("topk", None),
+                topk_text=kwargs.get("topk_text", None),
+                topk_visual=kwargs.get("topk_visual", None),
+                expert_num=kwargs.get("expert_num", None),
+                text_expert_num=kwargs.get("text_expert_num", None),
+                visual_expert_num=kwargs.get("visual_expert_num", None),
+                start=kwargs.get("start", 0),
+                end=kwargs.get("end", -1),
+            )
             model_kwargs["layer_gate_dict"] = layer_gate_dict
 
         expert_importance_path = kwargs.get("expert_importance_path", None)
@@ -237,70 +209,7 @@ class KimiVL(lmms):
 
         model, processor = load_model(model_path=pretrained, **model_kwargs)
 
-        # ── Optional structural pruning ──
-        scores_path = kwargs.get("scores_path", None)
-        prune_ratio = float(kwargs.get("prune_ratio", 0) or 0)
-        if scores_path and prune_ratio > 0:
-            from src.generate_mask import generate_masks
-            from src.prune import apply_structural_pruning
-
-            inter_method = kwargs.get("inter_method", "uniform")
-            intra_method = kwargs.get("intra_method", "uniform")
-            intra_expert_metric = kwargs.get("intra_expert_metric", "activation")
-            modality_aware = bool(int(kwargs.get("modality_aware", 0)))
-            normalize = bool(int(kwargs.get("normalize", 0)))
-            expertwise_budget_normalize = bool(int(kwargs.get("expertwise_budget_normalize", 0)))
-            smooth_fn = kwargs.get("smooth_fn", "sqrt")
-            ema_source_key = kwargs.get("ema_source_key", "ema_matrix")
-            align_inter = int(kwargs.get("align_inter", 0))
-            min_per_expert = int(kwargs.get("min_per_expert", 0))
-            thresholds_path = kwargs.get("thresholds_path", None)
-
-            eval_logger.info(
-                f"[KimiVL] Generating masks: ratio={prune_ratio}, "
-                f"inter={inter_method}, intra={intra_method}, metric={intra_expert_metric}"
-            )
-            mask_result = generate_masks(
-                scores_dir=scores_path,
-                prune_kwargs={
-                    "prune_ratio": prune_ratio,
-                    "thresholds_path": thresholds_path,
-                    "mask_method_kwargs": {
-                        "inter_layer_method": inter_method,
-                        "intra_layer_method": intra_method,
-                        "intra_expert_metric": intra_expert_metric,
-                    },
-                    "adjust_masks_kwargs": {
-                        "align_inter": align_inter,
-                        "min_per_expert": min_per_expert,
-                    },
-                    "modality_aware": modality_aware,
-                    "normalize": normalize,
-                    "expertwise_budget_normalize": expertwise_budget_normalize,
-                    "ema_source_key": ema_source_key,
-                    "prune_hidden": False,
-                    "prune_gqa": False,
-                    "smooth_fn": smooth_fn,
-                },
-                device="cpu",
-                verbose=True,
-            )
-            mask_tensor = mask_result["intermediate_masks"]
-            layers = [
-                int(l)
-                for l in mask_result.get(
-                    "layers", list(range(mask_tensor.shape[0]))
-                )
-            ]
-            masks = {
-                layer_idx: mask_tensor[pos].detach().cpu().bool()
-                for pos, layer_idx in enumerate(layers)
-            }
-            text_config = model.config.text_config
-            apply_structural_pruning(model, masks, text_config)
-            eval_logger.info(
-                f"[KimiVL] Structural pruning applied: ratio={prune_ratio}"
-            )
+        apply_optional_structural_pruning(model, kwargs, "KimiVL")
 
         self._model = model
         self.processor = processor
