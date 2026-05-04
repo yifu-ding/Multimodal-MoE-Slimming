@@ -30,9 +30,12 @@ from src.calibration.helpers.utils import (
     unwrap_output,
 )
 from src.calibration.helpers.helpers import compute_block_loss
-from src.calibration.representation_distill.common import ensure_dir
-from src.calibration.representation_distill.common import resolve_hidden_start_layer
-from src.calibration.representation_distill.common import sort_sequence_by_position_ids
+from src.calibration.representation_distill.common import (
+    ensure_dir,
+    get_decoder_layer,
+    resolve_hidden_start_layer,
+    sort_sequence_by_position_ids,
+)
 from src.calibration.representation_distill.runtime.forward_from_hidden import forward_from_hidden
 
 
@@ -87,7 +90,7 @@ def _set_synthetic_modality_masks(
         token_count = attn_mask.numel()
         cnt_block.mlp.moe_text_mask = torch.zeros(token_count, 1, dtype=torch.bool, device=device)
         cnt_block.mlp.moe_media_mask = torch.zeros(token_count, 1, dtype=torch.bool, device=device)
-    if bundle.family == "qwen3":
+    if hasattr(cnt_block.mlp, "moe_padding_mask"):
         cnt_block.mlp.moe_padding_mask = (~attn_mask.to(torch.bool)).view(-1, 1)
 
 
@@ -107,11 +110,7 @@ def _synthetic_block_forward(
 ) -> float:
     model = bundle.model
     model.eval()
-    teacher_block = (
-        bundle.model.model.language_model.layers[layer_idx]
-        if bundle.family == "qwen3"
-        else bundle.model.language_model.model.layers[layer_idx]
-    )
+    teacher_block = get_decoder_layer(bundle, layer_idx)
     block_device = next(teacher_block.parameters()).device
     cnt_block = cnt_block.to(device=block_device, dtype=dtype)
     cnt_block.eval()
@@ -521,11 +520,7 @@ def main() -> None:
     )
 
     for layer_idx in target_layers:
-        teacher_block = (
-            bundle.model.model.language_model.layers[layer_idx]
-            if bundle.family == "qwen3"
-            else bundle.model.language_model.model.layers[layer_idx]
-        )
+        teacher_block = get_decoder_layer(bundle, layer_idx)
         cnt_block = copy.deepcopy(teacher_block)
         block_dtype = next(teacher_block.parameters()).dtype
         total_batches_expected = math.ceil(num_samples / args.batch_size)

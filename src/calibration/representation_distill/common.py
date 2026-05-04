@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import inspect
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Sequence
@@ -52,11 +53,20 @@ def get_num_decoder_layers(bundle) -> int:
 
 def get_hidden_size(bundle) -> int:
     config = getattr(bundle.model, "config", None)
-    text_config = getattr(config, "text_config", config)
-    for attr in ("hidden_size", "d_model", "model_dim"):
-        value = getattr(text_config, attr, None)
-        if value is not None:
-            return int(value)
+    candidate_configs = [
+        getattr(config, "text_config", None),
+        getattr(config, "language_config", None),
+        getattr(bundle.model, "config", None),
+        getattr(getattr(bundle.model, "language", None), "config", None),
+        getattr(getattr(getattr(bundle.model, "language", None), "model", None), "config", None),
+    ]
+    for candidate in candidate_configs:
+        if candidate is None:
+            continue
+        for attr in ("hidden_size", "d_model", "model_dim"):
+            value = getattr(candidate, attr, None)
+            if value is not None:
+                return int(value)
     raise AttributeError("Cannot infer hidden size from model config.")
 
 
@@ -65,8 +75,10 @@ def get_final_norm(bundle):
         return bundle.model.model.language_model.norm
     if bundle.family == "kimi":
         return bundle.model.language_model.model.norm
+    if bundle.family == "deepseek_vl":
+        return bundle.model.language.model.norm
     raise NotImplementedError(
-        f"`forward_from_hidden` currently supports qwen3/kimi only, got family={bundle.family}."
+        f"`forward_from_hidden` currently supports qwen3/kimi/deepseek_vl only, got family={bundle.family}."
     )
 
 
@@ -588,37 +600,106 @@ def build_chat_messages(raw_samples: Sequence[Dict[str, Any]]) -> List[List[Dict
     return messages
 
 
+def _build_deepseek_conversations(raw_samples: Sequence[Dict[str, Any]]) -> List[List[Dict[str, str]]]:
+    conversations = []
+    for sample in raw_samples:
+        media_prefix = "<image>\n" * (
+            len(sample.get("images", [])) + len(sample.get("video_frames", []))
+        )
+        conversations.append(
+            [
+                {
+                    "role": "user",
+                    "content": f"{media_prefix}{sample['text']}".strip(),
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                },
+            ]
+        )
+    return conversations
+
+
+def _filter_forward_inputs(model, inputs: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        valid_names = set(inspect.signature(model.forward).parameters)
+    except Exception:
+        return inputs
+    return {key: value for key, value in inputs.items() if key in valid_names}
+
+
 def prepare_raw_batch_inputs(bundle, raw_samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     processor = bundle.processor
-    messages = build_chat_messages(raw_samples)
-    prompts = processor.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        tokenize=False,
-    )
-    flat_images = []
-    for sample in raw_samples:
-        flat_images.extend(sample.get("images", []))
-        flat_images.extend(sample.get("video_frames", []))
+    if hasattr(processor, "apply_chat_template"):
+        messages = build_chat_messages(raw_samples)
+        prompts = processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        flat_images = []
+        for sample in raw_samples:
+            flat_images.extend(sample.get("images", []))
+            flat_images.extend(sample.get("video_frames", []))
 
-    processor_kwargs = {
-        "text": prompts,
-        "return_tensors": "pt",
-        "padding": True,
-        "truncation": True,
-        "padding_side": "left",
-    }
-    if flat_images:
-        processor_kwargs["images"] = flat_images
-    return processor(**processor_kwargs)
+        processor_kwargs = {
+            "text": prompts,
+            "return_tensors": "pt",
+            "padding": True,
+            "truncation": True,
+            "padding_side": "left",
+        }
+        if flat_images:
+            processor_kwargs["images"] = flat_images
+        return processor(**processor_kwargs)
+
+    if hasattr(processor, "process_one") and hasattr(processor, "batchify"):
+        conversations = _build_deepseek_conversations(raw_samples)
+        sample_prepares = []
+        for sample, conversation in zip(raw_samples, conversations):
+            sample_images = [
+                *sample.get("images", []),
+                *sample.get("video_frames", []),
+            ]
+            sample_prepares.append(
+                processor(
+                    conversations=conversation,
+                    images=sample_images or None,
+                    force_batchify=False,
+                )
+            )
+        batched = processor.batchify(sample_prepares)
+        if hasattr(batched, "__dataclass_fields__"):
+            batched_dict = {
+                field_name: getattr(batched, field_name)
+                for field_name in batched.__dataclass_fields__
+            }
+            return _filter_forward_inputs(bundle.model, batched_dict)
+        if hasattr(batched, "keys"):
+            batched_dict = {key: batched[key] for key in batched.keys()}
+            return _filter_forward_inputs(bundle.model, batched_dict)
+        raise TypeError(
+            f"Unsupported DeepSeek batch output type: {type(batched).__name__}."
+        )
+
+    raise TypeError(
+        f"Unsupported processor type for raw batch preparation: {type(processor).__name__}."
+    )
 
 
 def move_inputs_to_model_device(model, inputs: Dict[str, Any]) -> Dict[str, Any]:
     device = next(model.parameters()).device
+    model_dtype = next(model.parameters()).dtype
     moved: Dict[str, Any] = {}
     for key, value in inputs.items():
         if hasattr(value, "to"):
-            moved[key] = value.to(device)
+            if key in {"attention_mask", "images_seq_mask"}:
+                moved[key] = value.to(device=device, dtype=torch.bool)
+            elif key in {"images", "pixel_values"} and torch.is_floating_point(value):
+                moved[key] = value.to(device=device, dtype=model_dtype)
+            else:
+                moved[key] = value.to(device)
         else:
             moved[key] = value
     return moved

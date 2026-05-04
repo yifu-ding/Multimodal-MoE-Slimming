@@ -25,7 +25,6 @@ try:
     )
     from transformers.utils.generic import check_model_inputs
     from transformers.utils import TransformersKwargs
-    from transformers.masking_utils import create_causal_mask
 except Exception:
     logger.warning("Qwen3VLMoeForConditionalGeneration is not available.")
     Qwen3VLMoeForConditionalGeneration = None
@@ -45,6 +44,7 @@ except Exception:
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.cache_utils import Cache, DynamicCache
+from src.base.models.transformers_compat import create_causal_mask
 from src.base.models.utils import (
     apply_tensor_scale,
     apply_scaler_scale,
