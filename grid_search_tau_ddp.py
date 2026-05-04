@@ -1,11 +1,6 @@
 import argparse
 from src.base.models.kimi import load_model as load_kimi_model
 from src.base.models.qwen3 import load_model as load_qwen3_model
-from datasets import load_dataset, concatenate_datasets
-from tasks.gqa import gqa_transform
-from tasks.coco import coco_transform
-from tasks.dataset_paths import require_dataset_dir
-from tasks.video_mmmu import videommmu_transform
 import torch.nn.functional as F
 import src.base.models.kimi as kimi_model
 import src.base.models.qwen3 as qwen3_model
@@ -16,10 +11,15 @@ import gc
 import torch
 from functools import partial
 from utils import to_device
-from utils import create_mask_after_token, create_mask_after_last_token
 from loguru import logger
 import math
 from accelerate import Accelerator
+from src.integrations import (
+    build_text_to_message,
+    get_family_calibration_config,
+    load_modes_dataset,
+    resolve_model_family_from_path,
+)
 
 
 @torch.no_grad()
@@ -346,45 +346,19 @@ if __name__ == "__main__":
     grid_map = args.grid_map
     exp_coeff = args.exp_coeff
 
-    model_name = ""
+    family = resolve_model_family_from_path(model_name_or_path)
 
     if is_main:
         os.makedirs(save_dir, exist_ok=True)
 
-    # Choose model loader and modality specifics
-    load_model = None
-    text_to_message = None
-    modalities = None
-    if "Kimi-VL" in model_name_or_path:
+    model_config = get_family_calibration_config(model_name_or_path)
+    if family == "kimi":
         load_model = load_kimi_model
-        text_to_message = lambda text: [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": "path/to/image"},
-                    {"type": "text", "text": text},
-                ],
-            }
-        ]
-        model_name = "Kimi-VL"
-        modalities = ["text", "visual"]
-        model_create_mask_after_token = create_mask_after_token
-    elif "Qwen3-VL" in model_name_or_path:
+    elif family == "qwen3":
         load_model = load_qwen3_model
-        text_to_message = lambda text: [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": "path/to/image"},
-                    {"type": "text", "text": text},
-                ],
-            }
-        ]
-        model_name = "Qwen3-VL"
-        modalities = ["text", "visual"]
-        model_create_mask_after_token = create_mask_after_last_token
     else:
         raise ValueError(f"Not support {model_name_or_path}")
+    text_to_message = build_text_to_message
 
     # Load model and processor on each process
     model, processor = load_model(model_name_or_path, device_map=None)
@@ -393,33 +367,7 @@ if __name__ == "__main__":
     # model = accelerator.prepare(model)
     model.to(accelerator.device)
 
-    # Load dataset (every rank loads the same, will be sharded by index selection below)
-    data = None
-    if "gqa" in dataset:
-        data = load_dataset(
-            require_dataset_dir("GQA", "testdev_balanced_instructions"), token=True
-        )["train"]
-        data.set_transform(gqa_transform)
-    elif "coco" in dataset:
-        data = load_dataset(
-            require_dataset_dir("COCO-Caption2017", "data"), token=True
-        )["validation"]
-        data.set_transform(coco_transform)
-    elif "video_mmmu" in dataset:
-        assert model_name == "Kimi-VL", "VideoMMMU only support Kimi-VL"
-        adaptation = load_dataset(
-            require_dataset_dir("VideoMMMU", "Adaptation"), token=True
-        )["test"]
-        comprehension = load_dataset(
-            require_dataset_dir("VideoMMMU", "Comprehension"), token=True
-        )["test"]
-        perception = load_dataset(
-            require_dataset_dir("VideoMMMU", "Perception"), token=True
-        )["test"]
-        data = concatenate_datasets([adaptation, comprehension, perception])
-        data.set_transform(videommmu_transform)
-    else:
-        raise ValueError(f"Not support {args.dataset}")
+    data = load_modes_dataset(dataset, family)
 
     # Build the global index range, then shard across processes
     global_start = start_idx
@@ -470,15 +418,9 @@ if __name__ == "__main__":
                 batched_messages[i] = (
                     batched_messages[i] + batch["model_input_full_answer"][i]
                 )
-                if model_name == "Kimi-VL":
-                    batched_messages[i] = batched_messages[i] + "<|im_end|>[EOS]"
-                elif model_name == "Qwen3-VL":
-                    batched_messages[i] = batched_messages[i] + "<|im_end|>"
-                else:
-                    ValueError(f"Not support {model_name}")
+                batched_messages[i] = batched_messages[i] + model_config["eos_token"]
                 if dataset == "video_mmmu":
                     tmp.extend(batch["model_input_visual"][i])
-                    videos = batch["model_input_visual"][i]
                     frame_num = batch["model_input_frames"][i]
                     media_end_idx = batched_messages[i].find(
                         "<|media_start|>image<|media_content|><|media_pad|><|media_end|>"
@@ -508,20 +450,8 @@ if __name__ == "__main__":
         inputs_list.append(to_device(inputs, "cpu"))
 
         # Determine special token for answer mask creation
-        special_token_id = None
-        if model_name == "Kimi-VL":
-            special_token_id = 163588
-            offset = 3
-        elif model_name == "Qwen3-VL":
-            special_token_id = 151644
-            offset = 3
-        else:
-            raise ValueError(f"Not support {model_name}")
-
-        answer_masks = model_create_mask_after_token(
+        answer_masks = model_config["create_mask"](
             input_ids=inputs["input_ids"],
-            special_token_id=special_token_id,
-            offset=offset,  # offset 2 for <|im_end|>[EOS]
         ).to("cpu")
         answer_masks_list.append(answer_masks)
 

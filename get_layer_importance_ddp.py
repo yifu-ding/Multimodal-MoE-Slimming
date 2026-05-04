@@ -1,20 +1,19 @@
 import torch
 import argparse
-from functools import partial
-from datasets import load_dataset, concatenate_datasets
-from tasks.gqa import gqa_transform
-from tasks.coco import coco_transform
-from tasks.dataset_paths import require_dataset_dir
-from tasks.video_mmmu import videommmu_transform
 import torch.nn.functional as F
 import pickle
 import os
-from utils import create_mask_after_token, create_mask_after_last_token
 from loguru import logger
 from accelerate import Accelerator
 from torch.utils.data import DataLoader, Subset
 from src.base.models.kimi import load_model as load_kimi_model
 from src.base.models.qwen3 import load_model as load_qwen_model
+from src.integrations import (
+    build_text_to_message,
+    get_family_calibration_config,
+    load_modes_dataset,
+    resolve_model_family_from_path,
+)
 
 
 @torch.no_grad()
@@ -265,88 +264,20 @@ if __name__ == "__main__":
     temperature = args.temperature
     dataset = args.dataset
     # topk_logits = args.topk_logits
-    model_name = ""
+    family = resolve_model_family_from_path(model_name_or_path)
 
     if accelerator.is_main_process:
         os.makedirs(save_dir, exist_ok=True)
-    load_model = None
-    text_to_message = None
-    modalities = None
-    model_config = {}
-    if "Kimi-VL" in model_name_or_path:
+    model_config = get_family_calibration_config(model_name_or_path)
+    if family == "kimi":
         load_model = load_kimi_model
-        model_name = "Kimi-VL"
-        modalities = ["text", "visual"]
-        model_config = {
-            "get_lm": lambda m: m.language_model,
-            "is_moe_layer": lambda cfg, idx: idx >= cfg.first_k_dense_replace
-            and idx % cfg.moe_layer_freq == 0,
-            "create_mask": partial(
-                create_mask_after_token, special_token_id=163588, offset=3
-            ),
-            "eos_token": "<|im_end|>[EOS]",
-        }
-    elif "Qwen3-VL" in model_name_or_path:
+    elif family == "qwen3":
         load_model = load_qwen_model
-        model_name = "Qwen3-VL"
-        special_token_id = 151644
-        offset = 3
-        eos_token = "<|im_end|>"
-        modalities = ["text", "visual"]
-        model_config = {
-            "get_lm": lambda m: m.model.language_model,
-            "is_moe_layer": lambda cfg, idx: (
-                hasattr(cfg, "num_experts")
-                and cfg.num_experts > 0
-                and (idx + 1) % cfg.decoder_sparse_step == 0
-                and idx not in getattr(cfg, "mlp_only_layers", [])
-            ),
-            "create_mask": partial(
-                create_mask_after_last_token,
-                special_token_id=special_token_id,
-                offset=offset,
-            ),
-            "eos_token": eos_token,
-        }
     else:
         raise ValueError(f"Not support {model_name_or_path}")
-    text_to_message = lambda text: [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": "path/to/image"},
-                {"type": "text", "text": text},
-            ],
-        }
-    ]
+    text_to_message = build_text_to_message
     model, processor = load_model(model_name_or_path, device_map="cpu")
-
-    data = None
-    if "gqa" in dataset:
-        data = load_dataset(
-            require_dataset_dir("GQA", "testdev_balanced_instructions"), token=True
-        )["train"]
-        data.set_transform(gqa_transform)
-    elif "coco" in dataset:
-        data = load_dataset(
-            require_dataset_dir("COCO-Caption2017", "data"), token=True
-        )["validation"]
-        data.set_transform(coco_transform)
-    elif "video_mmmu" in dataset:
-        assert model_name == "Kimi-VL", "VideoMMMU only support Kimi-VL"
-        adaptation = load_dataset(
-            require_dataset_dir("VideoMMMU", "Adaptation"), token=True
-        )["test"]
-        comprehension = load_dataset(
-            require_dataset_dir("VideoMMMU", "Comprehension"), token=True
-        )["test"]
-        perception = load_dataset(
-            require_dataset_dir("VideoMMMU", "Perception"), token=True
-        )["test"]
-        data = concatenate_datasets([adaptation, comprehension, perception])
-        data.set_transform(videommmu_transform)
-    else:
-        raise ValueError(f"Not support {args.dataset}")
+    data = load_modes_dataset(dataset, family)
 
     subset_indices = list(range(start_idx, min(start_idx + num_samples, len(data))))
     subset = Subset(data, subset_indices)
@@ -378,7 +309,7 @@ if __name__ == "__main__":
         temperature,
         dataset,
         dataloader,
-        modalities,
+        model_config["modalities"],
         # topk_logits,
     )
     if accelerator.is_main_process:

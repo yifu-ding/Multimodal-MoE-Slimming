@@ -234,6 +234,8 @@ def build_modality_budget_masks(
     visual_scores: torch.Tensor,
     use_ema: bool,
     shared_protect: bool, 
+    text_only: bool,
+    visual_only: bool,
     expertwise_budget_normalize: bool,
     expertwise_scores: torch.Tensor | None,
     layerwise_keep_plan: torch.Tensor,
@@ -241,8 +243,10 @@ def build_modality_budget_masks(
     ema_matrix: Optional[torch.Tensor] = None,
     verbose: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    
-    def _tentative(scores: torch.Tensor) -> torch.Tensor:
+    if text_only and visual_only:
+        raise ValueError("`text_only` and `visual_only` cannot both be True.")
+
+    def _tentative(scores: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if expertwise_scores is not None:
             weighted = torch.zeros_like(scores)
             for lid in range(scores.shape[0]):
@@ -265,6 +269,27 @@ def build_modality_budget_masks(
     # 计算文本和视觉各自的 tentative masks
     text_tentative, text_K_E = _tentative(text_scores)
     visual_tentative, visual_K_E = _tentative(visual_scores)
+    zero_shared_masks = torch.zeros_like(text_tentative, dtype=torch.bool)
+    zero_k = torch.zeros_like(text_K_E)
+
+    if text_only:
+        return (
+            text_tentative.bool(),
+            zero_shared_masks,
+            text_K_E,
+            torch.zeros_like(visual_K_E),
+            zero_k,
+            text_K_E.clone(),
+        )
+    if visual_only:
+        return (
+            visual_tentative.bool(),
+            zero_shared_masks,
+            torch.zeros_like(text_K_E),
+            visual_K_E,
+            visual_K_E.clone(),
+            zero_k,
+        )
     
     if verbose:
         _print(f"[Modality-aware Budget] before: text: {text_K_E[0]}, \n visual: {visual_K_E[0]}")

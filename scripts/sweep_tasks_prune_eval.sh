@@ -58,6 +58,7 @@ USE_EMA="${USE_EMA:-1}"
 NORMALIZE="${NORMALIZE:-0}"  # legacy
 EMA_SOURCE_KEY="${EMA_SOURCE_KEY:-ema_matrix_prior_corrected}"  # ema_matrix_prior_corrected
 LAYERWISE_LOSS_KEY="${LAYERWISE_LOSS_KEY:-layerwise_loss}"
+
 SMOOTH_FN="${SMOOTH_FN:-cbrt}" # sqrt cbrt fourth_root log
 SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act}"
 # 3proj_second_order down_saliency 3proj_saliency 3proj_grad wg

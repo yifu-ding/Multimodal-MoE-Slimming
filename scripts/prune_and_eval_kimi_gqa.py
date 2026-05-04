@@ -61,6 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min_per_expert", type=int, default=0)
     p.add_argument("--modality_aware", action="store_true")
     p.add_argument("--shared_protect", action="store_true")
+    p.add_argument("--text_only", action="store_true")
+    p.add_argument("--visual_only", action="store_true")
     p.add_argument("--normalize", action="store_true")
     p.add_argument("--expertwise_budget_normalize", action="store_true")
     p.add_argument("--num_samples", type=int, default=0)
@@ -70,6 +72,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--smooth_fn", type=str, default="sqrt")
     p.add_argument("--use_ema", type=int, default=1)
+    p.add_argument("--tau_skip_path", type=str, default=None)
+    p.add_argument("--layer_importance_path", type=str, default=None)
+    p.add_argument("--expert_importance_path", type=str, default=None)
     p.add_argument(
         "--ema_source_key",
         type=str,
@@ -95,6 +100,25 @@ def _build_messages_batch(questions, media_type):
             ]
         messages.append([{"role": "user", "content": content}])
     return messages
+
+
+def _build_generation_kwargs(args):
+    generation_kwargs = {}
+    enable_tau_skip = bool(args.tau_skip_path)
+    if enable_tau_skip:
+        import pickle
+
+        with open(args.tau_skip_path, "rb") as f:
+            tau_skip_dict = pickle.load(f)
+        generation_kwargs["enable_tau_skip"] = True
+        generation_kwargs["tau"] = tau_skip_dict["tau"]
+    if args.layer_importance_path:
+        generation_kwargs["enable_load_layer_importance"] = True
+        generation_kwargs["layer_importance_path"] = args.layer_importance_path
+    if args.expert_importance_path:
+        generation_kwargs["enable_load_expert_importance"] = True
+        generation_kwargs["expert_importance_path"] = args.expert_importance_path
+    return generation_kwargs
 
 
 def main() -> None:
@@ -123,6 +147,8 @@ def main() -> None:
                 },
                 "modality_aware": args.modality_aware,
                 "shared_protect": args.shared_protect,
+                "text_only": args.text_only,
+                "visual_only": args.visual_only,
                 "use_ema": bool(args.use_ema),
                 "normalize": args.normalize,
                 "expertwise_budget_normalize": args.expertwise_budget_normalize,
@@ -169,6 +195,7 @@ def main() -> None:
     )
     total = len(pool)
     print(f"[Run] Evaluating {total} samples (batch_size={args.batch_size}).")
+    generation_extra_kwargs = _build_generation_kwargs(args)
 
     # ── Eval loop ──
     predictions = []
@@ -222,6 +249,7 @@ def main() -> None:
                 **inputs,
                 max_new_tokens=args.max_new_tokens,
                 do_sample=False,
+                **generation_extra_kwargs,
             )
 
             for j, (gt, out_ids) in enumerate(zip(gt_answers, outputs)):
@@ -256,11 +284,16 @@ def main() -> None:
         metric_name.lower(): round(metric_value, 6),
         "scores_path": args.scores_path,
         "prune_ratio": args.prune_ratio,
+        "tau_skip_path": args.tau_skip_path,
+        "layer_importance_path": args.layer_importance_path,
+        "expert_importance_path": args.expert_importance_path,
         "inter_method": args.inter_method,
         "intra_method": args.intra_method,
         "intra_expert_metric": args.intra_expert_metric,
         "modality_aware": args.modality_aware,
         "shared_protect": args.shared_protect,
+        "text_only": args.text_only,
+        "visual_only": args.visual_only,
         "use_ema": bool(args.use_ema),
         "saved_pruned_checkpoint": False,
     }
