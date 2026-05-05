@@ -6,6 +6,27 @@ PREFIX="${PREFIX:-$(pwd)}"
 export PYTHONPATH="${PREFIX}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
+MODEL_NAME="${MODEL_NAME:-}"
+if [[ -n "${MODEL_NAME}" ]]; then
+    case "${MODEL_NAME}" in
+        kimi-vl-a3b|kimi-vl-a3b-instruct)
+            MODEL_PATH="moonshotai/Kimi-VL-A3B-Instruct"
+            ;;
+        qwen3-vl-30b-a3b|qwen3-vl-30b-a3b-instruct)
+            MODEL_PATH="Qwen/Qwen3-VL-30B-A3B-Instruct"
+            ;;
+        deepseek-vl2-small)
+            MODEL_PATH="deepseek-ai/deepseek-vl2-small"
+            ;;
+        internvl3_5-30b-a3b-hf)
+            MODEL_PATH="OpenGVLab/InternVL3_5-30B-A3B-HF"
+            ;;
+        *)
+            echo "Unsupported MODEL_NAME=${MODEL_NAME}" >&2
+            exit 1
+            ;;
+    esac
+fi
 TEACHER_LAYER="${TEACHER_LAYER:-0}"
 CACHE_BLOCK_INPUT="${CACHE_BLOCK_INPUT:-1}"
 COMPRESSED_LENGTH="${COMPRESSED_LENGTH:-2048}"  # sequence length  # 只压缩 seqlen
@@ -40,8 +61,12 @@ else
     TEACHER_DATASETS_PATH_LABEL="${TEACHER_DATASETS}"
 fi
 
-OUTPUT_PATH="${OUTPUT_PATH:-${PREFIX}/storage/data_distill_kimi/${TEACHER_DATASETS_PATH_LABEL}-num_${SAMPLES_PER_DATASET}-token_${COMPRESSED_LENGTH}-${COMPRESSION_MODE}_at${ATTN_TEMPERATURE}-$(date +%m%d%H%M%S)}/teacher_hidden.pt"
-LATEST_LINK_DIR="${LATEST_LINK_DIR:-${PREFIX}/storage/data_distill_kimi/${TEACHER_DATASETS_PATH_LABEL}-num_${SAMPLES_PER_DATASET}-token_${COMPRESSED_LENGTH}-${COMPRESSION_MODE}_at${ATTN_TEMPERATURE}-latest}"
+if [[ -n "${OUTPUT_PATH:-}" ]]; then
+    OUTPUT_PATH="${OUTPUT_PATH}"
+else
+    OUTPUT_PATH="${PREFIX}/storage/data_distill_${MODEL_NAME}/${TEACHER_DATASETS_PATH_LABEL}-num_${SAMPLES_PER_DATASET}-token_${COMPRESSED_LENGTH}-${COMPRESSION_MODE}_at${ATTN_TEMPERATURE}-$(date +%m%d%H%M%S)/teacher_hidden.pt"
+fi
+LATEST_LINK_DIR="${LATEST_LINK_DIR:-${PREFIX}/storage/data_distill_${MODEL_NAME}/${TEACHER_DATASETS_PATH_LABEL}-num_${SAMPLES_PER_DATASET}-token_${COMPRESSED_LENGTH}-${COMPRESSION_MODE}_at${ATTN_TEMPERATURE}-latest}"
 
 EXTRA_ARGS=("$@")
 

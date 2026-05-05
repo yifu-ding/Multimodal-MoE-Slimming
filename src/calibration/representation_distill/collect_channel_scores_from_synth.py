@@ -114,6 +114,15 @@ def _synthetic_block_forward(
     block_device = next(teacher_block.parameters()).device
     cnt_block = cnt_block.to(device=block_device, dtype=dtype)
     cnt_block.eval()
+    original_attn_impl = None
+    if (
+        getattr(bundle, "family", None) == "internvl"
+        and hasattr(cnt_block, "self_attn")
+        and hasattr(cnt_block.self_attn, "config")
+    ):
+        original_attn_impl = getattr(cnt_block.self_attn.config, "_attn_implementation", None)
+        if original_attn_impl is not None:
+            cnt_block.self_attn.config._attn_implementation = "eager"
 
     teacher_state = {}
     teacher_handle = register_teacher_block_hook(teacher_block, teacher_state)
@@ -231,6 +240,8 @@ def _synthetic_block_forward(
         if fused_expert_state is not None:
             experts, original_forward = fused_expert_state
             experts.forward = original_forward
+        if original_attn_impl is not None:
+            cnt_block.self_attn.config._attn_implementation = original_attn_impl
         clear_block_saved_tensors(cnt_block)
 
     return (total_loss / max(total_batches, 1), total_second_order_sum / max(total_batches, 1))

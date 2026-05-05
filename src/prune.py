@@ -272,6 +272,11 @@ def _make_linear(
 def _resolve_model_layout(model: nn.Module, config):
     if hasattr(model, "language_model") and hasattr(model.language_model, "model"):
         return "kimi", model.language_model.model.layers
+    if hasattr(model, "language_model") and hasattr(model.language_model, "layers"):
+        if getattr(config, "num_experts", 0) > 0:
+            return "qwen3", model.language_model.layers
+        if getattr(config, "num_local_experts", 0) > 0:
+            return "gpt_oss", model.language_model.layers
     if hasattr(model, "model") and hasattr(model.model, "language_model"):
         if getattr(config, "num_experts", 0) > 0:
             return "qwen3", model.model.language_model.layers

@@ -1,6 +1,11 @@
 import torch
 import torch.nn.functional as F
 from loguru import logger
+from src.integrations import (
+    fastmmoe_enabled,
+    fastmmoe_strategy,
+    prepare_fastmmoe_vendor_imports,
+)
 
 try:
     from transformers import AutoModel, AutoModelForCausalLM, AutoProcessor
@@ -170,6 +175,35 @@ def load_model(
 ):
     if AutoProcessor is None or AutoModelForCausalLM is None or AutoModel is None:
         raise ImportError("DeepSeek-VL loading requires transformers AutoModel/AutoProcessor support.")
+    if fastmmoe_enabled():
+        prepare_fastmmoe_vendor_imports("deepseek_vl")
+        from deepseek_vl2.models import (
+            DeepseekVLV2FastMMoEForCausalLM,
+            DeepseekVLV2FastVForCausalLM,
+            DeepseekVLV2Processor,
+            DeepseekVLV2SparseVLMForCausalLM,
+        )
+
+        strategy = fastmmoe_strategy()
+        if strategy == "sparsevlm":
+            model_cls = DeepseekVLV2SparseVLMForCausalLM
+        elif strategy == "fastv":
+            model_cls = DeepseekVLV2FastVForCausalLM
+        else:
+            model_cls = DeepseekVLV2FastMMoEForCausalLM
+
+        processor = DeepseekVLV2Processor.from_pretrained(model_path)
+        model = model_cls.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+            torch_dtype=torch_dtype,
+            device_map=device_map,
+        )
+        model.eval()
+        _set_special_token_tensor(model, processor)
+        logger.info(f"[FastMMoE] Loaded DeepSeek-VL2 with strategy={strategy}")
+        return model, processor
+
     _guard_against_broken_flash_attn()
     _patch_deepseek_vl2_vision_attention()
     _retry_import_deepseek_vl2_processor()

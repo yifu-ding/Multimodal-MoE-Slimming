@@ -31,6 +31,13 @@ def move_to_device(inputs: dict, device) -> dict:
     return {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
 
 
+def _resolve_text_config(model):
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        raise AttributeError(f"Model {type(model)} has no config")
+    return getattr(cfg, "text_config", getattr(cfg, "llm_config", cfg))
+
+
 def _get_batch_rows(pool, start: int, batch_size: int):
     end = min(start + batch_size, len(pool))
     return [pool[idx] for idx in range(start, end)]
@@ -178,7 +185,7 @@ def main() -> None:
     print(f"[Run] Loading model from: {args.model_path}")
     model, processor = auto_load_model(args.model_path)
     model.eval()
-    text_config = model.config.text_config
+    text_config = _resolve_text_config(model)
     apply_structural_pruning(model, masks, text_config)
     print("[Run] Applied structural pruning in memory; no checkpoint will be saved.")
 

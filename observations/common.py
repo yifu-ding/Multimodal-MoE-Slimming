@@ -339,6 +339,35 @@ def _get_qwen3_text_config(model):
     return getattr(cfg, "text_config", cfg)
 
 
+def _get_internvl_text_config(model):
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        raise AttributeError(f"Model {type(model)} has no `config` for InternVL config resolution.")
+    return getattr(cfg, "text_config", getattr(cfg, "llm_config", cfg))
+
+
+def _get_internvl_language_model(model):
+    candidates = [
+        ("model", "language_model"),
+        ("language_model",),
+    ]
+    for path in candidates:
+        current = model
+        ok = True
+        for attr in path:
+            if not hasattr(current, attr):
+                ok = False
+                break
+            current = getattr(current, attr)
+        if ok:
+            return current
+    raise AttributeError(f"Cannot resolve InternVL language model from model type {type(model)}")
+
+
+def _get_internvl_decoder_layers(model):
+    return _get_internvl_language_model(model).layers
+
+
 def _get_qwen3_decoder_layers(model):
     candidates = [
         ("model", "language_model", "layers"),  # Qwen3-VL
@@ -504,10 +533,11 @@ def load_model_bundle(
             attn_implementation=attn_implementation,
         )
         eos_token = getattr(processor.tokenizer, "eos_token", None) or ""
-        eos_token_id = getattr(model.config.text_config, "eos_token_id", None)
+        text_config = _get_internvl_text_config(model)
+        eos_token_id = getattr(text_config, "eos_token_id", None)
         model_config = {
             "family": family,
-            "get_lm": lambda m: m.model.language_model,
+            "get_lm": _get_internvl_language_model,
             "is_moe_layer": lambda cfg, idx: getattr(cfg, "num_local_experts", 0) > 0,
             "eos_token": eos_token,
             "create_mask": partial(
@@ -1424,8 +1454,33 @@ def discover_layer_structure(bundle: ModelBundle) -> Tuple[Dict[int, int], Dict[
                 layer_to_num_channels[layer_idx] = int(intermediate_size)
         return layer_to_num_experts, layer_to_num_channels
     if bundle.family == "internvl":
-        config = bundle.model.config.text_config
-        for layer_idx, layer in enumerate(bundle.model.model.language_model.layers):
+        config = _get_internvl_text_config(bundle.model)
+        for layer_idx, layer in enumerate(_get_internvl_decoder_layers(bundle.model)):
+            if hasattr(layer.mlp, "experts") and getattr(config, "num_experts", 0) > 0:
+                experts = layer.mlp.experts
+                num_experts = _safe_num_experts(experts)
+                layer_to_num_experts[layer_idx] = int(num_experts)
+                intermediate_size = getattr(experts, "intermediate_dim", None)
+                if intermediate_size is None:
+                    intermediate_size = getattr(experts, "intermediate_size", None)
+                if intermediate_size is None:
+                    intermediate_size = getattr(experts, "expert_dim", None)
+                if intermediate_size is None:
+                    sample_expert = experts[0]
+                    if hasattr(sample_expert, "up_proj"):
+                        intermediate_size = sample_expert.up_proj.out_features
+                    elif hasattr(sample_expert, "w3"):
+                        w3 = sample_expert.w3
+                        intermediate_size = (
+                            w3.out_features if isinstance(w3, torch.nn.Module) else w3.shape[0]
+                        )
+                if intermediate_size is None:
+                    raise AttributeError(
+                        "Cannot infer InternVL/Qwen3-MoE expert width for observation hooks."
+                    )
+                layer_to_num_channels[layer_idx] = int(intermediate_size)
+                continue
+
             if getattr(config, "num_local_experts", 0) <= 0:
                 continue
             if not (hasattr(layer.mlp, "router") and hasattr(layer.mlp, "experts")):

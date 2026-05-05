@@ -77,8 +77,13 @@ def get_final_norm(bundle):
         return bundle.model.language_model.model.norm
     if bundle.family == "deepseek_vl":
         return bundle.model.language.model.norm
+    if bundle.family == "internvl":
+        if hasattr(bundle.model, "model") and hasattr(bundle.model.model, "language_model"):
+            return bundle.model.model.language_model.norm
+        if hasattr(bundle.model, "language_model"):
+            return bundle.model.language_model.norm
     raise NotImplementedError(
-        f"`forward_from_hidden` currently supports qwen3/kimi/deepseek_vl only, got family={bundle.family}."
+        f"`forward_from_hidden` currently supports qwen3/kimi/deepseek_vl/internvl only, got family={bundle.family}."
     )
 
 

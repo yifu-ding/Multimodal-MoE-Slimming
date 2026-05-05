@@ -1,5 +1,10 @@
 import torch
 from loguru import logger
+from src.integrations import (
+    configure_fastmmoe_internvl_runtime,
+    fastmmoe_enabled,
+    prepare_fastmmoe_vendor_imports,
+)
 
 try:
     from transformers import AutoProcessor, InternVLForConditionalGeneration
@@ -16,6 +21,28 @@ def load_model(
     torch_dtype: torch.dtype = torch.bfloat16,
     device_map: str = "auto",
 ):
+    if fastmmoe_enabled():
+        prepare_fastmmoe_vendor_imports("internvl")
+        from vlmeval.vlm.internvl import InternVLChatModel
+
+        if AutoProcessor is None:
+            raise ImportError("InternVL FastMMoE loading requires transformers AutoProcessor.")
+        model = InternVLChatModel.from_pretrained(
+            model_path,
+            torch_dtype=torch_dtype,
+            trust_remote_code=trust_remote_code,
+            low_cpu_mem_usage=True,
+            device_map=device_map,
+        )
+        processor = AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+        )
+        model.eval()
+        configure_fastmmoe_internvl_runtime(model, processor)
+        logger.info("[FastMMoE] Loaded InternVL vendor model")
+        return model, processor
+
     if InternVLForConditionalGeneration is None or AutoProcessor is None:
         try:
             import transformers
