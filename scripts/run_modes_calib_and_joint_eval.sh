@@ -11,10 +11,10 @@ set -euo pipefail
 #
 # Example
 # -------
-#   USE_LMMS_EVAL=1 \
-#   SCORES_PATH=/path/to/maes/scores.pt \
-#   PRUNE_RATIO=0.5 \
-#   bash scripts/run_modes_calib_and_joint_eval.sh
+# USE_LMMS_EVAL=1 \
+# SCORES_PATH=/home/dyf/code/distill/MAES/storage/data_distill_kimi/mixed-num_342-token_2048-sample_at1.0-0423143643/teacher_hidden-scores.pt \
+# PRUNE_RATIO=0.5 \
+# bash scripts/run_modes_calib_and_joint_eval.sh
 
 source scripts/select_least_used_gpu.sh
 
@@ -25,17 +25,35 @@ MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 DATASET="${DATASET:-gqa}"
 SCORES_PATH="${SCORES_PATH:-}"
 PRUNE_RATIO="${PRUNE_RATIO:-0.5}"
-TASK="${TASK:-${DATASET}}"
+SWEEP_TASKS="${SWEEP_TASKS:-coco2017cap mmstar mmbench realworldqa gqa mme textvqa chartqa}"
 USE_LMMS_EVAL="${USE_LMMS_EVAL:-1}"
 
 NUM_PROCESSES="${NUM_PROCESSES:-8}"
 MAIN_PROCESS_PORT="${MAIN_PROCESS_PORT:-5678}"
+
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    visible_gpu_count=$(python - <<'PY'
+import os
+raw = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+if not raw:
+    print(0)
+else:
+    print(len([x for x in raw.split(",") if x.strip()]))
+PY
+)
+    if [[ "${visible_gpu_count}" -gt 0 && "${NUM_PROCESSES}" -gt "${visible_gpu_count}" ]]; then
+        echo "[warn] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} exposes ${visible_gpu_count} GPU(s), but NUM_PROCESSES=${NUM_PROCESSES}. Clamping NUM_PROCESSES to ${visible_gpu_count}."
+        NUM_PROCESSES="${visible_gpu_count}"
+    fi
+fi
 
 MODES_NUM_SAMPLES="${MODES_NUM_SAMPLES:-1024}"
 MODES_BATCH_SIZE="${MODES_BATCH_SIZE:-8}"
 MODES_START_IDX="${MODES_START_IDX:-0}"
 MODES_LOSS_TYPE="${MODES_LOSS_TYPE:-kl}"
 MODES_TEMPERATURE="${MODES_TEMPERATURE:-1.0}"
+SEARCH_BATCH_SIZE="${SEARCH_BATCH_SIZE:-${MODES_BATCH_SIZE}}"
+SEARCH_ATTN_IMPLEMENTATION="${SEARCH_ATTN_IMPLEMENTATION:-flash_attention_2}"
 
 TARGET_SKIP_PROPORTION="${TARGET_SKIP_PROPORTION:-0.8}"
 GRID_NUM="${GRID_NUM:-100}"
@@ -90,7 +108,7 @@ run_cmd() {
 
 echo "Model                : ${MODEL_PATH}"
 echo "Dataset              : ${DATASET}"
-echo "Task                 : ${TASK}"
+echo "Sweep tasks          : ${SWEEP_TASKS}"
 echo "MAES scores          : ${SCORES_PATH}"
 echo "Prune ratio          : ${PRUNE_RATIO}"
 echo "Layer importance out : ${LAYER_IMPORTANCE_PATH}"
@@ -138,7 +156,7 @@ if [[ "${SKIP_SEARCH}" != "1" ]]; then
             --save_dir "${TAU_SEARCH_DIR}"
             --dataset "${DATASET}"
             --loss_type "${MODES_LOSS_TYPE}"
-            --batch_size "${MODES_BATCH_SIZE}"
+            --batch_size "${SEARCH_BATCH_SIZE}"
             --num_samples "${MODES_NUM_SAMPLES}"
             --start_idx "${MODES_START_IDX}"
             --temperature "${MODES_TEMPERATURE}"
@@ -151,6 +169,7 @@ if [[ "${SKIP_SEARCH}" != "1" ]]; then
             --visual_tau_min "${VISUAL_TAU_MIN}"
             --visual_tau_max "${VISUAL_TAU_MAX}"
             --exp_coeff "${EXP_COEFF}"
+            --attn_implementation "${SEARCH_ATTN_IMPLEMENTATION}"
         )
         if [[ -n "${EXPERT_IMPORTANCE_PATH}" ]]; then
             search_cmd+=(--expert_importance_path "${EXPERT_IMPORTANCE_PATH}")
@@ -167,28 +186,34 @@ if [[ ! -f "${TAU_SKIP_PATH}" ]]; then
 fi
 
 if [[ "${SKIP_EVAL}" != "1" ]]; then
-    eval_cmd=(
-        bash scripts/run_prune_eval_kimi_gqa.sh
-    )
-    run_cmd env \
-        PREFIX="${PREFIX}" \
-        PYTHONPATH="${PYTHONPATH}" \
-        CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" \
-        MODEL_PATH="${MODEL_PATH}" \
-        SCORES_PATH="${SCORES_PATH}" \
-        PRUNE_RATIO="${PRUNE_RATIO}" \
-        TASK="${TASK}" \
-        DATASET="${DATASET}" \
-        NUM_SAMPLES="${EVAL_NUM_SAMPLES}" \
-        BATCH_SIZE="${EVAL_BATCH_SIZE}" \
-        START_IDX="${START_IDX}" \
-        SUBSET_SEED="${SUBSET_SEED}" \
-        USE_LMMS_EVAL="${USE_LMMS_EVAL}" \
-        TAU_SKIP_PATH="${TAU_SKIP_PATH}" \
-        LAYER_IMPORTANCE_PATH="${LAYER_IMPORTANCE_PATH}" \
-        EXPERT_IMPORTANCE_PATH="${EXPERT_IMPORTANCE_PATH}" \
-        OUTPUT_DIR="${JOINT_EVAL_OUTPUT_DIR}" \
-        "${eval_cmd[@]}"
+    for TASK in ${SWEEP_TASKS}; do
+        TASK_OUTPUT_DIR="${JOINT_EVAL_OUTPUT_DIR}/${TASK}"
+        mkdir -p "${TASK_OUTPUT_DIR}"
+        echo "[eval] TASK=${TASK} OUTPUT_DIR=${TASK_OUTPUT_DIR}"
+        eval_cmd=(
+            bash scripts/run_prune_eval_kimi_gqa.sh
+        )
+        run_cmd env \
+            PREFIX="${PREFIX}" \
+            PYTHONPATH="${PYTHONPATH}" \
+            CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}" \
+            MODEL_PATH="${MODEL_PATH}" \
+            SCORES_PATH="${SCORES_PATH}" \
+            PRUNE_RATIO="${PRUNE_RATIO}" \
+            TASK="${TASK}" \
+            DATASET="${DATASET}" \
+            NUM_SAMPLES="${EVAL_NUM_SAMPLES}" \
+            BATCH_SIZE="${EVAL_BATCH_SIZE}" \
+            START_IDX="${START_IDX}" \
+            SUBSET_SEED="${SUBSET_SEED}" \
+            USE_LMMS_EVAL="${USE_LMMS_EVAL}" \
+            LAYERWISE_LOSS_KEY="${LAYERWISE_LOSS_KEY:-}" \
+            TAU_SKIP_PATH="${TAU_SKIP_PATH}" \
+            LAYER_IMPORTANCE_PATH="${LAYER_IMPORTANCE_PATH}" \
+            EXPERT_IMPORTANCE_PATH="${EXPERT_IMPORTANCE_PATH}" \
+            OUTPUT_DIR="${TASK_OUTPUT_DIR}" \
+            "${eval_cmd[@]}"
+    done
 else
     echo "[skip] SKIP_EVAL=1"
 fi

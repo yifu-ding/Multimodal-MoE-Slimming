@@ -10,7 +10,6 @@ import os
 import gc
 import torch
 from functools import partial
-from utils import to_device
 from loguru import logger
 import math
 from accelerate import Accelerator
@@ -20,6 +19,14 @@ from src.integrations import (
     load_modes_dataset,
     resolve_model_family_from_path,
 )
+
+
+def to_device(inputs, device):
+    if isinstance(inputs, dict) or hasattr(inputs, "items"):
+        return {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
+    if hasattr(inputs, "to"):
+        return inputs.to(device)
+    return inputs
 
 
 @torch.no_grad()
@@ -72,7 +79,7 @@ def gen_data_loss(
     for inputs, answer_masks, org_logits in zip(
         inputs_list, answer_masks_list, org_logits_list
     ):
-        inputs = to_device(inputs, model.device)
+        inputs = to_device(inputs, accelerator.device)
         outputs = model(
             **inputs,
             use_cache=False,
@@ -319,6 +326,13 @@ if __name__ == "__main__":
         choices=["exp", "linear"],
         help="Grid mapping: 'exp' (sigmoid) or 'linear'.",
     )
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default="flash_attention_2",
+        choices=["flash_attention_2", "sdpa", "eager"],
+        help="Attention implementation to use when loading the model.",
+    )
     args = parser.parse_args()
 
     # Initialize accelerator (DDP)
@@ -345,6 +359,7 @@ if __name__ == "__main__":
     visual_tau_max = args.visual_tau_max
     grid_map = args.grid_map
     exp_coeff = args.exp_coeff
+    attn_implementation = args.attn_implementation
 
     family = resolve_model_family_from_path(model_name_or_path)
 
@@ -361,7 +376,11 @@ if __name__ == "__main__":
     text_to_message = build_text_to_message
 
     # Load model and processor on each process
-    model, processor = load_model(model_name_or_path, device_map=None)
+    model, processor = load_model(
+        model_name_or_path,
+        device_map=None,
+        attn_implementation=attn_implementation,
+    )
     model.eval()
     # Prepare model with accelerator; processor remains on CPU
     # model = accelerator.prepare(model)
@@ -444,7 +463,7 @@ if __name__ == "__main__":
             padding=True,
             padding_side="left",
             truncation=True,
-        ).to(model.device)
+        ).to(accelerator.device)
 
         # Append CPU copies to avoid GPU memory blow-up during search
         inputs_list.append(to_device(inputs, "cpu"))

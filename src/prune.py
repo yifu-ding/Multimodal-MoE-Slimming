@@ -1,4 +1,4 @@
-"""Structural channel pruning for Kimi-VL, Qwen3-VL-MoE, and InternVL/GPT-OSS MoE experts."""
+"""Structural channel pruning for Kimi-VL, DeepSeek-VL2, Qwen3-VL-MoE, and GPT-OSS MoE experts."""
 
 from typing import Dict
 
@@ -272,6 +272,9 @@ def _make_linear(
 def _resolve_model_layout(model: nn.Module, config):
     if hasattr(model, "language_model") and hasattr(model.language_model, "model"):
         return "kimi", model.language_model.model.layers
+    if hasattr(model, "language") and hasattr(model.language, "model"):
+        if getattr(config, "n_routed_experts", None) is not None:
+            return "deepseek_vl2", model.language.model.layers
     if hasattr(model, "model") and hasattr(model.model, "language_model"):
         if getattr(config, "num_experts", 0) > 0:
             return "qwen3", model.model.language_model.layers
@@ -309,7 +312,7 @@ def apply_structural_pruning(
 
     for layer_idx, layer in enumerate(layers):
         pbar.update(1)
-        if model_layout == "kimi":
+        if model_layout in {"kimi", "deepseek_vl2"}:
             is_moe_layer = _is_kimi_moe_layer(layer_idx, config)
         elif model_layout == "qwen3":
             is_moe_layer = _is_qwen3_moe_layer(layer_idx, layer, config)
@@ -321,7 +324,7 @@ def apply_structural_pruning(
             continue
 
         layer_mask = masks[layer_idx]  # [E, I]
-        if model_layout == "kimi":
+        if model_layout in {"kimi", "deepseek_vl2"}:
             old_num_experts = len(layer.mlp.experts)
             if layer_mask.shape[0] != old_num_experts:
                 raise RuntimeError(

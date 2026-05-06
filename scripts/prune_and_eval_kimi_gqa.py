@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
@@ -19,6 +20,7 @@ from src.base.load_dataset import load_eval_task
 from src.base.models import auto_load_model
 from src.generate_mask import generate_masks as build_masks_pipeline
 from src.prune import apply_structural_pruning
+from tasks.video_mmmu import process_media as process_video_media
 
 
 def _normalize_answer(s) -> str:
@@ -27,8 +29,23 @@ def _normalize_answer(s) -> str:
     return str(s).strip().lower()
 
 
-def move_to_device(inputs: dict, device) -> dict:
-    return {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
+def move_to_device(inputs: dict, device, dtype=None) -> dict:
+    moved = {}
+    for key, value in inputs.items():
+        if not hasattr(value, "to"):
+            moved[key] = value
+            continue
+        if key in {"attention_mask", "images_seq_mask"}:
+            moved[key] = value.to(device=device, dtype=torch.bool)
+        elif (
+            key in {"images", "pixel_values"}
+            and dtype is not None
+            and torch.is_floating_point(value)
+        ):
+            moved[key] = value.to(device=device, dtype=dtype)
+        else:
+            moved[key] = value.to(device)
+    return moved
 
 
 def _get_batch_rows(pool, start: int, batch_size: int):
@@ -84,15 +101,14 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _build_messages_batch(questions, media_type):
+def _build_messages_batch(questions, media_type, frame_counts=None):
     """Build chat messages for a batch of questions."""
     messages = []
-    for q in questions:
+    for idx, q in enumerate(questions):
         if media_type == "video":
-            content = [
-                {"type": "video", "video": "placeholder"},
-                {"type": "text", "text": q},
-            ]
+            frame_count = 1 if frame_counts is None else max(1, int(frame_counts[idx]))
+            content = [{"type": "image", "image": "placeholder"} for _ in range(frame_count)]
+            content.append({"type": "text", "text": q})
         else:
             content = [
                 {"type": "image", "image": "placeholder"},
@@ -100,6 +116,117 @@ def _build_messages_batch(questions, media_type):
             ]
         messages.append([{"role": "user", "content": content}])
     return messages
+
+
+def _resolve_text_config(model):
+    config = getattr(model, "config", None)
+    for candidate in (
+        getattr(config, "text_config", None),
+        getattr(config, "language_config", None),
+        getattr(getattr(model, "language", None), "config", None),
+        config,
+    ):
+        if candidate is not None:
+            return candidate
+    raise AttributeError(f"Cannot resolve text/language config for model type {type(model).__name__}.")
+
+
+def _build_deepseek_conversations(questions, media_type, frame_counts=None):
+    conversations = []
+    for idx, q in enumerate(questions):
+        if media_type == "video":
+            frame_count = 1 if frame_counts is None else max(1, int(frame_counts[idx]))
+            media_prefix = "<image>\n" * frame_count
+        else:
+            media_prefix = "<image>\n"
+        conversations.append(
+            [
+                {"role": "user", "content": f"{media_prefix}{q}".strip()},
+                {"role": "assistant", "content": ""},
+            ]
+        )
+    return conversations
+
+
+def _prepare_batch_inputs(processor, *, questions, visuals, media_type, frame_counts=None):
+    if hasattr(processor, "apply_chat_template"):
+        messages_batch = _build_messages_batch(questions, media_type, frame_counts)
+        texts = processor.apply_chat_template(
+            messages_batch,
+            add_generation_prompt=True,
+            return_tensors="pt",
+        )
+        if media_type == "video":
+            return processor(
+                text=texts,
+                images=visuals,
+                return_tensors="pt",
+                padding=True,
+                padding_side="left",
+                truncation=True,
+            )
+        return processor(
+            images=visuals,
+            text=texts,
+            return_tensors="pt",
+            padding=True,
+            padding_side="left",
+            truncation=True,
+        )
+
+    if hasattr(processor, "process_one") and hasattr(processor, "batchify"):
+        conversations_batch = _build_deepseek_conversations(questions, media_type, frame_counts)
+        sample_prepares = []
+        if media_type == "video":
+            cursor = 0
+            for conversation, frame_count in zip(conversations_batch, frame_counts):
+                sample_images = visuals[cursor: cursor + frame_count]
+                cursor += frame_count
+                sample_prepares.append(
+                    processor(
+                        conversations=conversation,
+                        images=sample_images or None,
+                        force_batchify=False,
+                    )
+                )
+        else:
+            for conversation, image in zip(conversations_batch, visuals):
+                sample_prepares.append(
+                    processor(
+                        conversations=conversation,
+                        images=[image] if image is not None else None,
+                        force_batchify=False,
+                    )
+                )
+        batched = processor.batchify(sample_prepares)
+        return {
+            "input_ids": batched.input_ids,
+            "attention_mask": batched.attention_mask,
+            "images": batched.images,
+            "images_seq_mask": batched.images_seq_mask,
+            "images_spatial_crop": batched.images_spatial_crop,
+        }
+
+    raise TypeError(f"Unsupported processor type: {type(processor).__name__}")
+
+
+def _prepare_video_visual(visual):
+    """Match eval/kimi.py behavior: flatten videos into sampled frames."""
+    if isinstance(visual, tuple):
+        frames, num_frames = visual
+        return list(frames), int(num_frames)
+
+    if isinstance(visual, list):
+        if len(visual) == 1 and isinstance(visual[0], (str, Path)):
+            frames, num_frames = process_video_media(visual[0])
+            return list(frames), int(num_frames)
+        return list(visual), len(visual)
+
+    if isinstance(visual, (str, Path)):
+        frames, num_frames = process_video_media(visual)
+        return list(frames), int(num_frames)
+
+    return [visual], 1
 
 
 def _build_generation_kwargs(args):
@@ -178,7 +305,7 @@ def main() -> None:
     print(f"[Run] Loading model from: {args.model_path}")
     model, processor = auto_load_model(args.model_path)
     model.eval()
-    text_config = model.config.text_config
+    text_config = _resolve_text_config(model)
     apply_structural_pruning(model, masks, text_config)
     print("[Run] Applied structural pruning in memory; no checkpoint will be saved.")
 
@@ -203,13 +330,15 @@ def main() -> None:
         for i in tqdm(range(0, total, args.batch_size), desc=f"Prune+Eval {args.task}", unit="batch"):
             batch_rows = _get_batch_rows(pool, i, args.batch_size)
             visuals = []
+            frame_counts = []
             questions = []
             gt_answers = []
             for row in batch_rows:
                 visual = task.doc_to_visual(row)
-                if isinstance(visual, tuple):
-                    # video_mmmu returns (frames_list, num_frames)
-                    visuals.append(visual[0] if task.media_type == "video" else visual[0])
+                if task.media_type == "video":
+                    frames, num_frames = _prepare_video_visual(visual)
+                    visuals.extend(frames)
+                    frame_counts.append(num_frames)
                 elif isinstance(visual, list):
                     visuals.append(visual[0])
                 else:
@@ -217,33 +346,15 @@ def main() -> None:
                 questions.append(task.doc_to_text(row))
                 gt_answers.append(task.doc_to_answer(row))
 
-            messages_batch = _build_messages_batch(questions, task.media_type)
-            texts = processor.apply_chat_template(
-                messages_batch,
-                add_generation_prompt=True,
-                return_tensors="pt",
+            inputs = _prepare_batch_inputs(
+                processor,
+                questions=questions,
+                visuals=visuals,
+                media_type=task.media_type,
+                frame_counts=frame_counts,
             )
 
-            if task.media_type == "video":
-                inputs = processor(
-                    videos=visuals,
-                    text=texts,
-                    return_tensors="pt",
-                    padding=True,
-                    padding_side="left",
-                    truncation=True,
-                )
-            else:
-                inputs = processor(
-                    images=visuals,
-                    text=texts,
-                    return_tensors="pt",
-                    padding=True,
-                    padding_side="left",
-                    truncation=True,
-                )
-
-            inputs = move_to_device(inputs, device)
+            inputs = move_to_device(inputs, device, dtype=next(model.parameters()).dtype)
             input_len = inputs["input_ids"].shape[1]
             outputs = model.generate(
                 **inputs,

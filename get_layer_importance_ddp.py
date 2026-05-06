@@ -6,6 +6,7 @@ import os
 from loguru import logger
 from accelerate import Accelerator
 from torch.utils.data import DataLoader, Subset
+from tqdm.auto import tqdm
 from src.base.models.kimi import load_model as load_kimi_model
 from src.base.models.qwen3 import load_model as load_qwen_model
 from src.integrations import (
@@ -54,12 +55,34 @@ def get_layer_importance(
     language_model = model_config["get_lm"](unwrapped_model)
     num_hidden_layers = language_model.config.num_hidden_layers
     is_moe_layer = model_config["is_moe_layer"]
+    moe_layers = [idx for idx in range(num_hidden_layers) if is_moe_layer(language_model.config, idx)]
     local_layer_loss_dict = {}
     local_total_token_count = 0
+    total_batches = len(dataloader)
 
-    for batch_idx, batch in enumerate(dataloader):
+    if accelerator.is_main_process:
+        per_batch_forwards = 1 + len(moe_layers) * len(modalities)
+        logger.info(
+            "Layer-importance calibration: "
+            f"batches={total_batches}, moe_layers={len(moe_layers)}, "
+            f"modalities={len(modalities)}, forwards_per_batch={per_batch_forwards}, "
+            f"estimated_total_forwards={total_batches * per_batch_forwards}"
+        )
+        batch_iterator = tqdm(
+            dataloader,
+            total=total_batches,
+            desc="MoDES layer importance",
+            unit="batch",
+            dynamic_ncols=True,
+        )
+    else:
+        batch_iterator = dataloader
+
+    for batch_idx, batch in enumerate(batch_iterator):
         if accelerator.is_main_process:
-            logger.info(f"Processing batch {batch_idx + 1}/{len(dataloader)}...")
+            batch_iterator.set_postfix_str(
+                f"batch={batch_idx + 1}/{total_batches}, forwards={1 + len(moe_layers) * len(modalities)}"
+            )
         # sync all processes
         accelerator.wait_for_everyone()
         batched_messages = [
@@ -113,41 +136,40 @@ def get_layer_importance(
         #     org_logits, topk_logits, dim=-1, sorted=False
         # )
         local_total_token_count += answer_masks.sum().item()
-        for layer_idx in range(num_hidden_layers):
-            if is_moe_layer(language_model.config, layer_idx):
-                modality_loss_dict = {}
-                for modality in modalities:
-                    output = model(
-                        **inputs,
-                        use_cache=False,
-                        return_dict=True,
-                        moe_layer_skip=layer_idx,
-                        skip_modality=modality,
-                    )
-                    logits = output.logits[answer_masks, :].contiguous()
-                    # logits = logits.gather(dim=-1, index=org_indices)
-                    if loss_type == "kl":
-                        loss = F.relu(
-                            F.kl_div(
-                                F.log_softmax(logits / temperature, dim=1),
-                                F.softmax(org_logits / temperature, dim=1),
-                                reduction="sum",
-                            )
+        for layer_idx in moe_layers:
+            modality_loss_dict = {}
+            for modality in modalities:
+                output = model(
+                    **inputs,
+                    use_cache=False,
+                    return_dict=True,
+                    moe_layer_skip=layer_idx,
+                    skip_modality=modality,
+                )
+                logits = output.logits[answer_masks, :].contiguous()
+                # logits = logits.gather(dim=-1, index=org_indices)
+                if loss_type == "kl":
+                    loss = F.relu(
+                        F.kl_div(
+                            F.log_softmax(logits / temperature, dim=1),
+                            F.softmax(org_logits / temperature, dim=1),
+                            reduction="sum",
                         )
-                    elif loss_type == "mse":
-                        loss = F.mse_loss(logits, org_logits, reduction="sum")
-                        # if accelerator.is_main_process:
-                        #     logger.info(
-                        #         f"Layer {layer_idx} {modality} MSE Loss: {loss.item()}"
-                        #     )
-                    modality_loss_dict[modality] = loss.item()
-                if layer_idx not in local_layer_loss_dict:
-                    local_layer_loss_dict[layer_idx] = modality_loss_dict
-                else:
-                    for modality in modalities:
-                        local_layer_loss_dict[layer_idx][
-                            modality
-                        ] += modality_loss_dict[modality]
+                    )
+                elif loss_type == "mse":
+                    loss = F.mse_loss(logits, org_logits, reduction="sum")
+                    # if accelerator.is_main_process:
+                    #     logger.info(
+                    #         f"Layer {layer_idx} {modality} MSE Loss: {loss.item()}"
+                    #     )
+                modality_loss_dict[modality] = loss.item()
+            if layer_idx not in local_layer_loss_dict:
+                local_layer_loss_dict[layer_idx] = modality_loss_dict
+            else:
+                for modality in modalities:
+                    local_layer_loss_dict[layer_idx][
+                        modality
+                    ] += modality_loss_dict[modality]
     # --- End of per-batch processing ---
     # NEW: Aggregation step
     accelerator.wait_for_everyone()

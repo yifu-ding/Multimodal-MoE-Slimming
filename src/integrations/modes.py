@@ -114,6 +114,7 @@ def apply_optional_structural_pruning(model, kwargs, log_prefix: str) -> None:
     expertwise_budget_normalize = bool(int(kwargs.get("expertwise_budget_normalize", 0)))
     smooth_fn = kwargs.get("smooth_fn", "sqrt")
     ema_source_key = kwargs.get("ema_source_key", "ema_matrix")
+    layerwise_loss_key = kwargs.get("layerwise_loss_key", "layerwise_second_order_sum")
     align_inter = int(kwargs.get("align_inter", 0))
     min_per_expert = int(kwargs.get("min_per_expert", 0))
     thresholds_path = kwargs.get("thresholds_path", None)
@@ -131,6 +132,7 @@ def apply_optional_structural_pruning(model, kwargs, log_prefix: str) -> None:
                 "inter_layer_method": inter_method,
                 "intra_layer_method": intra_method,
                 "intra_expert_metric": intra_expert_metric,
+                "layerwise_loss_key": layerwise_loss_key,
             },
             "adjust_masks_kwargs": {
                 "align_inter": align_inter,
