@@ -1,5 +1,10 @@
 import torch
 from loguru import logger
+from src.integrations import (
+    configure_fastmmoe_internvl_runtime,
+    fastmmoe_enabled,
+    prepare_fastmmoe_vendor_imports,
+)
 
 try:
     from transformers import AutoProcessor, InternVLForConditionalGeneration
@@ -9,6 +14,14 @@ except Exception:
     InternVLForConditionalGeneration = None
 
 
+def _set_default_generation_pad_token(model, processor) -> None:
+    tokenizer = getattr(processor, "tokenizer", None)
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is None or not hasattr(model, "generation_config"):
+        return
+    model.generation_config.pad_token_id = eos_token_id
+
+
 def load_model(
     model_path: str,
     attn_implementation: str = "flash_attention_2",
@@ -16,6 +29,29 @@ def load_model(
     torch_dtype: torch.dtype = torch.bfloat16,
     device_map: str = "auto",
 ):
+    if fastmmoe_enabled():
+        prepare_fastmmoe_vendor_imports("internvl")
+        from vlmeval.vlm.internvl import InternVLChatModel
+
+        if AutoProcessor is None:
+            raise ImportError("InternVL FastMMoE loading requires transformers AutoProcessor.")
+        model = InternVLChatModel.from_pretrained(
+            model_path,
+            torch_dtype=torch_dtype,
+            trust_remote_code=trust_remote_code,
+            low_cpu_mem_usage=True,
+            device_map=device_map,
+        )
+        processor = AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=trust_remote_code,
+        )
+        model.eval()
+        _set_default_generation_pad_token(model, processor)
+        configure_fastmmoe_internvl_runtime(model, processor)
+        logger.info("[FastMMoE] Loaded InternVL vendor model")
+        return model, processor
+
     if InternVLForConditionalGeneration is None or AutoProcessor is None:
         try:
             import transformers
@@ -41,6 +77,7 @@ def load_model(
         trust_remote_code=trust_remote_code,
     )
     model.eval()
+    _set_default_generation_pad_token(model, processor)
     model.model.special_token_id_tensor = torch.tensor(
         processor.tokenizer.all_special_ids
     )

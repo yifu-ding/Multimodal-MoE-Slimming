@@ -386,7 +386,7 @@ def apply_structural_pruning(
 
         if model_layout == "qwen3":
             experts = layer.mlp.experts
-            old_num_experts = int(experts.num_experts)
+            old_num_experts = int(getattr(experts, "num_experts", len(experts)))
             if layer_mask.shape[0] != old_num_experts:
                 raise RuntimeError(
                     f"Layer {layer_idx}: mask expert dim={int(layer_mask.shape[0])} "
@@ -395,35 +395,70 @@ def apply_structural_pruning(
 
             new_experts = []
             layer_active_expert = torch.zeros(old_num_experts, dtype=torch.bool)
-            for eid in range(old_num_experts):
-                m_inter = layer_mask[eid].to(device=experts.gate_up_proj.device, dtype=torch.bool)
-                I_old = int(experts.down_proj.shape[1])
-                H = int(experts.gate_up_proj.shape[1])
-                I_prime = int(m_inter.sum().item())
-                if I_prime == 0:
-                    params_removed += int(I_old * H * 3)
-                    continue
+            if hasattr(experts, "gate_up_proj") and hasattr(experts, "down_proj"):
+                for eid in range(old_num_experts):
+                    m_inter = layer_mask[eid].to(device=experts.gate_up_proj.device, dtype=torch.bool)
+                    I_old = int(experts.down_proj.shape[1])
+                    H = int(experts.gate_up_proj.shape[1])
+                    I_prime = int(m_inter.sum().item())
+                    if I_prime == 0:
+                        params_removed += int(I_old * H * 3)
+                        continue
 
-                layer_active_expert[eid] = True
-                keep_idx = torch.nonzero(m_inter, as_tuple=False).view(-1)
-                gate_up_w = experts.gate_up_proj.data[eid]
-                down_w = experts.down_proj.data[eid][m_inter, :]
+                    layer_active_expert[eid] = True
+                    keep_idx = torch.nonzero(m_inter, as_tuple=False).view(-1)
+                    gate_up_w = experts.gate_up_proj.data[eid]
+                    down_w = experts.down_proj.data[eid][m_inter, :]
 
-                gate_w = gate_up_w[:, keep_idx].transpose(0, 1).contiguous()
-                up_w = gate_up_w[:, keep_idx + I_old].transpose(0, 1).contiguous()
-                down_w = down_w.transpose(0, 1).contiguous()
+                    gate_w = gate_up_w[:, keep_idx].transpose(0, 1).contiguous()
+                    up_w = gate_up_w[:, keep_idx + I_old].transpose(0, 1).contiguous()
+                    down_w = down_w.transpose(0, 1).contiguous()
 
-                params_removed += int((I_old - I_prime) * H * 3)
-                params_kept += int(I_prime * H * 3)
+                    params_removed += int((I_old - I_prime) * H * 3)
+                    params_kept += int(I_prime * H * 3)
 
-                new_experts.append(
-                    PrunedQwen3Expert(
-                        gate_proj=_make_linear(gate_w, None, H, I_prime),
-                        up_proj=_make_linear(up_w, None, H, I_prime),
-                        down_proj=_make_linear(down_w, None, I_prime, H),
-                        act_fn=experts.act_fn,
+                    new_experts.append(
+                        PrunedQwen3Expert(
+                            gate_proj=_make_linear(gate_w, None, H, I_prime),
+                            up_proj=_make_linear(up_w, None, H, I_prime),
+                            down_proj=_make_linear(down_w, None, I_prime, H),
+                            act_fn=experts.act_fn,
+                        )
                     )
-                )
+            else:
+                for eid, expert in enumerate(experts):
+                    m_inter = layer_mask[eid].to(
+                        device=expert.gate_proj.weight.device, dtype=torch.bool
+                    )
+                    I_prime = int(m_inter.sum().item())
+                    if I_prime == 0:
+                        layer_active_expert[eid] = False
+                        I_old = expert.gate_proj.out_features
+                        H = expert.gate_proj.in_features
+                        params_removed += int(I_old * H * 3)
+                        continue
+
+                    layer_active_expert[eid] = True
+                    dtype = expert.gate_proj.weight.dtype
+                    device = expert.gate_proj.weight.device
+                    H = expert.gate_proj.in_features
+                    I_old = expert.gate_proj.out_features
+
+                    gate_w = expert.gate_proj.weight.data[m_inter, :]
+                    up_w = expert.up_proj.weight.data[m_inter, :]
+                    down_w = expert.down_proj.weight.data[:, m_inter]
+
+                    params_removed += int((I_old - I_prime) * H * 3)
+                    params_kept += int(I_prime * H * 3)
+
+                    new_experts.append(
+                        PrunedQwen3Expert(
+                            gate_proj=_make_linear(gate_w.contiguous(), None, H, I_prime),
+                            up_proj=_make_linear(up_w.contiguous(), None, H, I_prime),
+                            down_proj=_make_linear(down_w.contiguous(), None, I_prime, H),
+                            act_fn=expert.act_fn,
+                        )
+                    )
 
             n_active = int(layer_active_expert.sum().item())
             if n_active == 0:

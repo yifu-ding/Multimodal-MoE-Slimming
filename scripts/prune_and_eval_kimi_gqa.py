@@ -48,6 +48,13 @@ def move_to_device(inputs: dict, device, dtype=None) -> dict:
     return moved
 
 
+def _resolve_text_config(model):
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        raise AttributeError(f"Model {type(model)} has no config")
+    return getattr(cfg, "text_config", getattr(cfg, "llm_config", cfg))
+
+
 def _get_batch_rows(pool, start: int, batch_size: int):
     end = min(start + batch_size, len(pool))
     return [pool[idx] for idx in range(start, end)]

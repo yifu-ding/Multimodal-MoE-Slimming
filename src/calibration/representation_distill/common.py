@@ -77,8 +77,13 @@ def get_final_norm(bundle):
         return bundle.model.language_model.model.norm
     if bundle.family == "deepseek_vl":
         return bundle.model.language.model.norm
+    if bundle.family == "internvl":
+        if hasattr(bundle.model, "model") and hasattr(bundle.model.model, "language_model"):
+            return bundle.model.model.language_model.norm
+        if hasattr(bundle.model, "language_model"):
+            return bundle.model.language_model.norm
     raise NotImplementedError(
-        f"`forward_from_hidden` currently supports qwen3/kimi/deepseek_vl only, got family={bundle.family}."
+        f"`forward_from_hidden` currently supports qwen3/kimi/deepseek_vl/internvl only, got family={bundle.family}."
     )
 
 
@@ -745,7 +750,15 @@ def extract_block_output(
             )
 
     def _capture_input(module, args, kwargs):
-        hidden = unwrap_output(args[0]).detach()
+        hidden_source = kwargs.get("hidden_states")
+        if hidden_source is None:
+            if not args:
+                raise RuntimeError(
+                    "Failed to capture block input: decoder layer received neither "
+                    "positional args nor a 'hidden_states' kwarg."
+                )
+            hidden_source = args[0]
+        hidden = unwrap_output(hidden_source).detach()
         state["hidden"] = hidden
 
     def _capture_output(module, args, kwargs, output):

@@ -325,7 +325,8 @@ def loop_1_score_collector(
             # if isinstance(gateup_act, torch.Tensor) and float(gateup_act.abs().sum().item()) > 0:
             #     debug_gateup_hits += 1
             for key in ("usage", "router", "first_attr"):
-                metrics[key+"_fillzero"] = float(metrics[key])
+                if key in metrics:
+                    metrics[key+"_fillzero"] = float(metrics[key])
             if is_fused:
                 for key, value in metrics.items():
                     stacked_value = value if isinstance(value, torch.Tensor) else torch.tensor(float(value), dtype=torch.float32, device=experts.gate_up_proj.device)

@@ -6,4 +6,9 @@ from .modes import (
     load_modes_dataset,
     resolve_model_family_from_path,
 )
-
+from .fastmmoe import (
+    configure_fastmmoe_internvl_runtime,
+    fastmmoe_enabled,
+    fastmmoe_strategy,
+    prepare_fastmmoe_vendor_imports,
+)

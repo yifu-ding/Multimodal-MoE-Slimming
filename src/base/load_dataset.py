@@ -1,5 +1,6 @@
 """Unified dataset loading and evaluation for prune-and-eval tasks."""
 
+import csv
 import json
 import os
 import random
@@ -142,6 +143,38 @@ def _find_existing_media_path(candidates: List[str]) -> Optional[str]:
     return None
 
 
+def _parse_json_list(raw_value: Any) -> List[Any]:
+    if isinstance(raw_value, list):
+        return raw_value
+    if raw_value is None:
+        return []
+    text = str(raw_value).strip()
+    if not text:
+        return []
+    return json.loads(text)
+
+
+def _strip_option_prefix(option: str) -> str:
+    return re.sub(r"^\s*[A-Z][\.\):]\s*", "", option).strip()
+
+
+def _option_letter_from_answer(answer: str, options: List[str]) -> str:
+    answer = answer.strip()
+    if len(answer) == 1 and answer.isalpha():
+        return answer.upper()
+
+    normalized_answer = _normalize_answer(answer)
+    for idx, option in enumerate(options):
+        if _normalize_answer(option) == normalized_answer:
+            return chr(ord("A") + idx)
+    return answer
+
+
+def _load_tsv_rows(tsv_path: str) -> List[dict]:
+    with open(tsv_path, newline="") as f:
+        return list(csv.DictReader(f, delimiter="\t"))
+
+
 def _resolve_egoschema_video_path(video_idx: str) -> str:
     dataset_root = os.path.join(_hf_home(), "datasets", "egoschema")
     extracted = _find_existing_media_path(
@@ -163,6 +196,17 @@ def _resolve_egoschema_video_path(video_idx: str) -> str:
 
 
 def _resolve_videomme_video_path(video_id: str) -> str:
+    alt_root = os.path.join(_hf_home(), "datasets", "Video-MME_8frame")
+    extracted = _find_existing_media_path(
+        [
+            os.path.join(alt_root, "video", f"{video_id}.mp4"),
+            os.path.join(alt_root, "video", f"{video_id}.MP4"),
+            os.path.join(alt_root, "video", f"{video_id}.mkv"),
+        ]
+    )
+    if extracted:
+        return extracted
+
     dataset_root = os.path.join(_hf_home(), "datasets", "Video-MME")
     extracted = _find_existing_media_path(
         [
@@ -186,8 +230,18 @@ def _resolve_videomme_video_path(video_id: str) -> str:
 def _resolve_mvbench_video_path(sub_task: str, video_name: str) -> str:
     from lmms_eval.tasks.mvbench.utils import DATA_LIST
 
-    dataset_root = os.path.join(_hf_home(), "datasets", "MVBench")
+    alt_root = os.path.join(_hf_home(), "datasets", "MVBench_8frame")
     dataset_folder = DATA_LIST[sub_task]
+    extracted = _find_existing_media_path(
+        [
+            os.path.join(alt_root, "video", dataset_folder, video_name),
+            os.path.join(alt_root, "video", "data0613", dataset_folder, video_name),
+        ]
+    )
+    if extracted:
+        return extracted
+
+    dataset_root = os.path.join(_hf_home(), "datasets", "MVBench")
     candidates = [
         os.path.join(dataset_root, "video", dataset_folder, video_name),
         os.path.join(dataset_root, "video", "data0613", dataset_folder, video_name),
@@ -665,13 +719,19 @@ def _build_mvbench_helpers() -> TaskHelpers:
     from lmms_eval.tasks.mvbench.utils import mcq_acc, mvbench_doc_to_text
 
     def doc_to_visual(doc):
+        if doc.get("local_video_path") and os.path.exists(doc["local_video_path"]):
+            return [doc["local_video_path"]]
         return [_resolve_mvbench_video_path(doc["sub_task"], doc["video"])]
 
     def doc_to_text(doc):
-        return mvbench_doc_to_text(doc, lmms_eval_specific_kwargs={
-            "sub_task": doc["sub_task"],
-            "post_prompt": "\nAnswer with the option's letter from the given choices directly.",
-        })
+        options = "\n".join(
+            f"({chr(ord('A') + idx)}) {candidate}" for idx, candidate in enumerate(doc["candidates"])
+        )
+        return (
+            f"Question:{doc['question']}\n"
+            f"Option:\n{options}\n"
+            "Answer with the option's letter from the given choices directly."
+        )
 
     def doc_to_answer(doc):
         return doc["answer"]
@@ -710,6 +770,29 @@ def _build_mvbench_helpers() -> TaskHelpers:
     )
 
 def _load_mvbench_rows() -> List[dict]:
+    local_tsv = os.path.join(_hf_home(), "datasets", "MVBench_8frame", "MVBench_8frame.tsv")
+    if os.path.exists(local_tsv):
+        rows: List[dict] = []
+        for row in _load_tsv_rows(local_tsv):
+            candidates = [_strip_option_prefix(option) for option in _parse_json_list(row["candidates"])]
+            answer = _option_letter_from_answer(row["answer"], candidates)
+            rows.append(
+                {
+                    **row,
+                    "candidates": candidates,
+                    "answer": answer,
+                    "local_video_path": os.path.join(
+                        _hf_home(),
+                        "datasets",
+                        "MVBench_8frame",
+                        "video",
+                        row["sub_task"],
+                        row["video"],
+                    ),
+                }
+            )
+        return rows
+
     mvbench_json_root = os.path.join(_hf_home(), "datasets", "MVBench", "json")
     if os.path.isdir(mvbench_json_root):
         rows: List[dict] = []
@@ -896,6 +979,8 @@ def _build_videomme_helpers() -> TaskHelpers:
     )
 
     def doc_to_visual(doc):
+        if doc.get("local_video_path") and os.path.exists(doc["local_video_path"]):
+            return [doc["local_video_path"]]
         return [_resolve_videomme_video_path(doc["videoID"])]
 
     def doc_to_text(doc):
@@ -933,6 +1018,33 @@ def _build_videomme_helpers() -> TaskHelpers:
     )
 
 def _load_videomme_rows() -> List[dict]:
+    local_tsv = os.path.join(_hf_home(), "datasets", "Video-MME_8frame", "Video-MME_8frame.tsv")
+    if os.path.exists(local_tsv):
+        rows: List[dict] = []
+        for row in _load_tsv_rows(local_tsv):
+            options = [_strip_option_prefix(option) for option in _parse_json_list(row["candidates"])]
+            rows.append(
+                {
+                    "videoID": row["video"],
+                    "question": row["question"],
+                    "options": options,
+                    "answer": row["answer"].strip().upper(),
+                    "duration": row.get("duration", ""),
+                    "domain": row.get("domain", ""),
+                    "sub_category": row.get("sub_category", ""),
+                    "task_type": row.get("task_type", ""),
+                    "subtitle_path": row.get("subtitle_path", ""),
+                    "local_video_path": os.path.join(
+                        _hf_home(),
+                        "datasets",
+                        "Video-MME_8frame",
+                        "video",
+                        os.path.basename(row["video_path"]),
+                    ),
+                }
+            )
+        return rows
+
     local_arrow = os.path.join(
         _hf_home(),
         "datasets",

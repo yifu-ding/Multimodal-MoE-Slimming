@@ -21,13 +21,34 @@ resolve_storage_path() {
 }
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
+MODEL_NAME="${MODEL_NAME:-}"
+if [[ -n "${MODEL_NAME}" ]]; then
+    case "${MODEL_NAME}" in
+        kimi-vl-a3b|kimi-vl-a3b-instruct)
+            MODEL_PATH="moonshotai/Kimi-VL-A3B-Instruct"
+            ;;
+        qwen3-vl-30b-a3b|qwen3-vl-30b-a3b-instruct)
+            MODEL_PATH="Qwen/Qwen3-VL-30B-A3B-Instruct"
+            ;;
+        deepseek-vl2-small)
+            MODEL_PATH="deepseek-ai/deepseek-vl2-small"
+            ;;
+        internvl3_5-30b-a3b-hf)
+            MODEL_PATH="OpenGVLab/InternVL3_5-30B-A3B-HF"
+            ;;
+        *)
+            echo "Unsupported MODEL_NAME=${MODEL_NAME}" >&2
+            exit 1
+            ;;
+    esac
+fi
 HIDDEN_PAYLOAD_PATH="${HIDDEN_PAYLOAD_PATH:-}"
 HIDDEN_PAYLOAD_PATH="$(resolve_storage_path "${HIDDEN_PAYLOAD_PATH}")"
 OUTPUT_PATH="${OUTPUT_PATH:-${HIDDEN_PAYLOAD_PATH%.pt}-scores.pt}"
 OUTPUT_PATH="$(resolve_storage_path "${OUTPUT_PATH}")"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 EMA="${EMA:-0.9}"
-LOSS_FN="${LOSS_FN:-rel_l2}"
+LOSS_FN="${LOSS_FN:-l2}"
 ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
 DEVICE_MAP="${DEVICE_MAP:-cuda:0}"
 
