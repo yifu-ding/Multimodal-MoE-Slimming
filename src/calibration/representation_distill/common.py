@@ -750,7 +750,15 @@ def extract_block_output(
             )
 
     def _capture_input(module, args, kwargs):
-        hidden = unwrap_output(args[0]).detach()
+        hidden_source = kwargs.get("hidden_states")
+        if hidden_source is None:
+            if not args:
+                raise RuntimeError(
+                    "Failed to capture block input: decoder layer received neither "
+                    "positional args nor a 'hidden_states' kwarg."
+                )
+            hidden_source = args[0]
+        hidden = unwrap_output(hidden_source).detach()
         state["hidden"] = hidden
 
     def _capture_output(module, args, kwargs, output):
