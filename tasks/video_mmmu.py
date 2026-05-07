@@ -11,7 +11,24 @@ from tasks.dataset_paths import require_dataset_dir, resolve_dataset_dir
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
-HOME = resolve_dataset_dir("VideoMMMU")
+def _videommmu_home() -> str:
+    env_root = os.environ.get("VIDEO_MMMU_ROOT", "").strip()
+    candidates = []
+    if env_root:
+        candidates.append(env_root)
+    candidates.extend(
+        [
+            "/home/data2/dyf/VideoMMMU",
+            resolve_dataset_dir("VideoMMMU"),
+        ]
+    )
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return candidates[-1]
+
+
+HOME = _videommmu_home()
 ADAPTATION_IMAGE_BY_ID = None
 
 
@@ -182,13 +199,16 @@ def videommmu_doc_to_visual(doc):
     subject = "_".join(doc["id"].split("_")[1:-1])
 
     # Get the appropriate cache directory based on the subject
-    videommmu_cache_dir = os.path.join(HOME, get_cache_dir(subject))
+    videommmu_cache_roots = [
+        os.path.join(HOME, get_cache_dir(subject)),
+        os.path.join(HOME, "videos", get_cache_dir(subject)),
+    ]
 
     video_path = doc["id"] + ".mp4"
-    video_path = os.path.join(videommmu_cache_dir, video_path)
-
-    if os.path.exists(video_path):
-        return process_media(video_path)
+    for cache_root in videommmu_cache_roots:
+        video_path = os.path.join(cache_root, video_path)
+        if os.path.exists(video_path):
+            return process_media(video_path)
 
     frame = _image_payload_to_frame(doc.get("image"))
     if frame is None:

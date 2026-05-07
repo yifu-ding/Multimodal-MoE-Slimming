@@ -31,6 +31,7 @@ if REPO_ROOT not in sys.path:
 from tasks.coco import coco_transform
 from tasks.dataset_paths import require_dataset_dir
 from tasks.gqa import gqa_transform, load_gqa_instruction_rows, resolve_gqa_subdir
+from tasks.star import load_star_subset_rows, star_transform
 from utils import create_mask_after_last_token, create_mask_after_token
 
 
@@ -242,6 +243,8 @@ def normalize_dataset_name(dataset_name: str) -> str:
         "m4": "m4_instruct",
         "m4-instruct": "m4_instruct",
         "m4_instruct_data": "m4_instruct",
+        "star_train_subset_256": "star",
+        "star_train_subset": "star",
     }
     return aliases.get(normalized, normalized)
 
@@ -418,6 +421,9 @@ def build_dataset(dataset_name: str, model_family: str, **kwargs):
 
         max_rows = kwargs.get("max_rows", 1024)
         return TransformedListDataset(load_m4_instruct_rows(max_rows=max_rows), m4_instruct_transform)
+    if dataset_name == "star":
+        rows = [{"__raw_doc__": row} for row in load_star_subset_rows()]
+        return TransformedListDataset(rows, star_transform)
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
@@ -601,7 +607,7 @@ def prepare_inputs(
         if (
             bundle.family == "qwen3"
             and supports_vision
-            and normalized_dataset in ("video_mmmu", "m4_instruct")
+            and normalized_dataset in ("video_mmmu", "m4_instruct", "star")
         ):
             visuals = batch["model_input_visual"][i]
             if not isinstance(visuals, list):
@@ -633,7 +639,7 @@ def prepare_inputs(
             batched_messages[i] + batch["model_input_full_answer"][i]
         )
         batched_messages[i] = batched_messages[i] + bundle.model_config["eos_token"]
-        if normalized_dataset in ("video_mmmu", "m4_instruct"):
+        if normalized_dataset in ("video_mmmu", "m4_instruct", "star"):
             tmp.extend(batch["model_input_visual"][i])
             if bundle.family != "qwen3":
                 frame_num = batch["model_input_frames"][i]
@@ -646,7 +652,7 @@ def prepare_inputs(
                     * (frame_num - 1)
                     + batched_messages[i][media_end_idx:]
                 )
-    if supports_vision and normalized_dataset in ("video_mmmu", "m4_instruct"):
+    if supports_vision and normalized_dataset in ("video_mmmu", "m4_instruct", "star"):
         batch["model_input_visual"] = tmp
     if supports_vision:
         inputs = processor(

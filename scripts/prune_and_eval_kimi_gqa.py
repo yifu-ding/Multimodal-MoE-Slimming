@@ -5,6 +5,9 @@ import json
 import os
 import sys
 
+import imageio.v3 as iio
+import numpy as np
+
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 REPO_PARENT = os.path.dirname(REPO_ROOT)
@@ -15,6 +18,7 @@ for p in (REPO_PARENT, REPO_ROOT):
 import torch
 from tqdm.auto import tqdm
 
+from observations.common import infer_model_family
 from src.base.load_dataset import load_eval_task
 from src.base.models import auto_load_model
 from src.generate_mask import generate_masks as build_masks_pipeline
@@ -109,6 +113,88 @@ def _build_messages_batch(questions, media_type):
     return messages
 
 
+def _build_internvl_video_messages_batch(questions, frame_counts):
+    """Build InternVL chat messages for video tasks using frames as interleaved images."""
+    messages = []
+    for q, frame_count in zip(questions, frame_counts):
+        content = [{"type": "image", "image": "placeholder"} for _ in range(frame_count)]
+        content.append({"type": "text", "text": q})
+        messages.append([{"role": "user", "content": content}])
+    return messages
+
+
+def _resize_pil_frame(frame, max_long_side: int = 480):
+    width, height = frame.size
+    long_side = max(width, height)
+    if long_side <= max_long_side:
+        return frame.convert("RGB")
+    scale = max_long_side / long_side
+    new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    return frame.convert("RGB").resize(new_size)
+
+
+def _sample_frame_directory(frame_dir: str, max_frames: int = 8, max_long_side: int = 480):
+    from PIL import Image
+
+    frame_paths = sorted(
+        os.path.join(frame_dir, name)
+        for name in os.listdir(frame_dir)
+        if os.path.isfile(os.path.join(frame_dir, name))
+        and os.path.splitext(name)[1].lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    )
+    if not frame_paths:
+        raise RuntimeError(f"No image frames found in directory: {frame_dir}")
+
+    if len(frame_paths) > max_frames:
+        indices = np.linspace(0, len(frame_paths) - 1, max_frames, dtype=int).tolist()
+        frame_paths = [frame_paths[idx] for idx in indices]
+
+    frames = []
+    for frame_path in frame_paths:
+        with Image.open(frame_path) as frame:
+            frames.append(_resize_pil_frame(frame, max_long_side=max_long_side))
+    return frames
+
+
+def _sample_video_frames_fallback(video_path: str, max_frames: int = 8, max_long_side: int = 480):
+    from PIL import Image
+    from tasks.video_mmmu import process_media
+
+    if os.path.isdir(video_path):
+        return _sample_frame_directory(video_path, max_frames=max_frames, max_long_side=max_long_side)
+
+    try:
+        frames, _ = process_media(video_path, max_frames=max_frames, max_long_side=max_long_side)
+        if frames:
+            return frames
+    except Exception:
+        pass
+
+    decoded_frames = list(iio.imiter(video_path, plugin="pyav"))
+    if not decoded_frames:
+        raise RuntimeError(f"No frames decoded from video: {video_path}")
+
+    if len(decoded_frames) <= max_frames:
+        picked = decoded_frames
+    else:
+        indices = np.linspace(0, len(decoded_frames) - 1, max_frames, dtype=int).tolist()
+        picked = [decoded_frames[idx] for idx in indices]
+
+    return [_resize_pil_frame(Image.fromarray(frame_np), max_long_side=max_long_side) for frame_np in picked]
+
+
+def _coerce_internvl_video_visual(visual):
+    if isinstance(visual, tuple):
+        visual = visual[0]
+    if isinstance(visual, list):
+        if visual and isinstance(visual[0], str):
+            return _sample_video_frames_fallback(visual[0])
+        return list(visual)
+    if isinstance(visual, str):
+        return _sample_video_frames_fallback(visual)
+    return [visual]
+
+
 def _build_generation_kwargs(args):
     generation_kwargs = {}
     enable_tau_skip = bool(args.tau_skip_path)
@@ -132,6 +218,7 @@ def main() -> None:
     args = build_parser().parse_args()
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
+    model_family = infer_model_family(args.model_path)
 
     # ── Mask generation ──
     print(f"[Run] Loading scores from: {args.scores_path}")
@@ -201,20 +288,40 @@ def main() -> None:
         subset_seed=args.subset_seed,
     )
     total = len(pool)
-    print(f"[Run] Evaluating {total} samples (batch_size={args.batch_size}).")
+    effective_batch_size = args.batch_size
+    if model_family == "internvl" and task.media_type == "video":
+        effective_batch_size = 1
+        if args.batch_size != 1:
+            print(
+                "[Run] InternVL video evaluation uses frame-as-image inputs; "
+                "forcing batch_size=1 for processor compatibility."
+            )
+    print(f"[Run] Evaluating {total} samples (batch_size={effective_batch_size}).")
     generation_extra_kwargs = _build_generation_kwargs(args)
 
     # ── Eval loop ──
     predictions = []
+    skipped_missing_video = 0
     with torch.no_grad():
-        for i in tqdm(range(0, total, args.batch_size), desc=f"Prune+Eval {args.task}", unit="batch"):
-            batch_rows = _get_batch_rows(pool, i, args.batch_size)
+        for i in tqdm(range(0, total, effective_batch_size), desc=f"Prune+Eval {args.task}", unit="batch"):
+            batch_rows = _get_batch_rows(pool, i, effective_batch_size)
             visuals = []
             questions = []
             gt_answers = []
+            kept_rows = []
             for row in batch_rows:
-                visual = task.doc_to_visual(row)
-                if isinstance(visual, tuple):
+                try:
+                    visual = task.doc_to_visual(row)
+                except FileNotFoundError as exc:
+                    if args.task == "videomme":
+                        skipped_missing_video += 1
+                        video_id = row.get("videoID", "<unknown>")
+                        print(f"[Run] Skip videomme sample with missing video: {video_id} ({exc})")
+                        continue
+                    raise
+                if model_family == "internvl" and task.media_type == "video":
+                    visuals.append(_coerce_internvl_video_visual(visual))
+                elif isinstance(visual, tuple):
                     # video_mmmu returns (frames_list, num_frames)
                     visuals.append(visual[0] if task.media_type == "video" else visual[0])
                 elif isinstance(visual, list):
@@ -223,17 +330,27 @@ def main() -> None:
                     visuals.append(visual)
                 questions.append(task.doc_to_text(row))
                 gt_answers.append(task.doc_to_answer(row))
+                kept_rows.append(row)
 
-            messages_batch = _build_messages_batch(questions, task.media_type)
-            texts = processor.apply_chat_template(
-                messages_batch,
-                add_generation_prompt=True,
-                return_tensors="pt",
-            )
+            if not kept_rows:
+                continue
 
-            if task.media_type == "video":
+            if model_family == "internvl" and task.media_type == "video":
+                messages_batch = _build_internvl_video_messages_batch(
+                    questions,
+                    [len(frames) for frames in visuals],
+                )
+                texts = [
+                    processor.apply_chat_template(
+                        message,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                    for message in messages_batch
+                ]
+                flat_images = [frame for frames in visuals for frame in frames]
                 inputs = processor(
-                    videos=visuals,
+                    images=flat_images,
                     text=texts,
                     return_tensors="pt",
                     padding=True,
@@ -241,14 +358,33 @@ def main() -> None:
                     truncation=True,
                 )
             else:
-                inputs = processor(
-                    images=visuals,
-                    text=texts,
-                    return_tensors="pt",
-                    padding=True,
-                    padding_side="left",
-                    truncation=True,
-                )
+                messages_batch = _build_messages_batch(questions, task.media_type)
+                texts = [
+                    processor.apply_chat_template(
+                        message,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                    for message in messages_batch
+                ]
+                if task.media_type == "video":
+                    inputs = processor(
+                        videos=visuals,
+                        text=texts,
+                        return_tensors="pt",
+                        padding=True,
+                        padding_side="left",
+                        truncation=True,
+                    )
+                else:
+                    inputs = processor(
+                        images=visuals,
+                        text=texts,
+                        return_tensors="pt",
+                        padding=True,
+                        padding_side="left",
+                        truncation=True,
+                    )
 
             inputs = move_to_device(inputs, device)
             input_len = inputs["input_ids"].shape[1]
@@ -268,12 +404,12 @@ def main() -> None:
                     "correct": _normalize_answer(pred) == _normalize_answer(gt),
                 }
                 # Preserve question field if available
-                if "question" in batch_rows[j]:
-                    record["question"] = batch_rows[j]["question"]
+                if "question" in kept_rows[j]:
+                    record["question"] = kept_rows[j]["question"]
                 # Extra fields for task-specific eval (e.g. question_type for VideoMMMU)
                 for field in task.extra_fields:
-                    if field in batch_rows[j]:
-                        record[field] = batch_rows[j][field]
+                    if field in kept_rows[j]:
+                        record[field] = kept_rows[j][field]
                 predictions.append(record)
 
     # ── Evaluate with task-specific metric ──
@@ -282,12 +418,16 @@ def main() -> None:
     metric_value = eval_result["metric_value"]
     detail = eval_result.get("detail", "")
     print(f"\n[Run] {metric_name}: {metric_value:.4f}  ({detail})")
+    if skipped_missing_video:
+        print(f"[Run] Skipped {skipped_missing_video} videomme sample(s) with missing video files.")
 
     summary = {
         "model": args.model_path,
         "task": args.task,
         "dataset": args.task,
         "num_samples": total,
+        "num_evaluated": len(predictions),
+        "num_skipped_missing_video": skipped_missing_video,
         metric_name.lower(): round(metric_value, 6),
         "scores_path": args.scores_path,
         "prune_ratio": args.prune_ratio,

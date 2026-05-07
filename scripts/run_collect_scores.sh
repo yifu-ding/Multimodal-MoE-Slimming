@@ -32,11 +32,25 @@ export PYTHONPATH="${PREFIX}"
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 # MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-VL-30B-A3B-Instruct}"
-# MODEL_PATH="${MODEL_PATH:-OpenGVLab/InternVL3_5-GPT-OSS-20B-A4B-Preview-HF}"
 # deepseek-ai/deepseek-vl2-small
 
-DATASET="${DATASET:-gqa}"
-NUM_SAMPLES="${NUM_SAMPLES:-1024}"
+case "${MODEL_PATH,,}" in
+    kimi-vl-a3b|kimi-vl-a3b-instruct)
+        export MODEL_PATH="moonshotai/Kimi-VL-A3B-Instruct"
+        ;;
+    qwen3-vl-30b-a3b|qwen3-vl-30b-a3b-instruct)
+        export MODEL_PATH="Qwen/Qwen3-VL-30B-A3B-Instruct"
+        ;;
+    deepseek-vl2-small)
+        export MODEL_PATH="deepseek-ai/deepseek-vl2-small"
+        ;;
+    internvl3_5-30b-a3b-hf)
+        export MODEL_PATH="OpenGVLab/InternVL3_5-30B-A3B-HF"
+        ;;
+esac
+
+DATASET="${DATASET:-video_mmmu}"  # DATASET=gqa, coco, video_mmmu, m4_instruct, star
+NUM_SAMPLES="${NUM_SAMPLES:-128}"
 TOKEN_PER_SAMPLE="${TOKEN_PER_SAMPLE:-2048}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 START_IDX="${START_IDX:-0}"
@@ -70,8 +84,12 @@ case "${DATASET,,}" in
         DATASET="m4_instruct"
         DATASET_TAG="m4_instruct"
         ;;
+    star|star_train_subset|star_train_subset_256)
+        DATASET="star"
+        DATASET_TAG="star"
+        ;;
     *)
-        echo "Unsupported DATASET=${DATASET}. Supported values: gqa, coco, VMMMU (video_mmmu), m4 (m4_instruct)." >&2
+        echo "Unsupported DATASET=${DATASET}. Supported values: gqa, coco, VMMMU (video_mmmu), m4 (m4_instruct), star." >&2
         exit 1
         ;;
 esac
@@ -87,6 +105,9 @@ case "${MODEL_TAG}" in
         ;;
     deepseek-vl2-small)
         MODEL_TAG="deepseek-vl2-small"
+        ;;
+    internvl3_5-30b-a3b-hf)
+        MODEL_TAG="internvl3_5-30b-a3b"
         ;;
     internvl-3.5-gpt-oss-20b-a4b-preview-hf)
         MODEL_TAG="internvl-3.5-20b-a4b"

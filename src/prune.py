@@ -39,6 +39,18 @@ def _is_qwen3_moe_layer(layer_idx: int, layer: nn.Module, config) -> bool:
     )
 
 
+def _num_experts_of(experts: nn.Module) -> int:
+    num_experts = getattr(experts, "num_experts", None)
+    if num_experts is not None:
+        return int(num_experts)
+    try:
+        return int(len(experts))
+    except TypeError as exc:
+        raise TypeError(
+            f"Cannot infer number of experts from container type {type(experts).__name__}."
+        ) from exc
+
+
 def _shrink_kimi_router_for_active_experts(module: nn.Module, keep_mask: torch.Tensor) -> int:
     keep_mask = keep_mask.to(dtype=torch.bool)
     gate = module.gate
@@ -388,7 +400,7 @@ def apply_structural_pruning(
 
         if model_layout == "qwen3":
             experts = layer.mlp.experts
-            old_num_experts = int(getattr(experts, "num_experts", len(experts)))
+            old_num_experts = _num_experts_of(experts)
             if layer_mask.shape[0] != old_num_experts:
                 raise RuntimeError(
                     f"Layer {layer_idx}: mask expert dim={int(layer_mask.shape[0])} "

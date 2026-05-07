@@ -215,7 +215,7 @@ def _assert_cuda_runtime_compat(device_map: str) -> None:
 
 def run_collection(args) -> None:
     args.dataset = normalize_dataset_name(args.dataset)
-    supported_datasets = {"gqa", "coco", "video_mmmu", "m4_instruct"}
+    supported_datasets = {"gqa", "coco", "video_mmmu", "m4_instruct", "star"}
     if args.dataset not in supported_datasets:
         raise ValueError(
             f"Unsupported dataset: {args.dataset}. "

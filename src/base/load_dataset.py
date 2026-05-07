@@ -99,6 +99,105 @@ def _tmp_media_root() -> str:
     return root
 
 
+def _mvbench_roots() -> List[str]:
+    roots: List[str] = []
+    env_root = os.environ.get("MVBENCH_ROOT", "").strip()
+    if env_root:
+        roots.append(env_root)
+
+    roots.extend(
+        [
+            "/home/data2/dyf/MVBench",
+            os.path.join(_hf_home(), "datasets", "MVBench"),
+            os.path.join(
+                _hf_home(),
+                "hub",
+                "datasets--OpenGVLab--MVBench",
+                "snapshots",
+                "230a2d4fac8900333c61754641c7a13e069ac9c6",
+            ),
+        ]
+    )
+
+    deduped: List[str] = []
+    for root in roots:
+        if root and root not in deduped:
+            deduped.append(root)
+    return deduped
+
+
+def _videomme_roots() -> List[str]:
+    roots: List[str] = []
+    env_root = os.environ.get("VIDEO_MME_ROOT", "").strip()
+    if env_root:
+        roots.append(env_root)
+
+    roots.extend(
+        [
+            "/home/data2/dyf/Video-MME",
+            os.path.join(_hf_home(), "datasets", "Video-MME_8frame"),
+            os.path.join(_hf_home(), "datasets", "Video-MME"),
+        ]
+    )
+
+    deduped: List[str] = []
+    for root in roots:
+        if root and root not in deduped:
+            deduped.append(root)
+    return deduped
+
+
+def _videomme_archive_roots() -> List[str]:
+    roots = []
+
+    env_root = os.environ.get("VIDEO_MME_ROOT", "").strip()
+    if env_root:
+        roots.append(env_root)
+
+    roots.append(os.path.join(_hf_home(), "datasets", "Video-MME"))
+
+    snapshot_root = os.path.join(
+        _hf_home(),
+        "hub",
+        "datasets--lmms-lab--Video-MME",
+        "snapshots",
+    )
+    if os.path.isdir(snapshot_root):
+        for child in sorted(Path(snapshot_root).iterdir()):
+            if child.is_dir():
+                roots.append(str(child))
+
+    deduped: List[str] = []
+    for root in roots:
+        if root and root not in deduped:
+            deduped.append(root)
+    return deduped
+
+
+_MVBENCH_DATA_FOLDERS = {
+    "object_interaction": ["star/Charades_segment", "star/Charades_v1_480", "data0613/star/Charades_v1_480"],
+    "action_sequence": ["star/Charades_segment", "star/Charades_v1_480", "data0613/star/Charades_v1_480"],
+    "action_prediction": ["star/Charades_segment", "star/Charades_v1_480", "data0613/star/Charades_v1_480"],
+    "action_localization": ["sta/sta_video_segment", "sta/sta_video"],
+    "moving_count": ["clevrer/video_validation"],
+    "fine_grained_pose": ["nturgbd_convert"],
+    "character_order": ["perception/videos"],
+    "object_shuffle": ["perception/videos"],
+    "egocentric_navigation": ["vlnqa"],
+    "moving_direction": ["clevrer/video_validation"],
+    "episodic_reasoning": ["tvqa/video_fps3_hq_segment", "tvqa/frames_fps3_hq"],
+    "fine_grained_action": ["Moments_in_Time_Raw/videos", "Moments_in_Time_Raw/videos/validation"],
+    "scene_transition": ["scene_qa/video"],
+    "state_change": ["perception/videos"],
+    "moving_attribute": ["clevrer/video_validation"],
+    "action_antonym": ["ssv2_video_mp4", "ssv2_video"],
+    "unexpected_action": ["FunQA_test/test"],
+    "counterfactual_inference": ["clevrer/video_validation"],
+    "object_existence": ["clevrer/video_validation"],
+    "action_count": ["perception/videos"],
+}
+
+
 def _load_dataset_from_parquet(parquet_path: str):
     from datasets import Dataset
 
@@ -196,70 +295,78 @@ def _resolve_egoschema_video_path(video_idx: str) -> str:
 
 
 def _resolve_videomme_video_path(video_id: str) -> str:
-    alt_root = os.path.join(_hf_home(), "datasets", "Video-MME_8frame")
-    extracted = _find_existing_media_path(
-        [
-            os.path.join(alt_root, "video", f"{video_id}.mp4"),
-            os.path.join(alt_root, "video", f"{video_id}.MP4"),
-            os.path.join(alt_root, "video", f"{video_id}.mkv"),
-        ]
-    )
-    if extracted:
-        return extracted
+    checked_roots: List[str] = []
+    for root in _videomme_roots():
+        checked_roots.append(root)
+        extracted = _find_existing_media_path(
+            [
+                os.path.join(root, "video", f"{video_id}.mp4"),
+                os.path.join(root, "video", f"{video_id}.MP4"),
+                os.path.join(root, "video", f"{video_id}.mkv"),
+                os.path.join(root, "data", f"{video_id}.mp4"),
+                os.path.join(root, "data", f"{video_id}.MP4"),
+                os.path.join(root, "data", f"{video_id}.mkv"),
+                os.path.join(root, f"{video_id}.mp4"),
+                os.path.join(root, f"{video_id}.MP4"),
+                os.path.join(root, f"{video_id}.mkv"),
+            ]
+        )
+        if extracted:
+            return extracted
 
-    dataset_root = os.path.join(_hf_home(), "datasets", "Video-MME")
-    extracted = _find_existing_media_path(
-        [
-            os.path.join(dataset_root, "data", f"{video_id}.mp4"),
-            os.path.join(dataset_root, "data", f"{video_id}.MP4"),
-            os.path.join(dataset_root, "data", f"{video_id}.mkv"),
-        ]
-    )
-    if extracted:
-        return extracted
+    archive_roots = _videomme_archive_roots()
+    archive_paths: List[str] = []
+    for archive_root in archive_roots:
+        archive_paths.extend(sorted(str(p) for p in Path(archive_root).glob("videos_chunked_*.zip")))
 
-    archive_paths = sorted(str(p) for p in Path(dataset_root).glob("videos_chunked_*.zip"))
     for suffix in ("mp4", "MP4", "mkv"):
         member = f"data/{video_id}.{suffix}"
         extracted = _extract_zip_member(archive_paths, member, os.path.join(_tmp_media_root(), "videomme"))
         if extracted:
             return extracted
-    raise FileNotFoundError(f"Video-MME video not found for {video_id}")
+    roots_msg = ", ".join(checked_roots) if checked_roots else "<none>"
+    archive_msg = ", ".join(archive_roots) if archive_paths else "<no videos_chunked_*.zip found>"
+    raise FileNotFoundError(
+        "Video-MME video not found for "
+        f"{video_id}. Checked roots: {roots_msg}. "
+        f"Checked archives under: {archive_msg}. "
+        "If you only prepared Video-MME_8frame.tsv/subtitle without the actual videos, "
+        "set VIDEO_MME_ROOT to a directory containing video/*.mp4 (or data/*.mp4), "
+        "or place the videos under HF_HOME/datasets/Video-MME_8frame/video."
+    )
 
 
 def _resolve_mvbench_video_path(sub_task: str, video_name: str) -> str:
-    from lmms_eval.tasks.mvbench.utils import DATA_LIST
+    dataset_folders = _MVBENCH_DATA_FOLDERS.get(sub_task)
+    if dataset_folders is None:
+        raise FileNotFoundError(f"Unknown MVBench sub_task={sub_task}")
 
-    alt_root = os.path.join(_hf_home(), "datasets", "MVBench_8frame")
-    dataset_folder = DATA_LIST[sub_task]
-    extracted = _find_existing_media_path(
-        [
-            os.path.join(alt_root, "video", dataset_folder, video_name),
-            os.path.join(alt_root, "video", "data0613", dataset_folder, video_name),
-        ]
-    )
-    if extracted:
-        return extracted
+    for root in _mvbench_roots():
+        candidates: List[str] = []
+        for dataset_folder in dataset_folders:
+            candidates.append(os.path.join(root, dataset_folder, video_name))
+            candidates.append(os.path.join(root, "video", dataset_folder, video_name))
 
-    dataset_root = os.path.join(_hf_home(), "datasets", "MVBench")
-    candidates = [
-        os.path.join(dataset_root, "video", dataset_folder, video_name),
-        os.path.join(dataset_root, "video", "data0613", dataset_folder, video_name),
-    ]
-    extracted = _find_existing_media_path(candidates)
-    if extracted:
-        return extracted
-
-    archive_paths = sorted(str(p) for p in Path(dataset_root, "video").glob("*.zip"))
-    for member in (dataset_folder + "/" + video_name, "data0613/" + dataset_folder + "/" + video_name):
-        extracted = _extract_zip_member(archive_paths, member, os.path.join(_tmp_media_root(), "mvbench"))
+        extracted = _find_existing_media_path(candidates)
         if extracted:
             return extracted
+
+    for root in _mvbench_roots():
+        archive_paths = sorted(str(p) for p in Path(root, "video").glob("*.zip"))
+        for dataset_folder in dataset_folders:
+            extracted = _extract_zip_member(
+                archive_paths,
+                f"{dataset_folder}/{video_name}",
+                os.path.join(_tmp_media_root(), "mvbench"),
+            )
+            if extracted:
+                return extracted
     raise FileNotFoundError(f"MVBench video not found for sub_task={sub_task}, video={video_name}")
 
 
 def _resolve_longvideobench_video_path(video_path: str) -> str:
     candidates = [
+        os.path.join("/home/data2/dyf/LongVideoBench", "videos", video_path),
         os.path.join(_hf_home(), "datasets", "longvideobench", "videos", video_path),
         os.path.join(_hf_home(), "datasets", "longvideobench___long_video_bench", "videos", video_path),
         os.path.join(
@@ -277,7 +384,7 @@ def _resolve_longvideobench_video_path(video_path: str) -> str:
         return extracted
     raise FileNotFoundError(
         f"LongVideoBench video not found for {video_path}. "
-        "Expected extracted videos under $HF_HOME/datasets/longvideobench or the hub snapshot."
+        "Expected extracted videos under /home/data2/dyf/LongVideoBench or $HF_HOME/datasets/longvideobench or the hub snapshot."
     )
 
 
@@ -909,6 +1016,7 @@ def _load_videomme_rows() -> List[dict]:
                     "sub_category": row.get("sub_category", ""),
                     "task_type": row.get("task_type", ""),
                     "subtitle_path": row.get("subtitle_path", ""),
+                    "video_path": row.get("video_path", ""),
                     "local_video_path": os.path.join(
                         _hf_home(),
                         "datasets",

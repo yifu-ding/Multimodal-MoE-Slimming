@@ -38,13 +38,16 @@ PRUNE_RATIO="${PRUNE_RATIO:-0.5}"
 # export SCORES_PATH="storage/data_distill_kimi/gqa-sample_at1.0-0418234400/distilled-0419182016/distilled_hidden-scores.pt"
 # export SCORES_PATH="storage/data_distill_kimi/gqa-sample_at1.0-0418234400/distilled-0419164811/distilled_hidden-step7000-scores.pt"
 export SCORES_PATH="${SCORES_PATH:-/home/dyf/code/distill/MAES/storage/scores/kimi-vl-a3b_video_mmmu-num_1024-token_2048-fill_0-0422-162737/scores.pt}"
+# SCORES_PATH=/home/dyf/code/distill/MAES/storage/scores/qwen3-vl-30b-a3b_video_mmmu-num_128-token_2048-rel_l2-0506-135316/scores.pt
+# SCORES_PATH=/home/dyf/code/distill/MAES/storage/scores/internvl3_5-30b-a3b_video_mmmu-num_128-token_2048-rel_l2-0506-140130/scores.pt
 
-NUM_SAMPLES="${NUM_SAMPLES:-0}"
+
+NUM_SAMPLES="${NUM_SAMPLES:-501}"
 USE_LMMS_EVAL=${USE_LMMS_EVAL:-0}
 
 # ── Task grid ──────────────────────────────────────────────────────────────────
 # All 14 tasks requested; override via SWEEP_TASKS env var.
-SWEEP_TASKS="${SWEEP_TASKS:-video_mmmu videomme mvbench longvideobench}"
+SWEEP_TASKS="${SWEEP_TASKS:-longvideobench}"  # video_mmmu  mvbench longvideobench
 # mmvet video_mmmu videomme mvbench egoschema longvideobench
 # ── Setting grids (same defaults as sweep_prune_eval_kimi_gqa.sh) ──────────────
 SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-loss_smooth_2}"
@@ -56,8 +59,8 @@ EXPERTWISE_BUDGET_NORMALIZE="${EXPERTWISE_BUDGET_NORMALIZE:-1}"
 USE_EMA="${USE_EMA:-1}"
  
 NORMALIZE="${NORMALIZE:-0}"  # legacy
-EMA_SOURCE_KEY="${EMA_SOURCE_KEY:-ema_matrix}"  # ema_matrix_prior_corrected
-LAYERWISE_LOSS_KEY="${LAYERWISE_LOSS_KEY:-layerwise_loss}"  # layerwise_loss, layerwise_second_order_sum
+EMA_SOURCE_KEY="${EMA_SOURCE_KEY:-ema_matrix_prior_corrected}"  # ema_matrix_prior_corrected
+LAYERWISE_LOSS_KEY="${LAYERWISE_LOSS_KEY:-layerwise_second_order_sum}"  # layerwise_loss, layerwise_second_order_sum
 
 SMOOTH_FN="${SMOOTH_FN:-cbrt}" # sqrt cbrt fourth_root log
 SWEEP_INTRA_EXPERT_METRICS="${SWEEP_INTRA_EXPERT_METRICS:-gateup_act}"
