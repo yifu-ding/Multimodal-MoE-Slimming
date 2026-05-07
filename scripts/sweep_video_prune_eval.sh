@@ -47,7 +47,7 @@ USE_LMMS_EVAL=${USE_LMMS_EVAL:-0}
 
 # ── Task grid ──────────────────────────────────────────────────────────────────
 # All 14 tasks requested; override via SWEEP_TASKS env var.
-SWEEP_TASKS="${SWEEP_TASKS:-longvideobench}"  # video_mmmu  mvbench longvideobench
+SWEEP_TASKS="${SWEEP_TASKS:-videomme longvideobench}" # video_mmmu, mvbench 
 # mmvet video_mmmu videomme mvbench egoschema longvideobench
 # ── Setting grids (same defaults as sweep_prune_eval_kimi_gqa.sh) ──────────────
 SWEEP_INTER_METHODS="${SWEEP_INTER_METHODS:-loss_smooth_2}"
