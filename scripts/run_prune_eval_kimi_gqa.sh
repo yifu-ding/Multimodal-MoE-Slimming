@@ -33,7 +33,7 @@ PRUNE_RATIO="${PRUNE_RATIO:-0.5}"
 #   loss_smooth_<N>      # e.g. loss_smooth_1, loss_smooth_2
 #   loss_coverage
 #   raw_loss_coverage
-INTER_METHOD="${INTER_METHOD:-uniform}"
+INTER_METHOD="${INTER_METHOD:-loss_smooth_2}"
 # 在 loss_smooth 的时候会读取，可选：sqrt, cbrt, fourth_root, log, ...
 SMOOTH_FN="${SMOOTH_FN:-sqrt}"
 # INTRA_METHOD options (intra-layer planner, 基于 EXPERT_METRICS):
@@ -67,12 +67,12 @@ SHARED_PROTECT="${SHARED_PROTECT:-1}"  # 双模态时是否保留 shared channel
 TEXT_ONLY="${TEXT_ONLY:-0}"  # ablation: 仅使用 text tentative mask
 VISUAL_ONLY="${VISUAL_ONLY:-0}"  # ablation: 仅使用 visual tentative mask
 NORMALIZE="${NORMALIZE:-0}"  # 是否对 text / visual 分模态做层级归一化
-EXPERTWISE_BUDGET_NORMALIZE="${EXPERTWISE_BUDGET_NORMALIZE:-0}"  # 是否先按层归一化 expert raw budget 再分配
+EXPERTWISE_BUDGET_NORMALIZE="${EXPERTWISE_BUDGET_NORMALIZE:-1}"  # 是否先按层归一化 expert raw budget 再分配
 USE_EMA="${USE_EMA:-1}"  # 是否使用 EMA affinity 分配 modality budget
 # scores payload 里用作 EMA 源的 tensor 键名, 与 ``pipeline.prepare_scores(..., ema_source_key=...)`` 一致
 EMA_SOURCE_KEY="${EMA_SOURCE_KEY:-ema_matrix}"
-INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-3proj_second_order}"
-LAYERWISE_LOSS_KEY="${LAYERWISE_LOSS_KEY:-layerwise_second_order_sum}"
+INTRA_EXPERT_METRIC="${INTRA_EXPERT_METRIC:-gateup_act}"
+LAYERWISE_LOSS_KEY="${LAYERWISE_LOSS_KEY:-layerwise_loss}"
 
 ALIGN_INTER="${ALIGN_INTER:-0}"
 MIN_PER_EXPERT="${MIN_PER_EXPERT:-128}"
@@ -83,7 +83,13 @@ THRESHOLDS_PATH="${THRESHOLDS_PATH:-}"
 NUM_SAMPLES="${NUM_SAMPLES:-0}"  # 样本数, 0 表示全量
 START_IDX="${START_IDX:-0}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32}"
+if [[ -z "${MAX_NEW_TOKENS:-}" ]]; then
+    if [[ "${TASK}" == "video_mmmu" ]]; then
+        MAX_NEW_TOKENS="1024"
+    else
+        MAX_NEW_TOKENS="32"
+    fi
+fi
 SUBSET_SEED="${SUBSET_SEED:-}"
 
 USE_LMMS_EVAL="${USE_LMMS_EVAL:-0}"

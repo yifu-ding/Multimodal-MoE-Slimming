@@ -142,7 +142,7 @@ class KimiVL(lmms):
         device_map: Optional[str] = "auto",
         batch_size: Optional[Union[int, str]] = 1,
         use_cache=True,
-        attn_implementation: Optional[str] = None,
+        attn_implementation: Optional[str] = "flash_attention_2",
         **kwargs,
     ) -> None:
         super().__init__()

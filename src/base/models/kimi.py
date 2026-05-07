@@ -1534,6 +1534,11 @@ def load_model(
     _ensure_writable_hf_modules_cache(model_path)
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
     config = _normalize_kimi_config_for_remote_code(config)
+    config._attn_implementation = attn_implementation
+    if getattr(config, "text_config", None) is not None:
+        config.text_config._attn_implementation = attn_implementation
+    if getattr(config, "vision_config", None) is not None:
+        config.vision_config._attn_implementation = attn_implementation
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         config=config,

@@ -32,6 +32,28 @@ HOME = _videommmu_home()
 ADAPTATION_IMAGE_BY_ID = None
 
 
+def _parse_options(options: List[str]) -> str:
+    option_letters = [chr(ord("A") + i) for i in range(len(options))]
+    if all(option.startswith(f"{letter}.") for option, letter in zip(options, option_letters)):
+        return "\n".join(options)
+    return "\n".join(
+        f"{option_letter}. {option}"
+        for option_letter, option in zip(option_letters, options)
+    )
+
+
+def is_adaptation_doc(doc: dict) -> bool:
+    subset_name = str(doc.get("subset_name", "")).lower()
+    if subset_name == "adaptation":
+        return True
+
+    qa_type = str(doc.get("qa_type", "")).lower()
+    if "analysis" in qa_type or "adapt" in qa_type:
+        return True
+
+    return doc.get("image") is not None
+
+
 def get_cache_dir(subject):
     """Map subject to cache subdirectory (Art, Science, Humanities, etc.).
 
@@ -135,7 +157,7 @@ def _build_placeholder_frame() -> Image.Image:
 
 
 def process_media(
-    file_path: Union[str, Path], max_frames: int = 32, max_long_side: int = 480
+    file_path: Union[str, Path], max_frames: int = 64, max_long_side: int = 480
 ) -> tuple:
     """Load and process video or image file into list of resized PIL frames.
 
@@ -233,13 +255,12 @@ def videommmu_doc_to_text_adaptation(doc):
     question = doc["question"]
 
     if doc["question_type"] == "multiple-choice":
-        pre_prompt += "answer the following question. The image for this question is at the end of the video."
-        # parsed_options = parse_options(doc["options"])
-        # question += "\n" + parsed_options
+        pre_prompt += "answer the following multi-choice question. The image for this question is at the end of the video.\n"
+        question += "\n" + _parse_options(doc["options"])
     else:
-        pre_prompt += "answer the following open-ended question. The image for this question is at the end of the video."
+        pre_prompt += "answer the following open-ended question. The image for this question is at the end of the video.\n"
 
-    return f"{pre_prompt}{question}\nThe answer is: "
+    return f"{pre_prompt}{question}"
 
 
 def videommmu_doc_to_text_perception_comprehension(doc):
@@ -253,10 +274,10 @@ def videommmu_doc_to_text_perception_comprehension(doc):
     """
     post_prompt = "\nPlease ignore the Quiz question in last frame of the video."
     question = doc["question"]
-    # parsed_options = parse_options(doc["options"])
-    # question += "\n" + parsed_options
+    if doc["question_type"] == "multiple-choice":
+        question += "\n" + _parse_options(doc["options"])
 
-    return f"{question}{post_prompt}\nThe answer is: "
+    return f"{question}{post_prompt}"
 
 
 def videommmu_doc_to_org_text(doc):
@@ -337,9 +358,7 @@ def videommmu_transform(batch):
             "image": image,
         }
         visuals = videommmu_doc_to_visual(doc)
-        if doc["question_type"].endswith("Adaptation") or doc["question_type"].endswith(
-            "Analysis"
-        ):
+        if is_adaptation_doc(doc):
             text = videommmu_doc_to_text_adaptation(doc)
         else:
             text = videommmu_doc_to_text_perception_comprehension(doc)

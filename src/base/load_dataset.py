@@ -745,7 +745,17 @@ def _load_realworldqa_rows() -> List[dict]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _build_videommmu_helpers() -> TaskHelpers:
+    from lmms_eval.tasks._task_utils.mmmu_mcq_utils import (
+        get_multi_choice_info,
+    )
+    from lmms_eval.tasks.videommmu.utils import (
+        eval_multi_choice,
+        eval_open,
+        parse_multi_choice_response,
+        parse_open_response,
+    )
     from tasks.video_mmmu import (
+        is_adaptation_doc,
         videommmu_doc_to_answer,
         videommmu_doc_to_text_adaptation,
         videommmu_doc_to_text_perception_comprehension,
@@ -753,8 +763,7 @@ def _build_videommmu_helpers() -> TaskHelpers:
     )
 
     def doc_to_text(doc: dict) -> str:
-        qt = doc.get("question_type", "")
-        if qt.endswith("Adaptation") or qt.endswith("Analysis"):
+        if is_adaptation_doc(doc):
             return videommmu_doc_to_text_adaptation(doc)
         return videommmu_doc_to_text_perception_comprehension(doc)
 
@@ -766,9 +775,16 @@ def _build_videommmu_helpers() -> TaskHelpers:
             pred_raw = p["pred"].strip()
             qt = p.get("question_type", "")
             if qt == "multiple-choice":
-                is_correct = _extract_mc_answer(pred_raw) == gt
+                index2ans, all_choices = get_multi_choice_info(p.get("options", []))
+                parsed_pred = parse_multi_choice_response(
+                    pred_raw,
+                    all_choices,
+                    index2ans,
+                )
+                is_correct = eval_multi_choice(gt, parsed_pred)
             else:
-                is_correct = _normalize_answer(pred_raw) == _normalize_answer(gt)
+                parsed_pred = parse_open_response(pred_raw)
+                is_correct = eval_open(gt, parsed_pred)
             p["correct"] = is_correct
             correct += int(is_correct)
         accuracy = correct / total if total > 0 else 0.0
@@ -796,6 +812,9 @@ def _load_videommmu_rows():
     adaptation = load_dataset(require_dataset_dir("VideoMMMU", "Adaptation"), token=True)["test"]
     comprehension = load_dataset(require_dataset_dir("VideoMMMU", "Comprehension"), token=True)["test"]
     perception = load_dataset(require_dataset_dir("VideoMMMU", "Perception"), token=True)["test"]
+    adaptation = adaptation.add_column("subset_name", ["Adaptation"] * len(adaptation))
+    comprehension = comprehension.add_column("subset_name", ["Comprehension"] * len(comprehension))
+    perception = perception.add_column("subset_name", ["Perception"] * len(perception))
     return concatenate_datasets([adaptation, comprehension, perception])
 
 
@@ -804,6 +823,8 @@ def _load_videommmu_rows():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _build_mvbench_helpers() -> TaskHelpers:
+    from lmms_eval.tasks.mvbench.utils import mcq_acc, mvbench_doc_to_text
+
     def doc_to_visual(doc):
         if doc.get("local_video_path") and os.path.exists(doc["local_video_path"]):
             return [doc["local_video_path"]]
@@ -822,13 +843,37 @@ def _build_mvbench_helpers() -> TaskHelpers:
     def doc_to_answer(doc):
         return doc["answer"]
 
+    def evaluate(predictions: List[dict]) -> dict:
+        import string
+
+        correct = 0
+        total = len(predictions)
+        for p in predictions:
+            gt_option_letter = None
+            for i, candidate in enumerate(p.get("candidates", [])):
+                if candidate == p["gt"]:
+                    gt_option_letter = string.ascii_uppercase[i]
+                    break
+            is_correct = bool(gt_option_letter) and mcq_acc(gt_option_letter, p["pred"]) == 1
+            p["correct"] = is_correct
+            correct += int(is_correct)
+        accuracy = correct / total if total > 0 else 0.0
+        return {
+            "metric_name": "Accuracy",
+            "metric_value": accuracy,
+            "correct": correct,
+            "total": total,
+            "detail": f"{correct}/{total}",
+        }
+
     return TaskHelpers(
         task_name="mvbench",
         doc_to_visual=doc_to_visual,
         doc_to_text=doc_to_text,
         doc_to_answer=doc_to_answer,
-        evaluate=_mc_accuracy_evaluate,
+        evaluate=evaluate,
         media_type="video",
+        extra_fields=["candidates"],
     )
 
 def _load_mvbench_rows() -> List[dict]:
@@ -905,7 +950,11 @@ def _load_mvbench_rows() -> List[dict]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _build_egoschema_helpers() -> TaskHelpers:
-    from lmms_eval.tasks.egoschema.utils import egoschema_doc_to_text
+    from lmms_eval.tasks.egoschema.utils import (
+        egoschema_doc_to_text,
+        get_multi_choice_info,
+        parse_multi_choice_response,
+    )
 
     def doc_to_visual(doc):
         return [_resolve_egoschema_video_path(doc["video_idx"])]
@@ -918,13 +967,45 @@ def _build_egoschema_helpers() -> TaskHelpers:
     def doc_to_answer(doc):
         return str(doc["answer"])
 
+    def evaluate(predictions: List[dict]) -> dict:
+        labeled = [
+            p for p in predictions
+            if p["gt"] not in (None, "", "None")
+        ]
+        if not labeled:
+            raise RuntimeError(
+                "EgoSchema full test set has no offline labels. "
+                "Use `egoschema_subset` for local accuracy, or submit predictions for `egoschema`."
+            )
+
+        correct = 0
+        total = len(labeled)
+        pred_to_index = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4}
+        for p in labeled:
+            doc = {"option": p.get("option", [])}
+            index2ans, all_choices = get_multi_choice_info(doc)
+            parsed_pred, _ = parse_multi_choice_response(p["pred"], all_choices, index2ans)
+            pred_idx = pred_to_index.get(parsed_pred, -1)
+            is_correct = str(pred_idx) == str(p["gt"])
+            p["correct"] = is_correct
+            correct += int(is_correct)
+        accuracy = correct / total if total > 0 else 0.0
+        return {
+            "metric_name": "Accuracy",
+            "metric_value": accuracy,
+            "correct": correct,
+            "total": total,
+            "detail": f"{correct}/{total}",
+        }
+
     return TaskHelpers(
         task_name="egoschema",
         doc_to_visual=doc_to_visual,
         doc_to_text=doc_to_text,
         doc_to_answer=doc_to_answer,
-        evaluate=_mc_accuracy_evaluate,
+        evaluate=evaluate,
         media_type="video",
+        extra_fields=["option"],
     )
 
 def _load_egoschema_rows() -> List[dict]:
@@ -935,7 +1016,11 @@ def _load_egoschema_rows() -> List[dict]:
 
 
 def _build_egoschema_subset_helpers() -> TaskHelpers:
-    from lmms_eval.tasks.egoschema.utils import egoschema_doc_to_text
+    from lmms_eval.tasks.egoschema.utils import (
+        egoschema_doc_to_text,
+        get_multi_choice_info,
+        parse_multi_choice_response,
+    )
 
     def doc_to_visual(doc):
         return [_resolve_egoschema_video_path(doc["video_idx"])]
@@ -953,13 +1038,33 @@ def _build_egoschema_subset_helpers() -> TaskHelpers:
                 return chr(ord("A") + idx)
         return answer
 
+    def evaluate(predictions: List[dict]) -> dict:
+        correct = 0
+        total = len(predictions)
+        for p in predictions:
+            doc = {"option": p.get("option", [])}
+            index2ans, all_choices = get_multi_choice_info(doc)
+            parsed_pred, _ = parse_multi_choice_response(p["pred"], all_choices, index2ans)
+            is_correct = parsed_pred == p["gt"]
+            p["correct"] = is_correct
+            correct += int(is_correct)
+        accuracy = correct / total if total > 0 else 0.0
+        return {
+            "metric_name": "Accuracy",
+            "metric_value": accuracy,
+            "correct": correct,
+            "total": total,
+            "detail": f"{correct}/{total}",
+        }
+
     return TaskHelpers(
         task_name="egoschema_subset",
         doc_to_visual=doc_to_visual,
         doc_to_text=doc_to_text,
         doc_to_answer=doc_to_answer,
-        evaluate=_mc_accuracy_evaluate,
+        evaluate=evaluate,
         media_type="video",
+        extra_fields=["option"],
     )
 
 
@@ -975,27 +1080,47 @@ def _load_egoschema_subset_rows() -> List[dict]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _build_videomme_helpers() -> TaskHelpers:
+    from lmms_eval.tasks.videomme.utils import (
+        extract_characters_regex,
+        videomme_doc_to_text,
+    )
+
     def doc_to_visual(doc):
         if doc.get("local_video_path") and os.path.exists(doc["local_video_path"]):
             return [doc["local_video_path"]]
         return [_resolve_videomme_video_path(doc["videoID"])]
 
     def doc_to_text(doc):
-        question = doc["question"]
-        options = doc.get("options", [])
-        letters = [chr(ord("A") + i) for i in range(len(options))]
-        opts = "\n".join(f"({l}) {o}" for l, o in zip(letters, options))
-        return f"{question}\n{opts}\nAnswer with the option's letter from the given choices directly."
+        return videomme_doc_to_text(doc, lmms_eval_specific_kwargs={
+            "post_prompt": "The best answer is:",
+        })
 
     def doc_to_answer(doc):
         return doc["answer"]
+
+    def evaluate(predictions: List[dict]) -> dict:
+        correct = 0
+        total = len(predictions)
+        for p in predictions:
+            pred_ans = extract_characters_regex(p["pred"])
+            is_correct = pred_ans.lower() == p["gt"].strip().lower()
+            p["correct"] = is_correct
+            correct += int(is_correct)
+        accuracy = correct / total if total > 0 else 0.0
+        return {
+            "metric_name": "Accuracy",
+            "metric_value": accuracy,
+            "correct": correct,
+            "total": total,
+            "detail": f"{correct}/{total}",
+        }
 
     return TaskHelpers(
         task_name="videomme",
         doc_to_visual=doc_to_visual,
         doc_to_text=doc_to_text,
         doc_to_answer=doc_to_answer,
-        evaluate=_mc_accuracy_evaluate,
+        evaluate=evaluate,
         media_type="video",
     )
 
