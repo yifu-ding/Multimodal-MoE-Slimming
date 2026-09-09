@@ -1,0 +1,23 @@
+task: "video_mmmu_perception_local"
+dataset_path: parquet
+dataset_kwargs:
+  data_files: /home/data/dyf/hf_cache/datasets/VideoMMMU/Perception/test-00000-of-00001.parquet
+test_split: train
+output_type: generate_until
+doc_to_visual: !function video_mmmu_local_utils.video_mmmu_doc_to_visual_local
+doc_to_text: !function lmms_eval.tasks.videommmu.utils.videommmu_doc_to_text_perception_comprehension
+doc_to_target: !function lmms_eval.tasks.videommmu.utils.videommmu_doc_to_answer
+process_results: !function lmms_eval.tasks.videommmu.utils.videommmu_process_results
+generation_kwargs:
+  max_new_tokens: 1024
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: "You should watch and learn the video content. Then apply what you learned to "
+    perception_and_comprehension_prompt: "\nPlease ignore the Quiz question in last frame of the video."
+    mcq_prompt: "answer the following multi-choice question. The image for this question is at the end of the video.\n"
+    open_ended_prompt: "answer the following open-ended question. The image for this question is at the end of the video.\n"
+    mcq_post_prompt: ""
+metric_list:
+  - metric: mmmu_acc
+    aggregation: !function lmms_eval.tasks.videommmu.utils.videommmu_aggregate_results
+    higher_is_better: true

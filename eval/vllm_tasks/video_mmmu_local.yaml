@@ -1,0 +1,5 @@
+group: video_mmmu_local
+task:
+  - video_mmmu_adaptation_local
+  - video_mmmu_comprehension_local
+  - video_mmmu_perception_local

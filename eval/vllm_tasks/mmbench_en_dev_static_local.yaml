@@ -1,0 +1,31 @@
+task: "mmbench_en_dev_static_local"
+dataset_path: parquet
+dataset_kwargs:
+  data_files:
+    dev: /home/data/dyf/hf_cache/datasets/MMBench/en/dev-00000-of-00001.parquet
+dataset_name: "en_local"
+test_split: dev
+output_type: generate_until
+doc_to_visual: !function lmms_eval.tasks.mmbench.en_utils.mmbench_doc_to_visual
+doc_to_text: !function lmms_eval.tasks.mmbench.en_utils.mmbench_doc_to_text
+doc_to_target: "answer"
+process_results: !function lmms_eval.tasks.mmbench.en_utils.mmbench_process_results
+generation_kwargs:
+  until:
+    - "ASSISTANT:"
+  max_new_tokens: 1024
+  temperature: 0
+  top_p: 1.0
+  num_beams: 1
+  do_sample: false
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: "\nAnswer with the option's letter from the given choices directly."
+metric_list:
+  - metric: gpt_eval_score
+    aggregation: !function lmms_eval.tasks.mmbench.en_utils.mmbench_aggregate_dev_results_static
+    higher_is_better: true
+  - metric: submission
+    aggregation: !function lmms_eval.tasks.mmbench.en_utils.mmbench_aggregate_dev_results_submission
+    higher_is_better: true

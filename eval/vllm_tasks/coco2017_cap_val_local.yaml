@@ -1,0 +1,37 @@
+task: "coco2017_cap_val_local"
+dataset_path: /home/data/dyf/hf_cache/datasets/COCO-Caption2017
+dataset_name: "default"
+test_split: val
+output_type: generate_until
+doc_to_visual: !function lmms_eval.tasks.coco_cap.utils.coco_doc_to_visual
+doc_to_text: !function lmms_eval.tasks.coco_cap.utils.coco_doc_to_text
+doc_to_target: "answer"
+process_results: !function lmms_eval.tasks.coco_cap.utils.coco_process_result
+generation_kwargs:
+  max_new_tokens: 64
+  temperature: 0
+  top_p: 1.0
+  num_beams: 1
+  do_sample: false
+metric_list:
+  - metric: coco_Bleu_4
+    aggregation: !function lmms_eval.tasks.coco_cap.utils.coco_bleu4
+    higher_is_better: true
+  - metric: coco_Bleu_3
+    aggregation: !function lmms_eval.tasks.coco_cap.utils.coco_bleu3
+    higher_is_better: true
+  - metric: coco_Bleu_2
+    aggregation: !function lmms_eval.tasks.coco_cap.utils.coco_bleu2
+    higher_is_better: true
+  - metric: coco_Bleu_1
+    aggregation: !function lmms_eval.tasks.coco_cap.utils.coco_bleu1
+    higher_is_better: true
+  - metric: coco_METEOR
+    aggregation: !function lmms_eval.tasks.coco_cap.utils.coco_meteor
+    higher_is_better: true
+  - metric: coco_ROUGE_L
+    aggregation: !function lmms_eval.tasks.coco_cap.utils.coco_rougel
+    higher_is_better: true
+  - metric: coco_CIDEr
+    aggregation: !function lmms_eval.tasks.coco_cap.utils.coco_cider
+    higher_is_better: true
