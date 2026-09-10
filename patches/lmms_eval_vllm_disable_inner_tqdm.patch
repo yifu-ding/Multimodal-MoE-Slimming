@@ -1,0 +1,15 @@
+--- a/lmms-eval/lmms_eval/models/simple/vllm.py
++++ b/lmms-eval/lmms_eval/models/simple/vllm.py
+@@ -530,10 +530,12 @@
+                             sampling_params=sampling_params,
+                             messages=inputs,
+                             chat_template=self.chat_template,
++                            use_tqdm=False,
+                         )
+                     else:
+                         response = self.client.chat(
+                             sampling_params=sampling_params,
+                             messages=inputs,
++                            use_tqdm=False,
+                         )
+                     return [o.outputs[0].text for o in response]
