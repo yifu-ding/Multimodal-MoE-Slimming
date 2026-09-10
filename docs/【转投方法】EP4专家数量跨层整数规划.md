@@ -697,3 +697,22 @@ solver = scipy.optimize.milp (HiGHS)
 ```
 
 其中 `layer_scale_mode` 在真实 score data audit 后必须再确认。如果 `3proj_second_order` 在相同 loss、样本和累加口径下已经可以跨层直接比较，则应设为 `none`，避免重复计入 layer sensitivity。
+
+## 16. Codex 补充：2026-09-10 最新实现决策
+
+> [!IMPORTANT]
+> 本节记录最新讨论结果，并覆盖本文前面与之冲突的旧方案。v1 不再对所有 layer/expert/tier 建立全局宽度 MILP；默认活动档位改为 `768/640/512/384`，宽度低于 384 时直接量化为 0（删除 expert）。原 `768/512/384/256` 方案保留为可配置 ablation。
+
+最新流程为：
+
+1. 输入 `layer_sensitivity[L]`、`expert_sensitivity[L,E]`、`scores[L,E,I]` 和 `prune_ratio`，其中 `keep_ratio=1-prune_ratio`；
+2. 调用现有 layer score-coverage binary search，根据逐层 sensitivity 分配每层原始保留通道数；
+3. 每层调用现有 expert coverage binary search。其搜索变量 alpha 控制每个 expert 需要覆盖的累计 channel score 比例，而不是直接按通道数量比例分配；
+4. 将原始 `[L,E]` 通道数圆整到 `{768,640,512,384,0}`，并以 128 为单位修复全局离散预算；
+5. 每层四个活动档位必须各出现至少一次，0 档不参与 placement；
+6. placement 阶段每层枚举 24 种档位到 EP rank 的 permutation；默认先贪心平衡部分累计负载，再用逐层局部搜索降低最终最大偏差。小规模或离线最优性对照可显式选择 MILP；
+7. 若 placement 的相对偏差不超过 `tolerance`，则接受；否则返回当前最佳偏差，并由 strict mode 决定是否报错。
+
+这样 width planning 的主体复杂度是 binary search、排序和贪心档位修复。默认 placement 每层只评估 24 个候选，不会随层数产生组合爆炸。保留的 MILP 对照路径包含约 `L*24+1` 个变量；Qwen3 的 48 层对应约 1153 个变量，但实测仍明显慢于默认方法。
+
+选择 `{768,640,512,384,0}` 的原因是：30% 剪枝时平均目标宽度为 537.6，512 和 640 正好位于目标两侧，量化误差较小；384 作为最低活动宽度比 256 更保守。该选择理论上更有利于保留单个活动 expert 的表达能力，但会增加直接删除弱 expert 的可能性，最终结论仍需与 `{768,512,384,256,0}` 做同预算精度 ablation。
