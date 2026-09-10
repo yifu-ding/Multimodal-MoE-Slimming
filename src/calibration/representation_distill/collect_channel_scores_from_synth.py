@@ -101,6 +101,7 @@ def _synthetic_block_forward(
     layer_idx: int,
     dataloader,
     saliency_ema: float,
+    score_aggregation: str,
     start_layer: int,
     loss_fn: str,
     dtype: torch.dtype,
@@ -205,6 +206,7 @@ def _synthetic_block_forward(
             second_order_sum = collect_scores_from_moe_module(
                 cnt_block,
                 ema=saliency_ema,
+                aggregation=score_aggregation,
                 _kwargs={
                     "use_mlp_scores": True,
                     "use_attn_scores": False,
@@ -266,6 +268,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--ema", type=float, default=0.9)
+    parser.add_argument(
+        "--aggregation", type=str, default="mean", choices=["mean", "ema"]
+    )
     parser.add_argument("--loss_fn", type=str, default="rel_l2", choices=["l2", "rel_l2", "cosine"])
     parser.add_argument("--layers", type=int, nargs="+", default=None)
     parser.add_argument("--device_map", type=str, default=None)
@@ -524,6 +529,7 @@ def main() -> None:
         model_name_or_path=args.model_name_or_path,
         subset_seed=None,
         ema=args.ema,
+        aggregation=args.aggregation,
         fill_zero_for_unrouted=False,
         source=hidden_payload["source"],
         input_hidden_path=args.input_hidden_path,
@@ -551,6 +557,7 @@ def main() -> None:
             layer_idx=layer_idx,
             dataloader=loader,
             saliency_ema=args.ema,
+            score_aggregation=args.aggregation,
             start_layer=start_layer,
             loss_fn=args.loss_fn,
             dtype=block_dtype,

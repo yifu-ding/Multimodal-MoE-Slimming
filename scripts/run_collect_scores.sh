@@ -20,6 +20,11 @@ set -euo pipefail
 #
 # Full run:
 #   CUDA_VISIBLE_DEVICES=0 NUM_SAMPLES=512 bash scripts/run_collect_scores.sh
+#
+# Frozen mixed-source run (sample count and score-token quota come from manifest):
+#   SELECTION_MANIFEST=storage/calibration_manifests/mixed-512.json \
+#     BATCH_SIZE=16 SECOND_ORDER_CHUNK_SIZE=auto AGGREGATION=mean \
+#     bash scripts/run_collect_scores.sh
 
 source scripts/select_least_used_gpu.sh # 自动选择显存使用量最少的 gpu
 
@@ -50,13 +55,16 @@ case "${MODEL_PATH,,}" in
 esac
 
 DATASET="${DATASET:-video_mmmu}"  # DATASET=gqa, coco, video_mmmu, m4_instruct, star
+SELECTION_MANIFEST="${SELECTION_MANIFEST:-}"
 NUM_SAMPLES="${NUM_SAMPLES:-128}"
 TOKEN_PER_SAMPLE="${TOKEN_PER_SAMPLE:-2048}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 START_IDX="${START_IDX:-0}"
 SUBSET_SEED="${SUBSET_SEED:-42}"
 LOSS_FN="${LOSS_FN:-rel_l2}"
-SECOND_ORDER_IMPL="${SECOND_ORDER_IMPL:-legacy}"
+SECOND_ORDER_IMPL="${SECOND_ORDER_IMPL:-vectorized}"
+SECOND_ORDER_CHUNK_SIZE="${SECOND_ORDER_CHUNK_SIZE:-auto}"
+SECOND_ORDER_MAX_CHUNK_SIZE="${SECOND_ORDER_MAX_CHUNK_SIZE:-0}"
 SECOND_ORDER_PROFILE="${SECOND_ORDER_PROFILE:-0}"
 LAYERS="${LAYERS:-}"  # 默认不传值，全部层calibration
 # LAYERS="${LAYERS:-1-6}"
@@ -65,8 +73,19 @@ LAYERS="${LAYERS:-}"  # 默认不传值，全部层calibration
 # LAYERS="${LAYERS:-20-26}"
 
 EMA="${EMA:-0.9}"
+AGGREGATION="${AGGREGATION:-mean}"
 FILL_ZERO_FOR_UNROUTED="${FILL_ZERO_FOR_UNROUTED:-0}"
 
+export SECOND_ORDER_IMPL SECOND_ORDER_CHUNK_SIZE SECOND_ORDER_MAX_CHUNK_SIZE SECOND_ORDER_PROFILE
+
+if [[ -n "${SELECTION_MANIFEST}" ]]; then
+    if [[ ! -f "${SELECTION_MANIFEST}" ]]; then
+        echo "Selection manifest does not exist: ${SELECTION_MANIFEST}" >&2
+        exit 1
+    fi
+    DATASET="mixed"
+    DATASET_TAG="mixed-$(basename "${SELECTION_MANIFEST}" .json)"
+else
 case "${DATASET,,}" in
     gqa)
         DATASET="gqa"
@@ -93,6 +112,7 @@ case "${DATASET,,}" in
         exit 1
         ;;
 esac
+fi
 
 MODEL_TAG_RAW="${MODEL_PATH##*/}"
 MODEL_TAG="${MODEL_TAG_RAW,,}"
@@ -117,7 +137,12 @@ case "${MODEL_TAG}" in
         ;;
 esac
 
-OUTPUT_DIR="${OUTPUT_DIR:-${PREFIX}/storage/scores/${MODEL_TAG}_${DATASET_TAG}-num_${NUM_SAMPLES}-token_${TOKEN_PER_SAMPLE}-${LOSS_FN}-$(date +%m%d-%H%M%S)}"
+if [[ -n "${SELECTION_MANIFEST}" ]]; then
+    DEFAULT_OUTPUT_DIR="${PREFIX}/storage/scores/${MODEL_TAG}_${DATASET_TAG}-${LOSS_FN}-$(date +%m%d-%H%M%S)"
+else
+    DEFAULT_OUTPUT_DIR="${PREFIX}/storage/scores/${MODEL_TAG}_${DATASET_TAG}-num_${NUM_SAMPLES}-token_${TOKEN_PER_SAMPLE}-${LOSS_FN}-$(date +%m%d-%H%M%S)"
+fi
+OUTPUT_DIR="${OUTPUT_DIR:-${DEFAULT_OUTPUT_DIR}}"
 
 EXTRA_ARGS=("$@")
 
@@ -133,7 +158,12 @@ CMD=(
     --subset_seed        "${SUBSET_SEED}"
     --loss_fn            "${LOSS_FN}"
     --ema                "${EMA}"
+    --aggregation        "${AGGREGATION}"
 )
+
+if [[ -n "${SELECTION_MANIFEST}" ]]; then
+    CMD+=(--selection_manifest "${SELECTION_MANIFEST}")
+fi
 
 if [[ "${FILL_ZERO_FOR_UNROUTED}" == "1" ]]; then
     CMD+=(--fill_zero_for_unrouted)
@@ -176,9 +206,16 @@ fi
 CMD+=("${EXTRA_ARGS[@]}")
 
 echo "Model      : ${MODEL_PATH}"
-echo "Dataset    : ${DATASET} (${NUM_SAMPLES} samples, ${TOKEN_PER_SAMPLE} tokens per sample)"
+if [[ -n "${SELECTION_MANIFEST}" ]]; then
+    echo "Dataset    : mixed (sample count and score-token quota loaded from manifest)"
+    echo "Manifest   : ${SELECTION_MANIFEST} (sample count and score-token quota loaded from JSON)"
+else
+    echo "Dataset    : ${DATASET} (${NUM_SAMPLES} samples, ${TOKEN_PER_SAMPLE} tokens per sample)"
+fi
 echo "Layers     : ${LAYERS:-<all MoE layers>}"
 echo "Output     : ${OUTPUT_DIR}"
+echo "Aggregation: ${AGGREGATION}"
+echo "2nd order  : ${SECOND_ORDER_IMPL}, expert group=${SECOND_ORDER_CHUNK_SIZE}, max=${SECOND_ORDER_MAX_CHUNK_SIZE}"
 echo "Fill zero for unrouted: ${FILL_ZERO_FOR_UNROUTED}"
 echo "GPU        : ${CUDA_VISIBLE_DEVICES}"
 echo ""

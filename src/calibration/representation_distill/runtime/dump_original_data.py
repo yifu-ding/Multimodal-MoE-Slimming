@@ -1,6 +1,6 @@
 import os
 import random
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Mapping, Sequence
 
 from datasets import concatenate_datasets, load_dataset
 import pyarrow.parquet as pq
@@ -223,6 +223,111 @@ def _load_dataset_rows(dataset_name: str, samples_per_dataset: int) -> Sequence[
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
+def load_dataset_rows(
+    dataset_name: str,
+    *,
+    minimum_rows: int = 1,
+) -> Sequence[Dict[str, Any]]:
+    """Load source rows without materializing image/video payloads."""
+    if dataset_name not in SUPPORTED_DATASETS:
+        raise ValueError(
+            f"Unsupported dataset: {dataset_name}. Supported datasets: {SUPPORTED_DATASETS}"
+        )
+    return _load_dataset_rows(dataset_name, samples_per_dataset=max(int(minimum_rows), 1))
+
+
+def build_raw_sample(
+    dataset_name: str,
+    row: Dict[str, Any],
+    dataset_index: int,
+    *,
+    num_video_frames: int = 8,
+    video_max_long_side: int = 480,
+) -> Dict[str, Any]:
+    """Materialize one unified raw sample from a source row."""
+    if dataset_name == "gqa":
+        sample = _build_gqa_sample(row, dataset_index)
+    elif dataset_name == "coco":
+        sample = _build_coco_sample(row, dataset_index)
+    elif dataset_name == "m4_instruct":
+        sample = _build_m4_sample(row, dataset_index)
+    elif dataset_name == "video_mmmu":
+        sample = _build_videommmu_sample(
+            row,
+            dataset_index,
+            num_frames=num_video_frames,
+            max_long_side=video_max_long_side,
+        )
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset_name}")
+    sample["dataset_id"] = SUPPORTED_DATASETS.index(dataset_name)
+    return sample
+
+
+class ManifestRawDataset:
+    """Lazily materialize unified raw samples referenced by a JSON manifest."""
+
+    def __init__(
+        self,
+        entries: Sequence[Mapping[str, Any]],
+        *,
+        num_video_frames: int = 8,
+        video_max_long_side: int = 480,
+        rows_by_dataset: Mapping[str, Sequence[Dict[str, Any]]] | None = None,
+    ) -> None:
+        self.entries = [dict(entry) for entry in entries]
+        self.num_video_frames = int(num_video_frames)
+        self.video_max_long_side = int(video_max_long_side)
+        self._rows_by_dataset: Dict[str, Sequence[Dict[str, Any]]] = dict(
+            rows_by_dataset or {}
+        )
+
+        max_index_by_dataset: Dict[str, int] = {}
+        for entry in self.entries:
+            dataset_name = str(entry["dataset_name"])
+            if dataset_name not in SUPPORTED_DATASETS:
+                raise ValueError(f"Unsupported manifest dataset: {dataset_name}")
+            dataset_index = int(entry["dataset_index"])
+            if dataset_index < 0:
+                raise ValueError(f"dataset_index must be non-negative, got {dataset_index}")
+            max_index_by_dataset[dataset_name] = max(
+                max_index_by_dataset.get(dataset_name, -1), dataset_index
+            )
+
+        for dataset_name, max_index in max_index_by_dataset.items():
+            rows = self._rows_by_dataset.get(dataset_name)
+            if rows is None:
+                rows = load_dataset_rows(dataset_name, minimum_rows=max_index + 1)
+            if max_index >= len(rows):
+                raise IndexError(
+                    f"Manifest references {dataset_name}[{max_index}], but dataset has {len(rows)} rows."
+                )
+            self._rows_by_dataset[dataset_name] = rows
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        entry = self.entries[index]
+        dataset_name = str(entry["dataset_name"])
+        dataset_index = int(entry["dataset_index"])
+        sample = build_raw_sample(
+            dataset_name,
+            self._rows_by_dataset[dataset_name][dataset_index],
+            dataset_index,
+            num_video_frames=self.num_video_frames,
+            video_max_long_side=self.video_max_long_side,
+        )
+        expected_id = entry.get("sample_id")
+        if expected_id is not None and str(sample["sample_id"]) != str(expected_id):
+            raise ValueError(
+                "Manifest sample identity mismatch for "
+                f"{dataset_name}[{dataset_index}]: expected {expected_id!r}, "
+                f"loaded {sample['sample_id']!r}."
+            )
+        return sample
+
+
 def dump_original_data(
     *,
     output_dir: str,
@@ -269,20 +374,13 @@ def dump_original_data(
         dataset_samples = []
         for dataset_index in indices:
             row = rows[dataset_index]
-            if dataset_name == "gqa":
-                sample = _build_gqa_sample(row, dataset_index)
-            elif dataset_name == "coco":
-                sample = _build_coco_sample(row, dataset_index)
-            elif dataset_name == "m4_instruct":
-                sample = _build_m4_sample(row, dataset_index)
-            else:
-                sample = _build_videommmu_sample(
-                    row,
-                    dataset_index,
-                    num_frames=num_video_frames,
-                    max_long_side=video_max_long_side,
-                )
-            sample["dataset_id"] = dataset_ids[dataset_name]
+            sample = build_raw_sample(
+                dataset_name,
+                row,
+                dataset_index,
+                num_video_frames=num_video_frames,
+                video_max_long_side=video_max_long_side,
+            )
             dataset_samples.append(sample)
 
         combined_samples.extend(dataset_samples)

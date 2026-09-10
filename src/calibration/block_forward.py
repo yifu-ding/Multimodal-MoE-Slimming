@@ -4,8 +4,14 @@ import torch
 from torch import nn
 from tqdm import tqdm
 
-from observations.common import filter_model_forward_inputs, move_inputs_to_model_device, prepare_inputs
+from observations.common import (
+    _resolve_multimodal_media_token_ids,
+    filter_model_forward_inputs,
+    move_inputs_to_model_device,
+    prepare_inputs,
+)
 from src.calibration.collector import collect_scores_from_moe_module
+from src.calibration.representation_distill.common import prepare_raw_batch_inputs
 
 from .helpers.helpers import compute_block_loss, set_block_modality_masks, teacher_blocks
 from .helpers.hooks import register_copied_block_hooks, register_teacher_block_hook
@@ -25,6 +31,81 @@ __all__ = [
 ]
 
 
+def _build_fixed_score_mask(bundle, inputs, tokens_per_sample: int | None):
+    attention_mask = inputs["attention_mask"].to(torch.bool)
+    if tokens_per_sample is None:
+        return attention_mask
+    if tokens_per_sample <= 0:
+        raise ValueError(
+            f"score_tokens_per_sample must be positive, got {tokens_per_sample}"
+        )
+
+    input_ids = inputs.get("input_ids", None)
+    media_token_ids = _resolve_multimodal_media_token_ids(bundle)
+    keep_masks = []
+
+    def _uniform_positions(positions: torch.Tensor, count: int) -> torch.Tensor:
+        if count <= 0:
+            return positions[:0]
+        if count >= positions.numel():
+            return positions
+        offsets = torch.linspace(
+            0,
+            positions.numel() - 1,
+            steps=count,
+            device=positions.device,
+        ).round().long()
+        return positions.index_select(0, offsets)
+
+    for row_idx in range(attention_mask.shape[0]):
+        valid_count = int(attention_mask[row_idx].sum().item())
+        if valid_count < tokens_per_sample:
+            raise RuntimeError(
+                f"Manifest sample has only {valid_count} model tokens during collection; "
+                f"expected at least {tokens_per_sample}. The processor/model may differ "
+                "from the one used to build the manifest."
+            )
+        if input_ids is None:
+            active = attention_mask[row_idx].nonzero(as_tuple=True)[0]
+            keep = torch.zeros_like(attention_mask[row_idx])
+            keep[_uniform_positions(active, tokens_per_sample)] = True
+        else:
+            valid = attention_mask[row_idx]
+            active = valid.nonzero(as_tuple=True)[0]
+            if media_token_ids:
+                media_ids = torch.tensor(
+                    media_token_ids,
+                    device=input_ids.device,
+                    dtype=input_ids.dtype,
+                )
+                visual = active[
+                    torch.isin(input_ids[row_idx].index_select(0, active), media_ids)
+                ]
+            else:
+                visual = active[:0]
+            visual_lookup = torch.zeros_like(valid)
+            visual_lookup[visual] = True
+            text = active[~visual_lookup[active]]
+
+            visual_quota = int(
+                round(tokens_per_sample * visual.numel() / max(active.numel(), 1))
+            )
+            visual_quota = min(visual_quota, visual.numel())
+            text_quota = min(tokens_per_sample - visual_quota, text.numel())
+            visual_quota = min(tokens_per_sample - text_quota, visual.numel())
+
+            keep = torch.zeros_like(valid)
+            keep[_uniform_positions(visual, visual_quota)] = True
+            keep[_uniform_positions(text, text_quota)] = True
+        if int(keep.sum().item()) != tokens_per_sample:
+            raise RuntimeError(
+                f"Failed to construct an exact {tokens_per_sample}-token score mask; "
+                f"got {int(keep.sum().item())}."
+            )
+        keep_masks.append(keep)
+    return torch.stack(keep_masks, dim=0)
+
+
 def block_forward(
     bundle,
     cnt_block: nn.Module,
@@ -32,11 +113,14 @@ def block_forward(
     dataloader,
     dataset_name: str,
     saliency_ema: float,
+    score_aggregation: str = "mean",
     fill_zero_for_unrouted: bool = False,
     loss_fn: str = "rel_l2",
     second_order_mode: str = "exact",
     dtype: torch.dtype = torch.bfloat16,
     verbose: bool = False,
+    raw_samples: bool = False,
+    score_tokens_per_sample: int | None = None,
 ):
     model = bundle.model
     model.eval()
@@ -61,9 +145,16 @@ def block_forward(
         iterator = tqdm(dataloader, desc=f"Calibrating L{layer_idx}", disable=not verbose, leave=False)
         for batch in iterator:
             teacher_state.clear()
-            inputs = prepare_inputs(bundle, batch, dataset_name)
+            inputs = (
+                prepare_raw_batch_inputs(bundle, batch)
+                if raw_samples
+                else prepare_inputs(bundle, batch, dataset_name)
+            )
             inputs = move_inputs_to_model_device(model, inputs)
             attn_mask = inputs["attention_mask"].to(block_device)
+            score_mask = _build_fixed_score_mask(
+                bundle, inputs, score_tokens_per_sample
+            ).to(block_device)
             input_ids = inputs.get("input_ids", None)
             moe_text_mask = torch.zeros_like(attn_mask, dtype=torch.bool)
             moe_media_mask = torch.zeros_like(attn_mask, dtype=torch.bool)
@@ -78,6 +169,8 @@ def block_forward(
                 )
                 moe_text_mask = flat_text_mask.view_as(attn_mask)
                 moe_media_mask = flat_media_mask.view_as(attn_mask)
+            if hasattr(cnt_block, "mlp"):
+                cnt_block.mlp.moe_score_mask = score_mask.view(-1, 1)
 
             with torch.no_grad():
                 model(**filter_model_forward_inputs(model, inputs), use_cache=False, return_dict=True)
@@ -100,7 +193,7 @@ def block_forward(
                 loss_sum, rel_l2_inv_base_mean = compute_block_loss(
                     pred=pred,
                     teacher_target=teacher_target,
-                    attn_mask=attn_mask,
+                    attn_mask=score_mask,
                     loss_fn=loss_fn,
                 )
 
@@ -111,7 +204,7 @@ def block_forward(
             # gradients reflecting each channel's contribution to the block
             # output. This does NOT affect second-order scores (computed
             # independently from saved activations, not from backward).
-            mask_flat = attn_mask.float().view(-1)
+            mask_flat = score_mask.float().view(-1)
             energy = pred.float().view(-1, pred.size(-1)).pow(2).sum(dim=-1)
             energy_loss = (energy * mask_flat).sum()
             energy_loss.backward()
@@ -122,10 +215,11 @@ def block_forward(
             second_order_sum = collect_scores_from_moe_module(
                 cnt_block,
                 ema=saliency_ema,
+                aggregation=score_aggregation,
                 _kwargs={
                     "use_mlp_scores": True,
                     "use_attn_scores": False,
-                    "attn_mask": attn_mask,
+                    "attn_mask": score_mask,
                     "block_in_args": in_args,
                     "block_in_kwargs": in_kwargs,
                     "teacher_target": teacher_target,
@@ -139,8 +233,8 @@ def block_forward(
                     "autocast_device_type": device_type,
                     "layer_idx": layer_idx,
                     "debug_batch_idx": total_batches - 1,
-                    "moe_text_mask": moe_text_mask.view_as(attn_mask),
-                    "moe_media_mask": moe_media_mask.view_as(attn_mask),
+                    "moe_text_mask": moe_text_mask.view_as(score_mask),
+                    "moe_media_mask": moe_media_mask.view_as(score_mask),
                 },
             )
             total_second_order_sum += second_order_sum

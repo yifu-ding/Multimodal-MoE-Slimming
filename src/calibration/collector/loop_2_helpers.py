@@ -1,4 +1,5 @@
 import contextlib
+import gc
 import os
 import torch.nn as nn
 import types
@@ -13,6 +14,27 @@ from src.calibration.helpers.utils import (
     get_fused_intermediate_size,
     split_fused_gate_up_tensor,
 )
+
+
+_AUTO_SECOND_ORDER_CHUNK_SIZES = {}
+
+
+def _is_cuda_oom(error: BaseException) -> bool:
+    oom_type = getattr(torch.cuda, "OutOfMemoryError", ())
+    return (bool(oom_type) and isinstance(error, oom_type)) or (
+        isinstance(error, RuntimeError) and "out of memory" in str(error).lower()
+    )
+
+
+def _second_order_autotune_key(context: dict, num_experts: int):
+    target = context["teacher_target"]
+    batch_size = int(target.shape[0]) if target.ndim >= 3 else 1
+    return (str(target.device), str(target.dtype), int(num_experts), batch_size)
+
+
+def reset_second_order_chunk_autotune() -> None:
+    """Clear process-local tuning state, primarily for tests and model reloads."""
+    _AUTO_SECOND_ORDER_CHUNK_SIZES.clear()
 
 
 class _LinearWeightView:
@@ -462,11 +484,13 @@ def compute_expert_second_order(
     return second_value
 
 
-def compute_expert_second_order_batched(
+def _compute_expert_second_order_batched_once(
     cnt_block: nn.Module,
     experts,
     has_activation_mask,
     _kwargs: dict,
+    *,
+    chunk_size: int,
 ):
     context = get_block_eval_context(_kwargs)
     if context is None:
@@ -476,7 +500,6 @@ def compute_expert_second_order_batched(
     has_activation = torch.as_tensor(has_activation_mask, device=device, dtype=torch.bool)
     num_experts = int(has_activation.numel())
     active_indices = has_activation.nonzero(as_tuple=False).flatten()
-    chunk_size = int(os.getenv("SECOND_ORDER_CHUNK_SIZE", "8"))
     if chunk_size <= 0:
         raise ValueError(f"SECOND_ORDER_CHUNK_SIZE must be positive, got {chunk_size}")
     alpha = torch.ones(num_experts, device=device, dtype=torch.float32, requires_grad=True)
@@ -542,6 +565,80 @@ def compute_expert_second_order_batched(
         cnt_block.zero_grad(set_to_none=True)
 
     return second_value.masked_fill(~has_activation, 0.0)
+
+
+def compute_expert_second_order_batched(
+    cnt_block: nn.Module,
+    experts,
+    has_activation_mask,
+    _kwargs: dict,
+):
+    """Compute expert Hessian scores with process-local CUDA OOM autotuning.
+
+    ``SECOND_ORDER_CHUNK_SIZE=auto`` starts with all active experts (optionally
+    capped by ``SECOND_ORDER_MAX_CHUNK_SIZE``), halves on CUDA OOM, and reuses
+    the successful size for matching model/batch shapes during this process.
+    An integer chunk size disables autotuning for reproducible ablations.
+    """
+    context = get_block_eval_context(_kwargs)
+    if context is None:
+        return None
+
+    num_experts = len(has_activation_mask)
+    active_count = sum(bool(value) for value in has_activation_mask)
+    raw_chunk_size = os.getenv("SECOND_ORDER_CHUNK_SIZE", "auto").strip().lower()
+    auto = raw_chunk_size in {"", "auto"}
+    tuning_key = _second_order_autotune_key(context, num_experts)
+
+    if auto:
+        configured_cap = int(os.getenv("SECOND_ORDER_MAX_CHUNK_SIZE", "0"))
+        initial = max(active_count, 1)
+        if configured_cap > 0:
+            initial = min(initial, configured_cap)
+        chunk_size = min(_AUTO_SECOND_ORDER_CHUNK_SIZES.get(tuning_key, initial), initial)
+    else:
+        chunk_size = int(raw_chunk_size)
+        if chunk_size <= 0:
+            raise ValueError(
+                f"SECOND_ORDER_CHUNK_SIZE must be `auto` or a positive integer, got {raw_chunk_size!r}"
+            )
+
+    while True:
+        try:
+            result = _compute_expert_second_order_batched_once(
+                cnt_block=cnt_block,
+                experts=experts,
+                has_activation_mask=has_activation_mask,
+                _kwargs=_kwargs,
+                chunk_size=chunk_size,
+            )
+        except Exception as error:
+            if not auto or not _is_cuda_oom(error) or chunk_size <= 1:
+                raise
+            next_chunk_size = max(1, chunk_size // 2)
+            print(
+                "[second-order autotune] CUDA OOM with expert group "
+                f"size={chunk_size}; retrying with size={next_chunk_size}.",
+                flush=True,
+            )
+            cnt_block.zero_grad(set_to_none=True)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            chunk_size = next_chunk_size
+            continue
+
+        if auto:
+            previous = _AUTO_SECOND_ORDER_CHUNK_SIZES.get(tuning_key)
+            _AUTO_SECOND_ORDER_CHUNK_SIZES[tuning_key] = chunk_size
+            if previous != chunk_size:
+                print(
+                    "[second-order autotune] selected expert group "
+                    f"size={chunk_size} for batch_size={tuning_key[-1]}, "
+                    f"num_experts={num_experts} (process-local).",
+                    flush=True,
+                )
+        return result
 
 
 def compute_true_ablate_attr(

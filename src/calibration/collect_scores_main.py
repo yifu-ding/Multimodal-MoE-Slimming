@@ -1,5 +1,7 @@
 import argparse
 import copy
+import hashlib
+import json
 import os
 import random
 import sys
@@ -29,6 +31,9 @@ from src.calibration.helpers.helpers import teacher_block
 from src.calibration.block_forward import block_forward
 
 from src.calibration.score_accumulator import ScoreAccumulator
+from src.calibration.representation_distill.runtime.dump_original_data import (
+    ManifestRawDataset,
+)
 
 
 def save_score_artifacts(output_dir: str, accumulator: ScoreAccumulator, args) -> None:
@@ -46,6 +51,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--model_name_or_path", type=str, required=True)
     p.add_argument("--output_dir", type=str, required=True)
     p.add_argument("--dataset", type=str, default="gqa")
+    p.add_argument(
+        "--selection_manifest",
+        type=str,
+        default=None,
+        help="Frozen mixed-calibration manifest. When set, --dataset/start_idx/subset_seed selection is bypassed.",
+    )
     p.add_argument("--num_samples", type=int, default=128)
     p.add_argument("--token_per_sample", type=int, default=2048)
     p.add_argument(
@@ -59,9 +70,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--subset_seed", type=int, default=42)
     p.add_argument("--ema", type=float, default=0.9)
     p.add_argument(
+        "--aggregation",
+        type=str,
+        default="mean",
+        choices=["mean", "ema"],
+        help="Aggregate per-batch scores with an order-independent arithmetic mean or legacy EMA.",
+    )
+    p.add_argument(
         "--fill_zero_for_unrouted",
         action="store_true",
-        help="EMA-update unrouted experts with zero-filled loop_1 activations instead of leaving previous values untouched.",
+        help="Update unrouted experts with zero-filled loop_1 activations instead of leaving them untouched.",
     )
     p.add_argument(
         "--loss_fn",
@@ -92,6 +110,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--force", "-f", action="store_true")
     return p
+
+
+def _identity_collate(batch):
+    return batch
+
+
+def _load_selection_manifest(path: str) -> tuple[dict, str]:
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    payload = json.loads(raw.decode("utf-8"))
+    if not isinstance(payload, dict) or not isinstance(payload.get("samples"), list):
+        raise ValueError("Selection manifest must be a JSON object containing a `samples` list.")
+    if int(payload.get("schema_version", -1)) != 1:
+        raise ValueError(
+            f"Unsupported selection manifest schema_version={payload.get('schema_version')!r}; expected 1."
+        )
+    samples = payload["samples"]
+    if not samples:
+        raise ValueError("Selection manifest contains no samples.")
+    score_tokens_per_sample = int(payload.get("score_tokens_per_sample", 0))
+    if score_tokens_per_sample <= 0:
+        raise ValueError(
+            "Selection manifest must define a positive score_tokens_per_sample."
+        )
+    required_sample_fields = {"dataset_name", "dataset_index", "sample_id"}
+    for sample_idx, sample in enumerate(samples):
+        missing = sorted(required_sample_fields - set(sample))
+        if missing:
+            raise ValueError(
+                f"Manifest sample {sample_idx} is missing required fields: {missing}."
+            )
+    ranks = [int(item.get("selection_rank", idx)) for idx, item in enumerate(samples)]
+    if sorted(ranks) != list(range(len(samples))):
+        raise ValueError("Manifest selection_rank values must be exactly 0..num_samples-1.")
+    payload["samples"] = [item for _, item in sorted(zip(ranks, samples))]
+    return payload, hashlib.sha256(raw).hexdigest()
 
 
 def _count_sample_tokens(bundle, dataset_name: str, sample: Dict) -> int:
@@ -214,9 +268,27 @@ def _assert_cuda_runtime_compat(device_map: str) -> None:
 
 
 def run_collection(args) -> None:
-    args.dataset = normalize_dataset_name(args.dataset)
+    selection_manifest = None
+    if args.selection_manifest:
+        selection_manifest, manifest_sha256 = _load_selection_manifest(
+            args.selection_manifest
+        )
+        args.dataset = "mixed"
+        args.selection_manifest_sha256 = manifest_sha256
+        args.selection_source_summary = selection_manifest.get("source_summary", {})
+        args.score_tokens_per_sample = int(
+            selection_manifest["score_tokens_per_sample"]
+        )
+        args.score_token_sampling = selection_manifest.get(
+            "score_token_sampling",
+            "per_sample_proportional_modality_uniform_positions",
+        )
+    else:
+        args.dataset = normalize_dataset_name(args.dataset)
+        args.score_tokens_per_sample = None
+        args.score_token_sampling = None
     supported_datasets = {"gqa", "coco", "video_mmmu", "m4_instruct", "star"}
-    if args.dataset not in supported_datasets:
+    if selection_manifest is None and args.dataset not in supported_datasets:
         raise ValueError(
             f"Unsupported dataset: {args.dataset}. "
             f"Supported datasets: {sorted(supported_datasets)}"
@@ -253,17 +325,38 @@ def run_collection(args) -> None:
         f"{sum(layer_to_num_experts.values())} experts total."
     )
 
-    dataset = _build_calibration_dataset(bundle, args)
-    indices = _select_calibration_indices(dataset, bundle, args)
-    args.selected_num_samples = len(indices)
-
-    subset = Subset(dataset, indices)
-    loader = DataLoader(
-        subset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=custom_collate_fn,
-    )
+    if selection_manifest is not None:
+        manifest_samples = selection_manifest["samples"]
+        dataset = ManifestRawDataset(
+            manifest_samples,
+            num_video_frames=int(selection_manifest.get("num_video_frames", 8)),
+            video_max_long_side=int(
+                selection_manifest.get("video_max_long_side", 480)
+            ),
+        )
+        args.num_samples = len(manifest_samples)
+        args.selected_num_samples = len(manifest_samples)
+        loader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=_identity_collate,
+        )
+        print(
+            f"[calibration] Loaded frozen mixed selection with {len(dataset)} samples "
+            f"from {args.selection_manifest} (sha256={args.selection_manifest_sha256[:12]}...)."
+        )
+    else:
+        dataset = _build_calibration_dataset(bundle, args)
+        indices = _select_calibration_indices(dataset, bundle, args)
+        args.selected_num_samples = len(indices)
+        subset = Subset(dataset, indices)
+        loader = DataLoader(
+            subset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=custom_collate_fn,
+        )
 
     print("[calibration] Collecting block-reconstruction scores with attn_mlp collector...")
     target_layers = accumulator.layers
@@ -299,10 +392,13 @@ def run_collection(args) -> None:
             dataloader=loader,
             dataset_name=args.dataset,
             saliency_ema=args.ema,
+            score_aggregation=args.aggregation,
             fill_zero_for_unrouted=args.fill_zero_for_unrouted,
             loss_fn=args.loss_fn,
             dtype=block_dtype,
             verbose=True,
+            raw_samples=selection_manifest is not None,
+            score_tokens_per_sample=args.score_tokens_per_sample,
         )
         accumulator.layerwise_loss[layer_idx] = float(layer_loss)
         accumulator.layerwise_second_order_sum[layer_idx] = float(layer_second_order_sum)

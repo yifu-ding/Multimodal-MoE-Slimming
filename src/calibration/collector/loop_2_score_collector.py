@@ -28,6 +28,7 @@ def loop_2_score_collector(
     is_fused: bool,
     fused_metric_stacks: dict,
     ema: float,
+    aggregation: str = "mean",
     _kwargs: dict = None,
 ):
     profile_second_order = os.getenv("SECOND_ORDER_PROFILE", "0") == "1"
@@ -91,11 +92,29 @@ def loop_2_score_collector(
         else:
             if not record["has_activation"]:
                 # 如果没有被激活，则fillzero累加，但不计入second_attr
-                safe_add_with_ema(expert, ema, second_exact_attr, "second_attr_fillzero")
+                safe_update_running_stat(
+                    expert,
+                    second_exact_attr,
+                    key="second_attr_fillzero",
+                    aggregation=aggregation,
+                    ema=ema,
+                )
             else:
                 # 如果被激活过，则两者都累积
-                safe_add_with_ema(expert, ema, second_exact_attr, "second_attr")
-                safe_add_with_ema(expert, ema, second_exact_attr, "second_attr_fillzero")
+                safe_update_running_stat(
+                    expert,
+                    second_exact_attr,
+                    key="second_attr",
+                    aggregation=aggregation,
+                    ema=ema,
+                )
+                safe_update_running_stat(
+                    expert,
+                    second_exact_attr,
+                    key="second_attr_fillzero",
+                    aggregation=aggregation,
+                    ema=ema,
+                )
 
         if not record["has_activation"]:
             # 如果没有被激活，则channelwise second_order_exact不累积
@@ -132,11 +151,29 @@ def loop_2_score_collector(
                     fused_metric_stacks.setdefault("down_second_order_exact_visual", {})[expert_idx] = \
                         down_second_order_exact_visual.detach()
             else:
-                safe_add_with_ema(expert, ema, down_second_order_exact, "down_second_order_exact")
+                safe_update_running_stat(
+                    expert,
+                    down_second_order_exact,
+                    key="down_second_order_exact",
+                    aggregation=aggregation,
+                    ema=ema,
+                )
                 if down_second_order_exact_text is not None:
-                    safe_add_with_ema(expert, ema, down_second_order_exact_text, "down_second_order_exact_text")
+                    safe_update_running_stat(
+                        expert,
+                        down_second_order_exact_text,
+                        key="down_second_order_exact_text",
+                        aggregation=aggregation,
+                        ema=ema,
+                    )
                 if down_second_order_exact_visual is not None:
-                    safe_add_with_ema(expert, ema, down_second_order_exact_visual, "down_second_order_exact_visual")
+                    safe_update_running_stat(
+                        expert,
+                        down_second_order_exact_visual,
+                        key="down_second_order_exact_visual",
+                        aggregation=aggregation,
+                        ema=ema,
+                    )
 
         '''
         true_ablate = compute_true_ablate_attr(

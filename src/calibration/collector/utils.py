@@ -36,29 +36,110 @@ def get_fused_saved_tensor(experts: nn.Module, name: str, expert_idx: int):
     return value[expert_idx]
 
 
-def safe_add_with_ema(target, ema, value, key=None):
+_RUNNING_MEAN_COUNT_SUFFIX = "_running_mean_count"
+
+
+def safe_update_running_stat(target, value, *, key, aggregation="mean", ema=0.9):
+    """Update one module metric with an order-independent mean or legacy EMA."""
+    if aggregation not in {"mean", "ema"}:
+        raise ValueError(f"Unsupported score aggregation: {aggregation}")
     if isinstance(value, torch.Tensor):
         value = value.detach()
-
-    def ema_update(old, new):
-        if isinstance(new, torch.Tensor):
-            if old is None:
-                return new.clone()
-            if isinstance(old, torch.Tensor):
-                old.mul_(ema).add_(new, alpha=1.0 - ema)
-                return old
-            # e.g. attribute was seeded with 0.0 before first tensor observation
-            if isinstance(old, numbers.Number):
-                return torch.as_tensor(old, dtype=new.dtype, device=new.device) * ema + new * (1.0 - ema)
-            raise TypeError(f"EMA previous value must be None, Tensor, or scalar number, got {type(old)}")
-        return new if old is None else old * ema + new * (1.0 - ema)
-
-    if key is None:
-        return ema_update(target, value)
-
     assert isinstance(target, nn.Module), f"target must be nn.Module, got {type(target)}"
     old = getattr(target, key, None)
-    setattr(target, key, ema_update(old, value))
+    count_key = f"_{key}{_RUNNING_MEAN_COUNT_SUFFIX}"
+    count = int(getattr(target, count_key, 0))
+
+    if old is None or count == 0:
+        updated = value.clone() if isinstance(value, torch.Tensor) else value
+    elif aggregation == "ema":
+        if isinstance(value, torch.Tensor):
+            if isinstance(old, torch.Tensor):
+                updated = old.mul(ema).add(value, alpha=1.0 - ema)
+            elif isinstance(old, numbers.Number):
+                updated = torch.as_tensor(old, dtype=value.dtype, device=value.device) * ema
+                updated = updated + value * (1.0 - ema)
+            else:
+                raise TypeError(
+                    f"EMA previous value must be Tensor or scalar number, got {type(old)}"
+                )
+        else:
+            updated = old * ema + value * (1.0 - ema)
+    else:
+        # Stable online mean. The count belongs to this exact expert/metric pair,
+        # so sparse routing does not dilute a routed-only metric with missing data.
+        if isinstance(value, torch.Tensor):
+            if not isinstance(old, torch.Tensor):
+                old = torch.as_tensor(old, dtype=value.dtype, device=value.device)
+            updated = old + (value - old) / float(count + 1)
+        else:
+            updated = old + (value - old) / float(count + 1)
+
+    setattr(target, key, updated)
+    setattr(target, count_key, count + 1)
+
+
+def safe_add_with_ema(target, ema, value, key=None):
+    """Backward-compatible wrapper for callers outside the score collector."""
+    if key is None:
+        if isinstance(value, torch.Tensor):
+            value = value.detach()
+            if target is None:
+                return value.clone()
+            if isinstance(target, torch.Tensor):
+                return target.mul(ema).add(value, alpha=1.0 - ema)
+            old = torch.as_tensor(target, dtype=value.dtype, device=value.device)
+            return old * ema + value * (1.0 - ema)
+        return value if target is None else target * ema + value * (1.0 - ema)
+    safe_update_running_stat(target, value, key=key, aggregation="ema", ema=ema)
+
+
+def update_fused_running_stats(
+    target,
+    key,
+    per_expert,
+    *,
+    num_experts,
+    device,
+    aggregation="mean",
+    ema=0.9,
+    accumulate_sum=False,
+):
+    """Commit sparse per-expert values to a fused expert container."""
+    if not per_expert:
+        return
+    if aggregation not in {"mean", "ema"}:
+        raise ValueError(f"Unsupported score aggregation: {aggregation}")
+
+    template = next(iter(per_expert.values())).detach().to(device=device, dtype=torch.float32)
+    current = getattr(target, key, None)
+    if current is None:
+        current = torch.zeros((num_experts, *template.shape), dtype=torch.float32, device=device)
+    else:
+        current = current.detach().to(device=device, dtype=torch.float32)
+
+    count_key = f"_{key}{_RUNNING_MEAN_COUNT_SUFFIX}"
+    counts = getattr(target, count_key, None)
+    if counts is None:
+        counts = torch.zeros(num_experts, dtype=torch.int64, device=device)
+    else:
+        counts = counts.detach().to(device=device, dtype=torch.int64)
+
+    for expert_idx, raw_value in per_expert.items():
+        value = raw_value.detach().to(device=device, dtype=torch.float32)
+        count = int(counts[expert_idx].item())
+        if accumulate_sum:
+            current[expert_idx].add_(value)
+        elif count == 0:
+            current[expert_idx] = value
+        elif aggregation == "ema":
+            current[expert_idx].mul_(ema).add_(value, alpha=1.0 - ema)
+        else:
+            current[expert_idx].add_((value - current[expert_idx]) / float(count + 1))
+        counts[expert_idx] += 1
+
+    setattr(target, key, current)
+    setattr(target, count_key, counts)
 
 
 def unwrap_output(output):
@@ -93,6 +174,7 @@ def get_saved_tensors(
         gate_grad = get_fused_saved_tensor(experts, "saved_gate_grad", expert_idx)
         text_mask = get_fused_saved_tensor(experts, "saved_text_mask", expert_idx)
         visual_mask = get_fused_saved_tensor(experts, "saved_visual_mask", expert_idx)
+        score_mask = get_fused_saved_tensor(experts, "saved_score_mask", expert_idx)
         router_weights = get_fused_saved_tensor(experts, "saved_router_weights", expert_idx)
 
         W_down = down_proj_t[expert_idx]
@@ -131,9 +213,11 @@ def get_saved_tensors(
         expert.gate_proj.saved_grad_out = None
         text_mask = getattr(expert, "saved_text_mask", None)
         visual_mask = getattr(expert, "saved_visual_mask", None)
+        score_mask = getattr(expert, "saved_score_mask", None)
         router_weights = getattr(expert, "saved_router_weights", None)
         expert.saved_text_mask = None
         expert.saved_visual_mask = None
+        expert.saved_score_mask = None
         expert.saved_router_weights = None
 
         W_down, W_up, W_gate = expert.down_proj.weight, expert.up_proj.weight, expert.gate_proj.weight
@@ -157,6 +241,7 @@ def get_saved_tensors(
         gate_grad,
         text_mask,
         visual_mask,
+        score_mask,
         router_weights,
         W_down,
         W_up,

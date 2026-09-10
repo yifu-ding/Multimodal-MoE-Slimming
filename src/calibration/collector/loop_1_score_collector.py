@@ -17,6 +17,7 @@ def loop_1_score_collector(
     gate_grad_w,
     fused_metric_stacks: dict,
     ema: float,
+    aggregation: str = "mean",
     fill_zero_for_unrouted: bool = False,
     _kwargs: dict = None,
 ):
@@ -59,6 +60,7 @@ def loop_1_score_collector(
         gate_grad: torch.Tensor = None,
         text_mask: torch.Tensor = None,
         visual_mask: torch.Tensor = None,
+        score_mask: torch.Tensor = None,
         router_weights: torch.Tensor = None,
         attn_mask: torch.Tensor = None,
         force_zero_metrics: bool = False,
@@ -80,23 +82,8 @@ def loop_1_score_collector(
             gate_grad = _make_zero_tensor(num_channels, ref=W_gate)
             text_mask = torch.zeros(1, dtype=torch.bool, device=W_down.device)
             visual_mask = torch.zeros(1, dtype=torch.bool, device=W_down.device)
+            score_mask = torch.zeros(1, dtype=torch.bool, device=W_down.device)
             router_weights = torch.zeros(1, dtype=torch.float32, device=W_down.device)
-
-        _sanity_check_tensors(
-            expert_idx,
-            down_input=down_input,
-            down_output=down_output,
-            down_in_grad=down_in_grad,
-            down_out_grad=down_out_grad,
-            up_input=up_input,
-            up_output=up_output,
-            up_in_grad=up_in_grad,
-            up_out_grad=up_out_grad,
-            gate_input=gate_input,
-            gate_output=gate_output,
-            gate_in_grad=gate_in_grad,
-            gate_grad=gate_grad,
-        )
 
         # Some runtime paths (for example synthetic-hidden calibration smoke tests)
         # may not populate every backward hook tensor even when the routed expert
@@ -114,8 +101,70 @@ def loop_1_score_collector(
             gate_in_grad = torch.zeros_like(gate_input)
         if gate_grad is None and gate_output is not None:
             gate_grad = torch.zeros_like(gate_output)
+
+        _sanity_check_tensors(
+            expert_idx,
+            down_input=down_input,
+            down_output=down_output,
+            down_in_grad=down_in_grad,
+            down_out_grad=down_out_grad,
+            up_input=up_input,
+            up_output=up_output,
+            up_in_grad=up_in_grad,
+            up_out_grad=up_out_grad,
+            gate_input=gate_input,
+            gate_output=gate_output,
+            gate_in_grad=gate_in_grad,
+            gate_grad=gate_grad,
+        )
+
+        if score_mask is None:
+            score_mask = torch.ones(
+                down_input.shape[0], dtype=torch.bool, device=down_input.device
+            )
+        else:
+            score_mask = score_mask.to(device=down_input.device).view(-1).bool()
+            if score_mask.numel() != down_input.shape[0]:
+                raise ValueError(
+                    f"Expert {expert_idx} score mask has {score_mask.numel()} entries, "
+                    f"but routed activations contain {down_input.shape[0]} tokens."
+                )
+
+        affinity_text_count = (
+            float(text_mask.sum().item())
+            if isinstance(text_mask, torch.Tensor)
+            else 0.0
+        )
+        affinity_visual_count = (
+            float(visual_mask.sum().item())
+            if isinstance(visual_mask, torch.Tensor)
+            else 0.0
+        )
+        metrics = {
+            "token_count_text": affinity_text_count,
+            "token_count_visual": affinity_visual_count,
+        }
+        has_score_tokens = bool(score_mask.any())
+        if not has_score_tokens and not force_zero_metrics:
+            return metrics
+        metric_mask = (
+            torch.ones_like(score_mask) if force_zero_metrics else score_mask
+        )
+
+        def _mask_rows(value: torch.Tensor) -> torch.Tensor:
+            return value[metric_mask.to(value.device)]
+
+        score_text_mask = (
+            text_mask.to(device=down_input.device).view(-1).bool() & score_mask
+            if isinstance(text_mask, torch.Tensor)
+            else torch.zeros_like(score_mask)
+        )
+        score_visual_mask = (
+            visual_mask.to(device=down_input.device).view(-1).bool() & score_mask
+            if isinstance(visual_mask, torch.Tensor)
+            else torch.zeros_like(score_mask)
+        )
         
-        metrics = {}
         if "weight" in CHANNEL_METRICS:
             metrics["weight"] = (
                 weight_rms(W_down, channel_dim=1)
@@ -134,62 +183,78 @@ def loop_1_score_collector(
 
         down_grad_ch = up_out_grad_ch = gate_grad_ch = down_act = None
         if "3proj_grad" in CHANNEL_METRICS or "3proj_saliency" in CHANNEL_METRICS or "down_saliency" in CHANNEL_METRICS:
-            metrics["3proj_grad"], down_grad_ch, up_out_grad_ch, gate_grad_ch = compute_grad_I(
-                down_in_grad, up_out_grad, gate_grad
-            )
+            down_grad_ch = masked_channel_rms(down_in_grad, metric_mask)
+            up_out_grad_ch = masked_channel_rms(up_out_grad, metric_mask)
+            gate_grad_ch = masked_channel_rms(gate_grad, metric_mask)
+            metrics["3proj_grad"] = (
+                down_grad_ch + up_out_grad_ch + gate_grad_ch
+            ) / 3.0
         if "3proj_saliency" in CHANNEL_METRICS:
-            metrics["3proj_saliency"] = compute_3proj_saliency_I(
-                down_input, down_grad_ch, up_output, up_out_grad_ch, gate_output, gate_grad_ch
+            metrics["3proj_saliency"] = compute_3proj_saliency_I_masked(
+                down_input,
+                down_in_grad,
+                up_output,
+                up_out_grad,
+                gate_output,
+                gate_grad,
+                metric_mask,
             )
         if "down_saliency" in CHANNEL_METRICS:
-            metrics["down_saliency"] = compute_saliency_I(down_input, down_grad_ch)
+            metrics["down_saliency"] = channel_saliency_masked(
+                down_input, down_in_grad, metric_mask
+            )
             
         if "3proj_act" in CHANNEL_METRICS:
-            metrics["3proj_act"], down_act = compute_activation_I(down_input, up_output, gate_output)
+            metrics["3proj_act"] = compute_activation_I_masked(
+                down_input, up_output, gate_output, metric_mask
+            )
         if "wa" in CHANNEL_METRICS or "3proj_act" in CHANNEL_METRICS:
-            metrics["wa"] = compute_wa_I(
+            metrics["wa"] = compute_wa_I_masked(
                 W_down=W_down,
                 W_up=W_up,
                 W_gate=W_gate,
-                down_ch_act=down_act,
+                down_input=down_input,
                 up_input=up_input,
                 gate_input=gate_input,
-            )
-        if "3proj_saliency" in CHANNEL_METRICS:
-            if down_grad_ch is None:
-                down_grad_ch = channel_rms(down_in_grad).to(torch.float32)
-            if up_out_grad_ch is None:
-                up_out_grad_ch = channel_rms(up_out_grad).to(torch.float32)
-            if gate_grad_ch is None:
-                gate_grad_ch = channel_rms(gate_grad).to(torch.float32)
-            metrics["3proj_saliency"] = compute_3proj_saliency_I(
-                down_input, down_grad_ch, up_output, up_out_grad_ch, gate_output, gate_grad_ch
+                token_mask=metric_mask,
             )
         if "gateup_act" in CHANNEL_METRICS:
-            metrics["gateup_act"] = compute_gateup_act(activation_owner, gate_output, up_output)
+            metrics["gateup_act"] = compute_gateup_act(
+                activation_owner, gate_output, up_output, token_mask=metric_mask
+            )
         if "down_second_order_approx" in CHANNEL_METRICS:
-            metrics["down_second_order_approx"] = compute_channel_hessian_diag(W_down, down_input, None)
+            metrics["down_second_order_approx"] = compute_channel_hessian_diag(
+                W_down, down_input, metric_mask
+            )
+        if "3proj_second_order" in CHANNEL_METRICS:
+            metrics["3proj_second_order"] = compute_3linear_hessian_diag(
+                W_down, W_up, W_gate, down_input, up_output, gate_output, metric_mask
+            )
         
         # 算 expertwise 的 usage、router 
-        total_tokens = float(down_output.shape[0])
+        scored_routed_tokens = float(score_mask.sum().item())
+        total_tokens = scored_routed_tokens
         if attn_mask is not None:
             total_tokens = float(attn_mask.sum().item())
-            metrics["usage"] = float(down_output.shape[0]) / max(total_tokens, 1.0)
+        metrics["usage"] = scored_routed_tokens / max(total_tokens, 1.0)
         if router_weights is not None:
-            metrics["router"] = float(router_weights.detach().float().sum().item()) / max(total_tokens, 1.0)
+            selected_router_weights = _mask_rows(router_weights.view(-1))
+            metrics["router"] = float(
+                selected_router_weights.detach().float().sum().item()
+            ) / max(total_tokens, 1.0)
 
         # 算 expert 输出 first_attr，这个其实算的是 epertwise loss
-        first_attr = token_contrib(down_out_grad, down_output).sum() # * usage
+        first_attr = token_contrib(
+            _mask_rows(down_out_grad), _mask_rows(down_output)
+        ).sum()
         metrics["first_attr"] = float(first_attr.item())
 
-        t_count = float(text_mask.sum().item()) if isinstance(text_mask, torch.Tensor) else 0.0
-        v_count = float(visual_mask.sum().item()) if isinstance(visual_mask, torch.Tensor) else 0.0
-        metrics["token_count_text"] = t_count
-        metrics["token_count_visual"] = v_count
+        t_count = float(score_text_mask.sum().item())
+        v_count = float(score_visual_mask.sum().item())
 
         for suffix, token_mask, token_count in (
-            ("text", text_mask, t_count),
-            ("visual", visual_mask, v_count),
+            ("text", score_text_mask, t_count),
+            ("visual", score_visual_mask, v_count),
         ):
             if token_count <= 0:
                 continue
@@ -234,8 +299,7 @@ def loop_1_score_collector(
                 metrics[f"3proj_saliency_{suffix}"] = compute_3proj_saliency_I_masked(
                     down_input, down_in_grad, up_output, up_out_grad, gate_output, gate_grad, token_mask
                 )
-            if f"usage_{suffix}" in CHANNEL_METRICS:
-                metrics[f"usage_{suffix}"] = ratio
+            metrics[f"usage_{suffix}"] = ratio
         
         # ema_matrix 在外部计算过了，我感觉不用 ema 平滑来算
         # Expert Modality Affinity: (visual - text) / (visual + text + eps), per batch, EMA-accumulated.
@@ -262,7 +326,7 @@ def loop_1_score_collector(
         activation_owner, down_input, down_output, down_in_grad, \
         down_out_grad, up_input, up_output, up_in_grad, up_out_grad, \
         gate_input, gate_output, gate_in_grad, gate_grad, text_mask, \
-        visual_mask, router_weights, W_down, W_up, W_gate, W_down_grad, \
+        visual_mask, score_mask, router_weights, W_down, W_up, W_gate, W_down_grad, \
         W_up_grad, W_gate_grad = get_saved_tensors(
             experts=experts, expert_idx=expert_idx, is_fused=is_fused, expert=expert,
             down_proj_t=down_proj_t, up_proj=up_proj, gate_proj=gate_proj, down_grad_t=down_grad_t,
@@ -289,7 +353,9 @@ def loop_1_score_collector(
                         torch.zeros((), dtype=torch.float32, device=experts.gate_up_proj.device)
             else:
                 for key in ("first_attr_fillzero", "usage_fillzero", "router_fillzero"):
-                    safe_add_with_ema(expert, ema, 0.0, key)
+                    safe_update_running_stat(
+                        expert, 0.0, key=key, aggregation=aggregation, ema=ema
+                    )
             continue
 
         with torch.no_grad():
@@ -316,6 +382,7 @@ def loop_1_score_collector(
                 gate_grad=gate_grad,
                 text_mask=text_mask,
                 visual_mask=visual_mask,
+                score_mask=score_mask,
                 router_weights=router_weights,
                 attn_mask=None if _kwargs is None else _kwargs.get("attn_mask", None),
                 force_zero_metrics=force_zero_metrics,
@@ -337,10 +404,15 @@ def loop_1_score_collector(
                         current = float(getattr(expert, key, 0.0))
                         setattr(expert, key, current + float(value))
                     else:
-                        safe_add_with_ema(expert, ema, value, key)
-            expert_records.append({"expert_idx": expert_idx, 
-                                   "expert": expert, 
-                                   "has_activation": down_input is not None, 
+                        safe_update_running_stat(
+                            expert, value, key=key, aggregation=aggregation, ema=ema
+                        )
+            has_scored_activation = down_input is not None and (
+                score_mask is None or bool(score_mask.to(torch.bool).any())
+            )
+            expert_records.append({"expert_idx": expert_idx,
+                                   "expert": expert,
+                                   "has_activation": has_scored_activation,
                                    "num_channels": int(W_up.shape[0])})
        
 

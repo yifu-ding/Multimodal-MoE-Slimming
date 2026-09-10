@@ -109,12 +109,14 @@ def fused_linear(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Ten
 
 def set_block_modality_masks(bundle, cnt_block: nn.Module, input_ids: torch.Tensor, attn_mask: torch.Tensor):
     flat_input_ids = input_ids.view(-1)
+    flat_valid_mask = attn_mask.to(torch.bool).view(-1)
     special_ids = resolve_special_token_tensor(bundle)
     if special_ids is not None:
         special_ids = special_ids.to(flat_input_ids.device)
         moe_text_mask = ~torch.isin(flat_input_ids, special_ids)
     else:
         moe_text_mask = torch.ones_like(flat_input_ids, dtype=torch.bool)
+    moe_text_mask &= flat_valid_mask
 
     media_token_ids = resolve_media_token_ids(bundle)
     if media_token_ids:
@@ -124,6 +126,7 @@ def set_block_modality_masks(bundle, cnt_block: nn.Module, input_ids: torch.Tens
         moe_media_mask = torch.isin(flat_input_ids, media_token_tensor)
     else:
         moe_media_mask = torch.zeros_like(flat_input_ids, dtype=torch.bool)
+    moe_media_mask &= flat_valid_mask
 
     cnt_block.mlp.moe_text_mask = moe_text_mask[:, None]
     cnt_block.mlp.moe_media_mask = moe_media_mask[:, None]

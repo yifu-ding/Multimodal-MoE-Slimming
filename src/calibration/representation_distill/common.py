@@ -652,7 +652,9 @@ def prepare_raw_batch_inputs(bundle, raw_samples: Sequence[Dict[str, Any]]) -> D
             "text": prompts,
             "return_tensors": "pt",
             "padding": True,
-            "truncation": True,
+            # Keep the complete multimodal sequence. The score collector applies
+            # its fixed token budget with a separate mask after tokenization.
+            "truncation": False,
             "padding_side": "left",
         }
         if flat_images:

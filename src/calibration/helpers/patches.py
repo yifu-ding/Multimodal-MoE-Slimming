@@ -42,12 +42,14 @@ def patch_qwen_fused_experts_forward(block: nn.Module):
             "saved_gate_grad",
             "saved_text_mask",
             "saved_visual_mask",
+            "saved_score_mask",
             "saved_router_weights",
         ):
             setattr(self, name, [None] * num_experts)
 
         text_mask = getattr(block.mlp, "moe_text_mask", None)
         visual_mask = getattr(block.mlp, "moe_media_mask", None)
+        score_mask = getattr(block.mlp, "moe_score_mask", None)
         padding_mask = getattr(block.mlp, "moe_padding_mask", None)
         if fused_layout == "gpt_oss":
             batch_size = hidden_states.shape[0]
@@ -61,10 +63,15 @@ def patch_qwen_fused_experts_forward(block: nn.Module):
             visual_mask = torch.zeros(hidden_states.shape[0], dtype=torch.bool, device=hidden_states.device)
         else:
             visual_mask = visual_mask.to(hidden_states.device).view(-1)
+        if score_mask is None:
+            score_mask = torch.ones(hidden_states.shape[0], dtype=torch.bool, device=hidden_states.device)
+        else:
+            score_mask = score_mask.to(hidden_states.device).view(-1)
         if padding_mask is not None and fused_layout != "gpt_oss":
             keep = ~padding_mask.to(hidden_states.device).view(-1)
             text_mask = text_mask[keep]
             visual_mask = visual_mask[keep]
+            score_mask = score_mask[keep]
 
         next_states = torch.zeros_like(hidden_states)
         num_classes = self.num_experts + 1 if fused_layout == "gpt_oss" else self.num_experts
@@ -107,6 +114,7 @@ def patch_qwen_fused_experts_forward(block: nn.Module):
             self.saved_down_output[expert_idx] = down_out
             self.saved_text_mask[expert_idx] = text_mask[token_idx]
             self.saved_visual_mask[expert_idx] = visual_mask[token_idx]
+            self.saved_score_mask[expert_idx] = score_mask[token_idx]
             self.saved_router_weights[expert_idx] = expert_routing_weights
 
             if current_state.requires_grad:
@@ -151,6 +159,7 @@ def patch_grad_enabled_kimi_moe_infer(block: nn.Module, layer_idx: int):
 
         text_mask = getattr(self, "moe_text_mask", None)
         visual_mask = getattr(self, "moe_media_mask", None)
+        score_mask = getattr(self, "moe_score_mask", None)
         if text_mask is None:
             text_mask = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
         else:
@@ -159,10 +168,15 @@ def patch_grad_enabled_kimi_moe_infer(block: nn.Module, layer_idx: int):
             visual_mask = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
         else:
             visual_mask = visual_mask.to(x.device).view(-1)
+        if score_mask is None:
+            score_mask = torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
+        else:
+            score_mask = score_mask.to(x.device).view(-1)
 
         for expert in self.experts:
             expert.saved_text_mask = None
             expert.saved_visual_mask = None
+            expert.saved_score_mask = None
             expert.saved_router_weights = None
 
         if skip_expert_idx is not None:
@@ -194,6 +208,7 @@ def patch_grad_enabled_kimi_moe_infer(block: nn.Module, layer_idx: int):
         sorted_tokens = x[flat_token_idx]
         sorted_text_mask = text_mask[flat_token_idx]
         sorted_visual_mask = visual_mask[flat_token_idx]
+        sorted_score_mask = score_mask[flat_token_idx]
         cnts = topk_ids.new_zeros((topk_ids.shape[0], len(self.experts) + 1))
         src = torch.ones_like(topk_ids, dtype=cnts.dtype, device=cnts.device)
         cnts.scatter_add_(1, topk_ids, src)
@@ -213,6 +228,7 @@ def patch_grad_enabled_kimi_moe_infer(block: nn.Module, layer_idx: int):
             expert = self.experts[i + self.ep_rank * self.experts_per_rank]
             expert.saved_text_mask = sorted_text_mask[start_idx:end_idx]
             expert.saved_visual_mask = sorted_visual_mask[start_idx:end_idx]
+            expert.saved_score_mask = sorted_score_mask[start_idx:end_idx]
             expert.saved_router_weights = flat_routing_weight[start_idx:end_idx]
             outputs.append(expert(tokens_for_this_expert))
             called_experts += 1

@@ -7,10 +7,12 @@ ACTIVE_CHANNEL_METRICS = (
     "3proj_act",
     "3proj_act_text",
     "3proj_act_visual",
-    # # three proj second order
-    "3proj_second_order",
-    "3proj_second_order_text",
-    "3proj_second_order_visual",
+    # Per-channel analytic Hessian scores are intentionally opt-in because they
+    # add substantial work for every routed expert. Uncomment only for their
+    # dedicated ablation.
+    # "3proj_second_order",
+    # "3proj_second_order_text",
+    # "3proj_second_order_visual",
     # # three proj saliency
     # "3proj_saliency",
     # "3proj_saliency_text",
@@ -23,16 +25,16 @@ ACTIVE_CHANNEL_METRICS = (
     # "down_second_order_approx",
     # "down_second_order_approx_text",
     # "down_second_order_approx_visual",
-    # # w
-    # "weight",
-    # # weight*grad
-    # "wg",
-    # "wg_text",
-    # "wg_visual",
-    # # weight*activation
-    # "wa",
-    # "wa_text",
-    # "wa_visual",
+    # w
+    "weight",
+    # weight*grad
+    "wg",
+    "wg_text",
+    "wg_visual",
+    # weight*activation
+    "wa",
+    "wa_text",
+    "wa_visual",
 )
 
 CHANNEL_METRICS = (
@@ -82,17 +84,17 @@ CHANNEL_METRICS = (
 
 EXPERT_METRICS = (
     "first_attr",
-    "first_attr_fillzero",
+    # "first_attr_fillzero",
     "usage",
     "usage_text",
     "usage_visual",
     "token_count_text",
     "token_count_visual",
-    "usage_fillzero",
+    # "usage_fillzero",
     "router",
-    "router_fillzero",
+    # "router_fillzero",
     "second_attr",
-    "second_attr_fillzero",
-    "true_ablate",
-    "true_ablate_fillzero",
+    # "second_attr_fillzero",
+    # "true_ablate",
+    # "true_ablate_fillzero",
 )

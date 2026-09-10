@@ -18,6 +18,18 @@ def _normalize_per_layer_counts(counts_map: Dict[int, torch.Tensor]) -> Dict[int
     return output
 
 
+def _modality_affinity_from_counts(
+    text_counts: torch.Tensor,
+    visual_counts: torch.Tensor,
+) -> torch.Tensor:
+    """Compare per-expert routing rates after normalizing modality exposure."""
+    text_counts = text_counts.detach().float()
+    visual_counts = visual_counts.detach().float()
+    text_rates = text_counts / text_counts.sum().clamp_min(1.0)
+    visual_rates = visual_counts / visual_counts.sum().clamp_min(1.0)
+    return (visual_rates - text_rates) / (visual_rates + text_rates + 1e-8)
+
+
 class ScoreAccumulator:
     def __init__(
         self,
@@ -103,45 +115,26 @@ class ScoreAccumulator:
         expert_scores["token_count_visual"] = to_nested_expert_dict(
             normalized_token_count_visual, scalar=True
         )
-        # Raw EMA matches observations/o1: compare per-modality normalized routing
-        # frequencies directly, without an extra global prior correction.
         text_count_map = self.expert_scores["token_count_text"]      # {layer_idx: Tensor[E]}
         visual_count_map = self.expert_scores["token_count_visual"]  # {layer_idx: Tensor[E]}
-
-        total_text = sum(
-            float(layer_counts.float().sum().item())
-            for layer_counts in text_count_map.values()
-        )
-        total_visual = sum(
-            float(layer_counts.float().sum().item())
-            for layer_counts in visual_count_map.values()
-        )
-
-        gamma = 1.0
-        prior_ratio = (total_visual + 1e-8) / (total_text + 1e-8)
 
         ema_matrix = {}
         ema_matrix_prior_corrected = {}
 
         for layer_idx in self.layers:
-            text_freq_tensor = text_count_map[layer_idx].float()      # shape [E]
-            visual_freq_tensor = visual_count_map[layer_idx].float()  # shape [E]
-
-            ema_tensor = (visual_freq_tensor - text_freq_tensor) / (
-                visual_freq_tensor + text_freq_tensor + 1e-8
-            )
-            visual_freq_corr = visual_freq_tensor / (prior_ratio ** gamma)
-            ema_prior_corrected_tensor = (visual_freq_corr - text_freq_tensor) / (
-                visual_freq_corr + text_freq_tensor + 1e-8
+            affinity_tensor = _modality_affinity_from_counts(
+                text_count_map[layer_idx], visual_count_map[layer_idx]
             )
 
             ema_matrix[layer_idx] = {
-                expert_id: float(ema_tensor[expert_id].item())
-                for expert_id in range(ema_tensor.shape[0])
+                expert_id: float(affinity_tensor[expert_id].item())
+                for expert_id in range(affinity_tensor.shape[0])
             }
+            # Retain the historical key as an alias so existing pruning commands
+            # keep working; exposure normalization is now performed per layer.
             ema_matrix_prior_corrected[layer_idx] = {
-                expert_id: float(ema_prior_corrected_tensor[expert_id].item())
-                for expert_id in range(ema_prior_corrected_tensor.shape[0])
+                expert_id: float(affinity_tensor[expert_id].item())
+                for expert_id in range(affinity_tensor.shape[0])
             }
 
 
@@ -158,19 +151,35 @@ class ScoreAccumulator:
                 "selected_num_samples": getattr(args, "selected_num_samples", args.num_samples),
                 "batch_size": args.batch_size,
                 "dataset": args.dataset,
+                "selection_manifest": getattr(args, "selection_manifest", None),
+                "selection_manifest_sha256": getattr(
+                    args, "selection_manifest_sha256", None
+                ),
+                "selection_source_summary": getattr(
+                    args, "selection_source_summary", None
+                ),
+                "score_tokens_per_sample": getattr(
+                    args, "score_tokens_per_sample", None
+                ),
+                "score_token_sampling": getattr(
+                    args, "score_token_sampling", None
+                ),
                 "start_idx": args.start_idx,
                 "model_name_or_path": args.model_name_or_path,
                 "resolved_model_name_or_path": resolve_model_name_or_path(args.model_name_or_path),
                 "subset_seed": args.subset_seed,
                 "ema": args.ema,
+                "score_aggregation": getattr(args, "aggregation", "mean"),
                 "fill_zero_for_unrouted": getattr(args, "fill_zero_for_unrouted", False),
                 "layers": self.layers,
                 "layer_to_num_experts": self.layer_to_num_experts,
                 "layer_to_num_channels": self.layer_to_num_channels,
                 "available_channel_metrics": list(CHANNEL_METRICS),
                 "available_expert_metrics": list(EXPERT_METRICS),
-                "ema_matrix_definition": "raw modality affinity: (visual_freq - text_freq) / (visual_freq + text_freq + 1e-8)",
-                "ema_matrix_prior_corrected_definition": "prior-corrected modality affinity: ((visual_freq / prior_ratio) - text_freq) / ((visual_freq / prior_ratio) + text_freq + 1e-8), prior_ratio = total_visual / total_text",
+                "affinity_token_scope": "full valid sequence; independent of score_tokens_per_sample",
+                "score_token_scope": "fixed per-sample quota, sampled uniformly within each modality in proportion to full-sequence modality counts",
+                "ema_matrix_definition": "per-layer exposure-normalized modality affinity: let r_m[e] = routed_m[e] / sum_e routed_m[e], then (r_visual[e] - r_text[e]) / (r_visual[e] + r_text[e] + 1e-8)",
+                "ema_matrix_prior_corrected_definition": "compatibility alias of ema_matrix; modality exposure correction is now applied per layer",
                 "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "created_at_unix": dt.datetime.now(dt.timezone.utc).timestamp(),
             },

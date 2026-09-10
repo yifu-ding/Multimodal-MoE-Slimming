@@ -68,6 +68,7 @@ def clear_fused_saved_tensors(experts: nn.Module) -> None:
         "saved_gate_grad",
         "saved_text_mask",
         "saved_visual_mask",
+        "saved_score_mask",
         "saved_router_weights",
     ):
         if hasattr(experts, name):
@@ -119,7 +120,12 @@ def clear_block_saved_tensors(block: nn.Module) -> None:
         clear_fused_saved_tensors(experts)
         return
     for expert in iter_experts(block.mlp):
-        for attr in ("saved_text_mask", "saved_visual_mask", "saved_router_weights"):
+        for attr in (
+            "saved_text_mask",
+            "saved_visual_mask",
+            "saved_score_mask",
+            "saved_router_weights",
+        ):
             setattr(expert, attr, None)
         for proj_name in ("down_proj", "up_proj", "gate_proj"):
             proj = getattr(expert, proj_name, None)
