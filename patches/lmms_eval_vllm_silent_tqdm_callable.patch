@@ -1,0 +1,32 @@
+--- a/lmms-eval/lmms_eval/models/simple/vllm.py
++++ b/lmms-eval/lmms_eval/models/simple/vllm.py
+@@ -3,4 +3,5 @@
+ import socket
+ import time
+ from concurrent.futures import ThreadPoolExecutor
++from functools import partial
+ from typing import Any, Callable, List, Optional, Tuple, Union
+@@ -11,3 +12,4 @@
+ from decord import VideoReader, cpu
+ from loguru import logger as eval_logger
++from tqdm import tqdm
+ from PIL import Image
+@@ -22,2 +24,3 @@
+ NUM_SECONDS_TO_SLEEP = int(os.getenv("NUM_SECONDS_TO_SLEEP", "5"))
+ WORKERS = int(os.getenv("WORKERS", "32"))
++SILENT_VLLM_TQDM = partial(tqdm, disable=True)
+@@ -532,12 +535,12 @@
+                             sampling_params=sampling_params,
+                             messages=inputs,
+                             chat_template=self.chat_template,
+-                            use_tqdm=False,
++                            use_tqdm=SILENT_VLLM_TQDM,
+                         )
+                     else:
+                         response = self.client.chat(
+                             sampling_params=sampling_params,
+                             messages=inputs,
+-                            use_tqdm=False,
++                            use_tqdm=SILENT_VLLM_TQDM,
+                         )
+                     return [o.outputs[0].text for o in response]
