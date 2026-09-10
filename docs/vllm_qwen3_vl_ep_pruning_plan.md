@@ -356,18 +356,6 @@ HF_DATASETS_CACHE=/home/data/dyf/hf_cache/datasets
 - 模型加载后的静态显存；
 - 各 rank 实际 token-expert pair 数和负载偏差。
 
-## 15. Video-MMMU 状态
-
-2026-09-09 已一次性检查：
-
-```text
-路径: /home/data/dyf/hf_cache/datasets/VideoMMMU
-MP4 数量: 301
-空文件: 0
-总大小: 13,821,999,601 bytes (12.873 GiB)
-```
-
-数据已经解压，不再在每次运行前执行全目录扫描，也不再运行 `prepare-vmmmu`。实际评测仍应在样本日志中记录媒体路径和实际采样帧数；非 Adaptation 样本若指定媒体缺失，应立即报错，不能静默退化为静态图。
 
 ## 16. 预期新增文件与不修改项
 

@@ -1,0 +1,18 @@
+group: mvbench_available_2600
+task:
+  - mvbench_moving_count
+  - mvbench_action_count
+  - mvbench_scene_transition
+  - mvbench_object_shuffle
+  - mvbench_object_existence
+  - mvbench_unexpected_action
+  - mvbench_moving_direction
+  - mvbench_state_change
+  - mvbench_character_order
+  - mvbench_counterfactual_inference
+  - mvbench_fine_grained_action
+  - mvbench_moving_attribute
+  - mvbench_egocentric_navigation
+aggregate_metric_list:
+  - metric: mvbench_accuracy
+    weight_by_size: true

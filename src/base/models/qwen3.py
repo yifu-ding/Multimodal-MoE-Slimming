@@ -861,6 +861,21 @@ def load_model(
     processor = AutoProcessor.from_pretrained(
         model_path, trust_remote_code=trust_remote_code
     )
+    if not hasattr(processor, "tokenizer"):
+        try:
+            import transformers
+
+            transformers_version = transformers.__version__
+        except Exception:
+            transformers_version = "unknown"
+        raise RuntimeError(
+            "Failed to load a multimodal processor for Qwen3-VL. "
+            f"AutoProcessor returned {type(processor).__name__} instead of a VL processor. "
+            "This environment likely lacks Qwen3-VL processor support. "
+            f"Installed transformers version: {transformers_version}. "
+            "The checkpoint expects `Qwen3VLProcessor` (see preprocessor_config.json). "
+            "Use a newer transformers build that includes Qwen3-VL processor support."
+        )
     # import ipdb; ipdb.set_trace()
     special_token_id_list = processor.tokenizer.all_special_ids
     model.model.special_token_id_tensor = torch.tensor(special_token_id_list)

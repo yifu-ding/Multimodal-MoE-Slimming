@@ -10,37 +10,59 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SOURCE_ENV="${SOURCE_ENV:-maes}"
 TARGET_ENV="${TARGET_ENV:-vllm-maes}"
 VLLM_VERSION="${VLLM_VERSION:-0.11.2}"
+RESUME_EXISTING="${RESUME_EXISTING:-0}"
+PYPI_INDEX_URL="${PYPI_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+OPENJDK_PACKAGE_URL="${OPENJDK_PACKAGE_URL:-https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge/linux-64/openjdk-17.0.14-h39bb4c0_2.conda}"
+
+pip_install() {
+    conda run --no-capture-output -n "${TARGET_ENV}" \
+        python -m pip install --index-url "${PYPI_INDEX_URL}" \
+        --retries 10 --timeout 120 "$@"
+}
 
 if ! command -v conda >/dev/null 2>&1; then
     echo "error: conda is not available in PATH." >&2
     exit 2
 fi
 if conda env list | awk -v target="${TARGET_ENV}" '$1 == target { found=1 } END { exit(found ? 0 : 1) }'; then
-    echo "error: target environment '${TARGET_ENV}' already exists." >&2
-    echo "       Choose TARGET_ENV=... or remove it explicitly before retrying." >&2
-    exit 2
-fi
-if ! conda env list | awk -v target="${SOURCE_ENV}" '$1 == target { found=1 } END { exit(found ? 0 : 1) }'; then
-    echo "error: source environment '${SOURCE_ENV}' does not exist." >&2
-    exit 2
-fi
+    if [[ "${RESUME_EXISTING}" != "1" ]]; then
+        echo "error: target environment '${TARGET_ENV}' already exists." >&2
+        echo "       Set RESUME_EXISTING=1 to continue an interrupted setup," >&2
+        echo "       choose TARGET_ENV=..., or remove it explicitly before retrying." >&2
+        exit 2
+    fi
+    echo "Resuming setup in existing environment '${TARGET_ENV}'."
+else
+    if ! conda env list | awk -v target="${SOURCE_ENV}" '$1 == target { found=1 } END { exit(found ? 0 : 1) }'; then
+        echo "error: source environment '${SOURCE_ENV}' does not exist." >&2
+        exit 2
+    fi
 
-echo "Cloning conda environment: ${SOURCE_ENV} -> ${TARGET_ENV}"
-conda create --yes --name "${TARGET_ENV}" --clone "${SOURCE_ENV}"
+    echo "Cloning conda environment: ${SOURCE_ENV} -> ${TARGET_ENV}"
+    conda create --yes --name "${TARGET_ENV}" --clone "${SOURCE_ENV}"
+fi
 
 echo "Installing vllm==${VLLM_VERSION}; this will replace cloned torch packages with vLLM-compatible versions."
-conda install --yes --name "${TARGET_ENV}" "openjdk=17"
-conda run --no-capture-output -n "${TARGET_ENV}" \
-    python -m pip install --upgrade pip setuptools wheel
-conda run --no-capture-output -n "${TARGET_ENV}" \
-    python -m pip install "vllm==${VLLM_VERSION}"
+if ! conda run -n "${TARGET_ENV}" java -version >/dev/null 2>&1; then
+    # This build is compatible with the lcms2/xorg versions cloned from maes.
+    conda install --yes --name "${TARGET_ENV}" "${OPENJDK_PACKAGE_URL}"
+fi
+pip_install --upgrade pip setuptools wheel
+pip_install "vllm==${VLLM_VERSION}"
+
+# A compiled flash-attn inherited from the source environment may target the
+# old Torch ABI. vLLM uses its bundled backend when that optional import fails.
+if conda run -n "${TARGET_ENV}" python -c 'import importlib.util, sys; sys.exit(0 if importlib.util.find_spec("flash_attn") else 1)' \
+    && ! conda run -n "${TARGET_ENV}" python -c 'import flash_attn' >/dev/null 2>&1; then
+    echo "Removing flash-attn inherited with an incompatible Torch ABI."
+    conda run --no-capture-output -n "${TARGET_ENV}" \
+        python -m pip uninstall --yes flash-attn
+fi
 
 # Use the checked-out evaluator and task definitions rather than fetching a
 # second lmms-eval copy from the network.
-conda run --no-capture-output -n "${TARGET_ENV}" \
-    python -m pip install --no-deps --editable "${REPO_ROOT}/lmms-eval"
-conda run --no-capture-output -n "${TARGET_ENV}" \
-    python -m pip install "qwen-vl-utils>=0.0.14" "decord>=0.6.0" requests openpyxl pycocoevalcap
+pip_install --no-deps --editable "${REPO_ROOT}/lmms-eval"
+pip_install "qwen-vl-utils>=0.0.14" "decord>=0.6.0" requests openpyxl pycocoevalcap
 
 echo "Verifying imports and CUDA visibility."
 conda run --no-capture-output -n "${TARGET_ENV}" python - <<'PY'

@@ -1,0 +1,16 @@
+--- a/lmms-eval/lmms_eval/models/simple/vllm.py
++++ b/lmms-eval/lmms_eval/models/simple/vllm.py
+@@ -341 +341 @@
+-        return max(request_max_new_tokens, self.max_new_tokens)
++        return request_max_new_tokens
+@@ -473,2 +473,3 @@
+             try:
+                 batched_messages = []
++                params = None
+@@ -481 +482,5 @@
+-                    sampling_params = SamplingParams(**self._build_sampling_params_dict(gen_kwargs))
++                    request_params = self._build_sampling_params_dict(gen_kwargs)
++                    if params is None:
++                        params = request_params
++                    elif request_params != params:
++                        raise ValueError("All requests in a vLLM batch must use identical generation parameters.")

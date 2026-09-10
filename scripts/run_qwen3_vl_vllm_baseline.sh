@@ -41,6 +41,7 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 MAX_FRAME_NUM="${MAX_FRAME_NUM:-32}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
+IMAGE_FIRST="${IMAGE_FIRST:-1}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
 LIMIT="${LIMIT:-}"
 VERBOSITY="${VERBOSITY:-INFO}"
@@ -50,7 +51,7 @@ FORCE="${FORCE:-0}"
 FAIL_FAST="${FAIL_FAST:-0}"
 export WORKERS
 
-for binary_flag in LOG_SAMPLES FORCE FAIL_FAST; do
+for binary_flag in IMAGE_FIRST LOG_SAMPLES FORCE FAIL_FAST; do
     if [[ "${!binary_flag}" != "0" && "${!binary_flag}" != "1" ]]; then
         echo "error: ${binary_flag} must be 0 or 1; got '${!binary_flag}'." >&2
         exit 2
@@ -115,6 +116,12 @@ else
     exit 2
 fi
 
+if [[ "${IMAGE_FIRST}" == "1" ]]; then
+    IMAGE_FIRST_ARG=True
+else
+    IMAGE_FIRST_ARG=False
+fi
+
 RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/results/vllm_baseline/qwen3-vl-30b-a3b}"
 RUN_DIR="${RUN_DIR:-${OUTPUT_ROOT}/${PARALLEL_MODE}-${RUN_TIMESTAMP}}"
@@ -125,7 +132,7 @@ mkdir -p "${RUN_DIR}" "${TASK_OUTPUT_ROOT}" "${TASK_LOG_ROOT}" "${TASK_STATUS_RO
 export VIDEO_MMMU_ROOT="${VIDEO_MMMU_ROOT:-${HF_DATASETS_CACHE}/VideoMMMU}"
 export VIDEO_MMMU_MEDIA_LOG="${VIDEO_MMMU_MEDIA_LOG:-${RUN_DIR}/video_mmmu_media_paths.jsonl}"
 
-MODEL_ARGS="model=${MODEL},tensor_parallel_size=${TENSOR_PARALLEL_SIZE},enable_expert_parallel=${ENABLE_EXPERT_PARALLEL},dtype=bfloat16,enforce_eager=${EAGER_ARG},gpu_memory_utilization=${GPU_MEMORY_UTILIZATION},max_model_len=${MAX_MODEL_LEN},max_frame_num=${MAX_FRAME_NUM},max_new_tokens=${MAX_NEW_TOKENS},trust_remote_code=True,disable_log_stats=False"
+MODEL_ARGS="model=${MODEL},tensor_parallel_size=${TENSOR_PARALLEL_SIZE},enable_expert_parallel=${ENABLE_EXPERT_PARALLEL},dtype=bfloat16,enforce_eager=${EAGER_ARG},gpu_memory_utilization=${GPU_MEMORY_UTILIZATION},max_model_len=${MAX_MODEL_LEN},max_frame_num=${MAX_FRAME_NUM},max_new_tokens=${MAX_NEW_TOKENS},image_first=${IMAGE_FIRST_ARG},trust_remote_code=True,disable_log_stats=False"
 
 # GPT-dependent tasks run in output-only mode after the regular benchmark pass.
 # This keeps the four inference GPUs dedicated to the evaluated model. Their
@@ -200,10 +207,10 @@ task_batch_size_for() {
 LOCAL_TASKS_CSV="$(join_by_comma "${LOCAL_TASKS[@]}")"
 DEFERRED_TASKS_CSV="$(join_by_comma "${DEFERRED_JUDGE_TASKS[@]}")"
 printf -v RESUME_COMMAND \
-    'RUN_DIR=%q TASKS=%q MODEL=%q CONDA_ENV_NAME=%q PARALLEL_MODE=%q CUDA_VISIBLE_DEVICES=%q BATCH_SIZE=%q LIGHT_IMAGE_BATCH_SIZE=%q IMAGE_BATCH_SIZE=%q VIDEO_BATCH_SIZE=%q GPU_MEMORY_UTILIZATION=%q MAX_MODEL_LEN=%q MAX_FRAME_NUM=%q MAX_NEW_TOKENS=%q ENFORCE_EAGER=%q LIMIT=%q LOG_SAMPLES=%q bash scripts/run_qwen3_vl_vllm_baseline.sh' \
+    'RUN_DIR=%q TASKS=%q MODEL=%q CONDA_ENV_NAME=%q PARALLEL_MODE=%q CUDA_VISIBLE_DEVICES=%q BATCH_SIZE=%q LIGHT_IMAGE_BATCH_SIZE=%q IMAGE_BATCH_SIZE=%q VIDEO_BATCH_SIZE=%q GPU_MEMORY_UTILIZATION=%q MAX_MODEL_LEN=%q MAX_FRAME_NUM=%q MAX_NEW_TOKENS=%q IMAGE_FIRST=%q ENFORCE_EAGER=%q LIMIT=%q LOG_SAMPLES=%q bash scripts/run_qwen3_vl_vllm_baseline.sh' \
     "${RUN_DIR}" "${TASKS}" "${MODEL}" "${CONDA_ENV_NAME}" "${PARALLEL_MODE}" "${CUDA_VISIBLE_DEVICES}" \
     "${BATCH_SIZE}" "${LIGHT_IMAGE_BATCH_SIZE}" "${IMAGE_BATCH_SIZE}" "${VIDEO_BATCH_SIZE}" \
-    "${GPU_MEMORY_UTILIZATION}" "${MAX_MODEL_LEN}" "${MAX_FRAME_NUM}" "${MAX_NEW_TOKENS}" "${ENFORCE_EAGER}" \
+    "${GPU_MEMORY_UTILIZATION}" "${MAX_MODEL_LEN}" "${MAX_FRAME_NUM}" "${MAX_NEW_TOKENS}" "${IMAGE_FIRST}" "${ENFORCE_EAGER}" \
     "${LIMIT}" "${LOG_SAMPLES}"
 
 {
@@ -228,6 +235,8 @@ printf -v RESUME_COMMAND \
     echo "gpu_memory_utilization=${GPU_MEMORY_UTILIZATION}"
     echo "max_model_len=${MAX_MODEL_LEN}"
     echo "max_frame_num=${MAX_FRAME_NUM}"
+    echo "fallback_max_new_tokens=${MAX_NEW_TOKENS}"
+    echo "image_first=${IMAGE_FIRST_ARG}"
     echo "hf_home=${HF_HOME}"
     echo "run_dir=${RUN_DIR}"
     echo "force=${FORCE}"

@@ -123,6 +123,7 @@ def select_items(requested: List[str], registry: Dict[str, object]) -> List[str]
 
 def download_datasets(
     names: List[str],
+    cache_dir: str,
     token: str | None,
     force_download: bool,
     resume_download: bool,
@@ -137,6 +138,7 @@ def download_datasets(
         snapshot_download(
             repo_id=spec.repo_id,
             repo_type="dataset",
+            cache_dir=cache_dir,
             token=token,
             force_download=force_download,
             resume_download=resume_download,
@@ -145,6 +147,7 @@ def download_datasets(
 
 def download_models(
     names: List[str],
+    cache_dir: str,
     token: str | None,
     force_download: bool,
     resume_download: bool,
@@ -159,6 +162,7 @@ def download_models(
         snapshot_download(
             repo_id=spec.repo_id,
             repo_type="model",
+            cache_dir=cache_dir,
             token=token,
             force_download=force_download,
             resume_download=resume_download,
@@ -167,10 +171,12 @@ def download_models(
 
 def main() -> None:
     args = parse_args()
+    args.hf_home = os.path.abspath(os.path.expanduser(args.hf_home))
     os.environ["HF_HOME"] = args.hf_home
+    cache_dir = os.path.join(args.hf_home, "hub")
 
     print(f"HF_HOME={args.hf_home}")
-    print(f"Default cache root={os.path.join(args.hf_home, 'hub')}")
+    print(f"Default cache root={cache_dir}")
 
     selected_benchmarks = select_items(args.benchmarks, DATASETS)
     selected_models = select_items(args.models, MODELS)
@@ -182,6 +188,7 @@ def main() -> None:
 
     download_datasets(
         names=selected_benchmarks,
+        cache_dir=cache_dir,
         token=args.token,
         force_download=args.force_download,
         resume_download=args.resume_download,
@@ -189,6 +196,7 @@ def main() -> None:
 
     download_models(
         names=selected_models,
+        cache_dir=cache_dir,
         token=args.token,
         force_download=args.force_download,
         resume_download=args.resume_download,
