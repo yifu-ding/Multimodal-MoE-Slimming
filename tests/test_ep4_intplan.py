@@ -1,6 +1,7 @@
 import torch
 
 from src.generate_mask.ep4_intplan import (
+    DEFAULT_WIDTHS,
     plan_ep4_intplan,
     solve_cross_layer_placement,
 )
@@ -15,6 +16,7 @@ def _synthetic_inputs():
 
 
 def test_ep4_plan_preserves_discrete_budget_and_mapping_invariants():
+    assert DEFAULT_WIDTHS == (0, 384, 512, 640, 768)
     layer_sensitivity, expert_sensitivity, scores = _synthetic_inputs()
     result = plan_ep4_intplan(
         layer_sensitivity,
@@ -80,23 +82,6 @@ def test_prune_ratio_is_not_interpreted_as_keep_ratio():
     expected_units = round(0.70 * scores.numel() / 128)
     assert result["target_keep_channels"] == expected_units * 128
     assert abs(result["actual_prune_ratio"] - 0.30) < 128 / scores.numel()
-
-
-def test_original_256_width_scheme_remains_available_for_ablation():
-    layer_sensitivity, expert_sensitivity, scores = _synthetic_inputs()
-    result = plan_ep4_intplan(
-        layer_sensitivity,
-        expert_sensitivity,
-        scores,
-        prune_ratio=0.30,
-        widths=(768, 512, 384, 256, 0),
-    )
-
-    assert result["active_widths"] == (768, 512, 384, 256)
-    assert torch.isin(
-        result["expert_widths"], torch.tensor([0, 256, 384, 512, 768])
-    ).all()
-    assert result["actual_keep_channels"] == result["target_keep_channels"]
 
 
 def test_infeasible_budget_is_rejected_when_all_active_tiers_are_mandatory():

@@ -40,7 +40,7 @@ from src.generate_mask.planners.intra_layer.algo.coverage import (
 )
 
 
-DEFAULT_WIDTHS = (768, 640, 512, 384, 0)
+DEFAULT_WIDTHS = (0, 384, 512, 640, 768)
 
 
 def _as_finite_float_tensor(value: torch.Tensor, name: str, ndim: int) -> torch.Tensor:
@@ -790,8 +790,7 @@ def plan_ep4_intplan(
         prune_ratio: Fraction of expert intermediate channels to remove.  This
             is not a keep ratio; ``keep_ratio = 1 - prune_ratio``.
         widths: Four active widths plus zero.  The default is
-            ``(768, 640, 512, 384, 0)``.  Passing
-            ``(768, 512, 384, 256, 0)`` reproduces the original tier proposal.
+            ``(0, 384, 512, 640, 768)``.
         placement_tolerance: Allowed relative deviation from mean cumulative
             rank weight load.
         strict_placement_tolerance: Raise if the best placement exceeds the

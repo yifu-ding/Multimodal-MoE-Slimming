@@ -5,7 +5,7 @@
 设模型包含 $L$ 个 MoE 层（当前模型约 60--64 层），每层有 $E=128$ 个 expert。将剪枝后的中间宽度量化为
 
 $$
-\mathcal M=\{768,512,384,256,0\},
+\mathcal M=\{0,384,512,640,768\},
 $$
 
 并部署到 4 张 GPU。目标是同时满足：
@@ -15,7 +15,7 @@ $$
 3. 每层内部严格“一张 GPU 一个宽度档”，但跨层轮换宽度档，使每张物理 GPU 的累计权重负载在 tolerance 内；
 4. 宽度为 0 的 expert 不存放权重，也不进入 dispatch 和 GEMM。
 
-这是一个小规模整数规划问题。由于当前 fused MoE kernel 要求**同一层、同一张 GPU 上的 local experts 具有相同的中间宽度**，所以每层必须把 768/512/384/256 四个非零档分别交给 4 张 GPU，不能在单卡上混放多个宽度后仍使用同一次 fused MoE 调用。
+这是一个小规模整数规划问题。由于当前 fused MoE kernel 要求**同一层、同一张 GPU 上的 local experts 具有相同的中间宽度**，所以每层必须把 768/640/512/384 四个非零档分别交给 4 张 GPU，不能在单卡上混放多个宽度后仍使用同一次 fused MoE 调用。
 
 ## 2. 显存负载的计算方式
 
@@ -66,7 +66,7 @@ $$
 因为所有非零宽度都是 128 的倍数，定义整数负载单位
 
 $$
-u_m=\frac{m}{128}\in\{6,4,3,2,0\}.
+u_m=\frac{m}{128}\in\{0,3,4,5,6\}.
 $$
 
 于是全局预算约束可写为
@@ -81,7 +81,7 @@ $$
 
 $$
 n_{\ell,k}\ge1,\qquad
-\forall \ell,\ m_k\in\{768,512,384,256\}.
+\forall \ell,\ m_k\in\{384,512,640,768\}.
 $$
 
 宽度为 0 的档位不要求出现；如果实验必须包含完整 expert removal，再增加全局约束 $\sum_\ell n_{\ell,0}\ge1$，或者设置每层最小删除数。
@@ -118,7 +118,7 @@ $$
 
 ### 3.4 如何从 sensitivity 构造 $c_{\ell,e,k}$
 
-最推荐的做法是为每个 expert 直接构造五档代理损失表。先根据已有 channel importance 为 expert $(\ell,e)$ 构造 768/512/384/256/0 五个嵌套 channel mask，再在同一个 calibration set 上计算
+最推荐的做法是为每个 expert 直接构造五档代理损失表。先根据已有 channel importance 为 expert $(\ell,e)$ 构造 0/384/512/640/768 五个嵌套 channel mask，再在同一个 calibration set 上计算
 
 $$
 c_{\ell,e,k}
@@ -130,8 +130,8 @@ $$
 也可以使用二阶 Taylor/Hessian 预测损失或被删除 channel importance 之和。这里不运行下游任务精度，只计算结构化剪枝的代理损失。应令 $c_{\ell,e,768}=0$，并对有噪声的估计做单调化：
 
 $$
-c_{\ell,e,768}\le c_{\ell,e,512}
-\le c_{\ell,e,384}\le c_{\ell,e,256}\le c_{\ell,e,0}.
+c_{\ell,e,768}\le c_{\ell,e,640}
+\le c_{\ell,e,512}\le c_{\ell,e,384}\le c_{\ell,e,0}.
 $$
 
 当前另有独立的 layer sensitivity 系数，记为 $a_\ell>0$。令 $v_{\ell,e}$ 是层内 expert sensitivity 原始分数，先在每层内部变换为非负值并归一化到均值 1：
@@ -163,7 +163,7 @@ $p=1$ 容易产生偏极端的 768/0 分配；$p>1$ 表示同一 expert 被继�
 
 如果使用五档 proxy cost $\widehat c_{\ell,e,k}$，且该 cost 只在层内可比，则同样先做层内尺度归一化，再令 $c_{\ell,e,k}=a_\ell\widehat c_{\ell,e,k}$。如果 Hessian/Taylor cost 本身已经在统一 loss 和采样口径下跨层可比，则不应再次乘 $a_\ell$，避免重复计入层敏感度。
 
-### 3.5 全局 0-1 整数规划
+### 3.5 可选的全局 0-1 宽度整数规划（当前第一版不采用）
 
 将每层 expert 按 sensitivity 排序，记排序后的索引为 $\pi_{\ell,1},\ldots,\pi_{\ell,128}$，其中
 
@@ -206,7 +206,7 @@ $$
 
 由于 $c_{\ell,e,k}$ 都在求解前计算完成，目标函数和约束对二进制变量 $y$ 都是线性的。以 $L=64$ 为例，只有 $64\times128\times5=40960$ 个 $y$ 变量，使用 Gurobi、SCIP 或 OR-Tools CP-SAT 都是合理规模。CP-SAT 需要把浮点 $c$ 乘固定比例后取整。
 
-单调约束意味着每层排序后的 expert 最终形成 768、512、384、256、0 五个连续分段。也可以据此改写为“每层选择四个切分点”，再用跨层 knapsack/DP 分配总预算；但第一版直接实现上述 0-1 模型更清楚，也更容易加入其他约束。
+单调约束意味着每层排序后的 expert 最终形成 768、640、512、384、0 五个连续分段。也可以据此改写为“每层选择四个切分点”，再用跨层 knapsack/DP 分配总预算。当前第一版不求解这个 expert 级全局 MILP，而是复用既有 binary search 生成原始宽度，再在全局离散预算下圆整。
 
 ### 3.6 可选的连续目标宽度匹配
 
@@ -227,7 +227,7 @@ $$
 
 这是另一种 $c_{\ell,e,k}$ 构造方式，不应与前面的剪枝损失 cost 重复叠加。
 
-### 3.7 第一阶段求解伪代码
+### 3.7 全局宽度 MILP 备选方案伪代码（非当前第一版路径）
 
 ```text
 input:
@@ -235,8 +235,8 @@ input:
     expert_sensitivity v[L, 128]
     optional proxy_cost c[L, 128, 5]
     target pruning ratio r
-    widths = [768, 512, 384, 256, 0]
-    units = [6, 4, 3, 2, 0]
+    widths = [0, 384, 512, 640, 768]
+    units = [0, 3, 4, 5, 6]
 
 U = round((1 - r) * L * 128 * 6)
 
@@ -407,7 +407,7 @@ $$
 2. **读入 sensitivity：** 对每层 128 个 expert 取得 $s_e$，做稳健归一化并按降序排列。
 3. **生成连续目标：** 通过 water-filling 计算 $\widetilde m_e$，使连续宽度之和等于保留预算。
 4. **离散档位规划：** 在精确预算、排序单调和四个非零档都存在的约束下，最小化 sensitivity 匹配代价，输出每个 expert 的宽度及 $n_{\ell,k}$。
-5. **构建 fused groups：** 每层按 768/512/384/256 将非零 expert 建成四个同宽度 group，删除宽度为 0 的 expert 权重。
+5. **构建 fused groups：** 每层按 768/640/512/384 将非零 expert 建成四个同宽度 group，删除宽度为 0 的 expert 权重。
 6. **跨层静态放置：** 默认求解各层四个 group 到物理 GPU 的轮换映射，最小化整个模型的最大累计权重负载并满足 $\tau_w$。
 7. **后续校准：** vLLM 实现跑通后，再收集 batch 级 token、peak memory、GEMM 和 all-to-all 指标，必要时把动态代价加回宽度规划。
 8. **留出验收：** 报告精度、throughput、TTFT、TPOT、P50/P95 latency、逐卡 peak memory 和 OOM 情况。
@@ -428,15 +428,15 @@ $$
 这个方法的核心不是“给 4 张卡各固定一个宽度”，而是以层为单位选择一个档位到 EP rank 的置换（permutation）：
 
 ```text
-layer 0: rank 0/1/2/3 <- 768/512/384/256
-layer 1: rank 0/1/2/3 <- 256/384/512/768
-layer 2: rank 0/1/2/3 <- 384/768/256/512
+layer 0: rank 0/1/2/3 <- 768/640/512/384
+layer 1: rank 0/1/2/3 <- 384/512/640/768
+layer 2: rank 0/1/2/3 <- 512/768/384/640
 ...
 ```
 
 因此，需要同时保持下列三个不变量：
 
-1. 对任意层，`768/512/384/256` 四个非零档位与 4 个 EP rank 一一对应；
+1. 对任意层，`768/640/512/384` 四个非零档位与 4 个 EP rank 一一对应；
 2. 对任意层的任意 rank，本地 expert 只有一种宽度，但 expert 数量可以与其他 rank 不同；
 3. 对不同层，同一物理 rank 接收哪个档位没有顺序约束，只优化全模型跨层累计负载。
 
@@ -460,7 +460,7 @@ layer 2: rank 0/1/2/3 <- 384/768/256/512
 
 ### 9.2 不能直接复用的部分
 
-1. [`src/generate_mask/pipeline.py`](../src/generate_mask/pipeline.py) 当前的契约是输出任意 boolean channel mask，不保证每个 expert 宽度属于 `{768,512,384,256,0}`。
+1. [`src/generate_mask/pipeline.py`](../src/generate_mask/pipeline.py) 当前的契约是输出任意 boolean channel mask，不保证每个 expert 宽度属于 `{0,384,512,640,768}`。
 2. 现有 inter-layer planner 先生成浮点层保留率，超过 1 时直接 clamp，只警告均值偏差；它不能保证全局离散预算精确相等。
 3. `build_masks_expertwise()` 使用 `max(1, ceil(...))`，因此不能产生宽度 0；后续 `adjust_masks()` 还可能把已量化的宽度再次改成非法档位。
 4. `build_masks_globally()` 对按权重分配的 $K_E$ 直接取 floor 且没有回填余数，无法守住精确预算；当前实现还把 layer 循环写成了 `for lid in len(scores)`，因此不能作为新 Stage 1 的基础。
@@ -528,11 +528,11 @@ planner 首先从 score metadata 获得真实 model layer ID 列表，再与 mod
 
 - 所有规划层的 expert 数相同，当前目标是 128；
 - 所有 expert 的原始宽度为 768；
-- `tiers=[768,512,384,256,0]` 严格递减、不重复，非零档位数等于 `ep_size=4`；
+- `tiers=[0,384,512,640,768]` 严格递增、不重复，非零档位数等于 `ep_size=4`；
 - score 必须 finite，shape 必须与 metadata 完全一致；
 - positional layer index 只用于 tensor 运算，artifact 中始终保存原始 model layer ID。
 
-全局预算使用 `round((1-r)*L*E*I/128)` 个整数单位，并在求解前检查可行区间。由于要求每层四个非零档位都至少有一个 expert，一层的最小单位数是 `6+4+3+2=15`，最大单位数是 `6*(E-3)+4+3+2`。超出区间或离散预算不可达时必须 fail fast，不能静默改剪枝率。
+全局预算使用 `round((1-r)*L*E*I/128)` 个整数单位，并在求解前检查可行区间。由于要求每层四个非零档位都至少有一个 expert，一层的最小单位数是 `3+4+5+6=18`，最大单位数是 `18+6*(E-4)=6E-6`。超出区间或离散预算不可达时必须 fail fast，不能静默改剪枝率。
 
 ### 11.2 五档 cost 和 channel mask
 
@@ -547,9 +547,9 @@ water-filling 作为单独的 `cost_mode=target_width` 保留，与 `cost_mode=r
 
 用于宽度单调约束的 expert sensitivity 也必须显式指定 `expert_order_source`。建议 v1 使用同一 cost table 的完全删除代价 `cost[l,e,0]` 排序，使目标和顺序约束来自同一信号。如果实验要改用 `expert_scores.second_attr`，应作为明确的 ablation 配置并记录到 artifact，不能因 key 缺失而静默 fallback。
 
-### 11.3 Stage 1：width MILP
+### 11.3 可选 Stage 1：width MILP（当前第一版未实现）
 
-按本文第 3.5 节直接建立 binary MILP。对 Qwen3 的实际 48 层，变量数是 `48*128*5=30720`，而不是 64 层示例的 40960。
+如果后续开启全局宽度 MILP，可按本文第 3.5 节建立 binary MILP。对 Qwen3 的实际 48 层，变量数是 `48*128*5=30720`，而不是 64 层示例的 40960。
 
 约束必须包含：
 
@@ -561,7 +561,7 @@ water-filling 作为单独的 `cost_mode=target_width` 保留，与 `cost_mode=r
 
 用 SciPy/HiGHS 求解后不直接信任浮点结果，而是先把 `y` 解析成整数 width，再用独立 validator 重新计算每条约束和 actual pruning ratio。如果求解器非 optimal，或任一 expert 没有唯一档位，编译失败。
 
-### 11.4 Stage 2：cross-layer placement MILP
+### 11.4 Stage 2：cross-layer placement MILP 精确对照
 
 Stage 2 的输入是固定的 `count[l,tier]`。每层只有 24 种合法 permutation，但跨层组合仍由 MILP 统一求解，优化
 
@@ -683,7 +683,7 @@ ep4_plan/
 
 ```text
 ep_size = 4
-tiers = [768, 512, 384, 256, 0]
+tiers = [0, 384, 512, 640, 768]
 require_each_active_tier_per_layer = true
 cost_mode = removed_channel_score
 channel_metric = 3proj_second_order
@@ -693,7 +693,9 @@ expert_order_source = full_removal_cost
 enforce_monotonic_width_by_sensitivity = true
 placement_objective = cross_layer_static_weight_minimax
 dynamic_routing_load = disabled
-solver = scipy.optimize.milp (HiGHS)
+width_planner = coverage_binary_search_then_budget_quantization
+placement_method = greedy
+placement_exact_reference = scipy.optimize.milp (HiGHS)
 ```
 
 其中 `layer_scale_mode` 在真实 score data audit 后必须再确认。如果 `3proj_second_order` 在相同 loss、样本和累加口径下已经可以跨层直接比较，则应设为 `none`，避免重复计入 layer sensitivity。
@@ -701,18 +703,157 @@ solver = scipy.optimize.milp (HiGHS)
 ## 16. Codex 补充：2026-09-10 最新实现决策
 
 > [!IMPORTANT]
-> 本节记录最新讨论结果，并覆盖本文前面与之冲突的旧方案。v1 不再对所有 layer/expert/tier 建立全局宽度 MILP；默认活动档位改为 `768/640/512/384`，宽度低于 384 时直接量化为 0（删除 expert）。原 `768/512/384/256` 方案保留为可配置 ablation。
+> 本节给出当前第一版实现的最终口径。默认档位为 `[0, 384, 512, 640, 768]`；宽度低于 384 时直接量化为 0（删除 expert）。第一版不对所有 layer/expert/tier 建立全局宽度 MILP。
 
 最新流程为：
 
 1. 输入 `layer_sensitivity[L]`、`expert_sensitivity[L,E]`、`scores[L,E,I]` 和 `prune_ratio`，其中 `keep_ratio=1-prune_ratio`；
 2. 调用现有 layer score-coverage binary search，根据逐层 sensitivity 分配每层原始保留通道数；
 3. 每层调用现有 expert coverage binary search。其搜索变量 alpha 控制每个 expert 需要覆盖的累计 channel score 比例，而不是直接按通道数量比例分配；
-4. 将原始 `[L,E]` 通道数圆整到 `{768,640,512,384,0}`，并以 128 为单位修复全局离散预算；
+4. 将原始 `[L,E]` 通道数圆整到 `{0,384,512,640,768}`，并以 128 为单位修复全局离散预算；
 5. 每层四个活动档位必须各出现至少一次，0 档不参与 placement；
 6. placement 阶段每层枚举 24 种档位到 EP rank 的 permutation；默认先贪心平衡部分累计负载，再用逐层局部搜索降低最终最大偏差。小规模或离线最优性对照可显式选择 MILP；
 7. 若 placement 的相对偏差不超过 `tolerance`，则接受；否则返回当前最佳偏差，并由 strict mode 决定是否报错。
 
 这样 width planning 的主体复杂度是 binary search、排序和贪心档位修复。默认 placement 每层只评估 24 个候选，不会随层数产生组合爆炸。保留的 MILP 对照路径包含约 `L*24+1` 个变量；Qwen3 的 48 层对应约 1153 个变量，但实测仍明显慢于默认方法。
 
-选择 `{768,640,512,384,0}` 的原因是：30% 剪枝时平均目标宽度为 537.6，512 和 640 正好位于目标两侧，量化误差较小；384 作为最低活动宽度比 256 更保守。该选择理论上更有利于保留单个活动 expert 的表达能力，但会增加直接删除弱 expert 的可能性，最终结论仍需与 `{768,512,384,256,0}` 做同预算精度 ablation。
+选择 `{0,384,512,640,768}` 的原因是：30% 剪枝时平均目标宽度为 537.6，512 和 640 正好位于目标两侧，量化误差较小；384 是最低活动宽度，再低则直接删除 expert。
+
+## 17. Codex 补充：Greedy 与 placement MILP 的关系
+
+### 17.1 两个阶段优化的不是同一件事
+
+| 阶段 | 已知输入 | 决策 | 优化目标 | 是否可能影响模型精度 |
+| --- | --- | --- | --- | --- |
+| 宽度规划 | layer/expert sensitivity、channel scores、prune ratio | 每个 expert 的宽度和 channel mask | 在全局剪枝预算下尽量保留高分 channel | 是 |
+| 跨层 placement | 已经完全固定的 expert 宽度及每层档位数量 | 每层四个宽度组到四个 rank 的排列 | 最小化四卡跨层累计静态权重负载的最大偏差 | 否（正确实现下） |
+
+placement 阶段不会再改 expert 宽度、保留 channel、router 语义或 sensitivity objective。在 dispatch 映射正确、四张 GPU 等价的前提下，两个不同 placement 表示同一个模型函数。更小的 placement 目标值不会带来更高的模型精度，它只能改善静态参数显存均衡，并可能降低 OOM 或静态计算 straggler 风险。
+
+> [!IMPORTANT]
+> 当前 placement objective 没有包含各 expert 的 token 路由量、activation 峰值、all-to-all 通信或 rank-specific 硬件差异。因此，静态权重更平衡也不等价于实际 latency 一定更低，仍需 runtime profile 验证。
+
+### 17.2 Greedy 和 MILP 在求解同一个 placement 目标
+
+> [!NOTE]
+> 本节的 MILP 专指“宽度已固定后的 Stage 2 placement MILP”，不是对所有 layer/expert/width 重新做宽度分配的全局 MILP。
+
+定义第 $\ell$ 层档位 $k$ 的固定负载为
+
+$$
+q_{\ell,k}=m_kn_{\ell,k}.
+$$
+
+每层选择一个 permutation $\pi_\ell$，将四个 $q_{\ell,k}$ 一一分配给四个 rank。给定所有层的 permutation 后，rank $g$ 的总负载和优化目标为
+
+$$
+W_g=\sum_\ell q_{\ell,\pi_\ell(g)},
+\qquad
+D=\max_g|W_g-\bar W|.
+$$
+
+$\bar W$ 由总参数量决定，不随 placement 改变。Greedy 和 MILP 都在最小化这个 $D$，差别只是搜索方式和是否给出全局最优证明。
+
+MILP 为每层的 24 个 permutation 建立二进制变量，约束每层恰好选一个，再用连续变量 $D$ 线性化四个 rank 的最大绝对偏差。当 HiGHS 以 `optimal` 状态结束时，结果对这个静态 placement objective 是可证明的全局最优。
+
+固定第一层为 identity 可以去除纯 rank 标号对称性，不会损失最优解。即便如此，$L$ 层的原始组合数仍是 $24^{L-1}$；$L=48$ 时约为 $7.4\times10^{64}$。MILP 不会真的穷举所有组合，但 branch-and-bound 在对称解多、LP relaxation 不紧时仍可能接近指数级增长。因此“只有 $24L+1$ 个变量”并不代表一定很快。
+
+### 17.3 当前 Greedy 具体如何做
+
+当前代码是一个确定性的 greedy + 1-opt coordinate descent：
+
+```text
+1. 固定第 0 层为 identity，消除 rank label 对称性。
+2. 计算每层四个 q[l,k] 的 max-min spread，spread 大的层先放。
+3. 对当前层枚举全部 24 个 permutation：
+   a. 优先选择当前部分累计负载最大偏差 D 最小的 permutation；
+   b. D 相同时，选择 sum_g (W[g]-mean(W))^2 更小的 permutation；
+   c. 仍相同时，用 permutation ID 确定性打破平局。
+4. 所有层放置完后做 coordinate descent：
+   a. 固定其他层，为当前层重新枚举 24 个 permutation；
+   b. 只要 (D, squared_deviation) 严格改善就替换；
+   c. 重复逐层扫描，直到整轮无改善或达到最大 pass 数。
+5. 最后计算 D / mean(W)，判断是否小于 tolerance。
+```
+
+当局部搜索因“整轮无改善”而收敛时，所谓“局部最优”是 **1-opt 局部最优**：固定其他所有层时，任意单独一个可变层改成其他 23 个 permutation 都不会让 $(D,\text{squared deviation})$ 更小。它不排除“同时修改两层或更多层才会改善”的情况；如果先达到最大 pass 数则不声称已经 1-opt 收敛。
+
+Greedy 的初始放置复杂度约为 $O(24L)$，每个局部搜索 pass 也是 $O(24L)$；四个 rank 是常数。实际 48 层例子只用了 3 个 pass。
+
+### 17.4 “找到全局最优的概率”应如何理解
+
+Greedy 对给定输入是确定性的，因此对某一份固定 plan，它要么命中全局最优，要么没有命中，不存在内在的“成功概率”。只有先指定随机生成 $n_{\ell,k}$ 的数据分布，才能统计该分布下的经验命中率；这个数字不能直接当成真实模型的概率。
+
+为了展示量级，使用固定 seed `20260910` 生成 5000 个人工三层实例，每个 $n_{\ell,k}$ 独立均匀取 $[1,16]$ 的整数，并穷举固定第一层后的 $24^2=576$ 个组合：
+
+- Greedy 精确命中全局最优 2947 次，该人工分布下的经验命中率为 58.94%；
+- 在没命中的实例中，$(D_{greedy}-D_{optimal})/\bar W$ 平均为 5.31%，P95 为 13.56%；
+- 这是故意很小、层数很少的随机问题，不是 Qwen3 的实际分布，只用来证明“Greedy 不保证全局最优”和“不能声称固定命中概率”。
+
+对真实 48 层 plan，更实用的判断不是“permutation 是否与 MILP 完全相同”，而是最终相对偏差是否达到部署 tolerance。
+
+### 17.5 三个具体例子
+
+#### 例 1：Greedy 与 MILP 肯定等价的零偏差对称例
+
+假设四层的档位数量都是 `[8,4,2,1]`，列顺序为 `[768,640,512,384]`。每层四个组的负载是
+
+```text
+[6144, 2560, 1024, 384]
+```
+
+四层各用一次循环排列，则每张卡恰好收到一次这四个数，总负载都是 `10112`，所以 $D=0$。由于 $D$ 的理论下界就是 0，Greedy 只要找到该解，就已经可以证明全局最优；当前测试中 Greedy 和 MILP 都得到 `[10112,10112,10112,10112]`。
+
+#### 例 2：需要同时改两层的局部最优反例
+
+三层档位数量如下，列顺序仍为 `[768,640,512,384]`：
+
+| layer | 768 | 640 | 512 | 384 |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 3 | 2 | 12 | 2 |
+| 1 | 14 | 7 | 11 | 1 |
+| 2 | 14 | 6 | 4 | 2 |
+
+Greedy + 1-opt 得到 rank 负载 `[10624,8960,17280,12288]`，$\bar W=12288$，$D=4992$（相对偏差 40.625%）。此时单独改任意一层都不能改善目标，但同时改动 layer 1 和 layer 2 后，全局最优负载为 `[11776,12800,12672,11904]`，$D=512$（相对偏差 4.167%）。这正是 1-opt 会落入局部最优的原因。
+
+#### 例 3：48 层规模下已经远低于 tolerance
+
+在当前环境的 `48x128x768`、30% 剪枝合成 smoke test 中，Greedy 得到
+
+```text
+rank loads = [825728, 825472, 825856, 825984]
+relative max deviation = 0.034877%
+tolerance = 1%
+```
+
+该结果不能证明 $D=288$ 就是全局最优；但它只是 tolerance 的约 1/29。即使 MILP 把 $D$ 继续降到 0，也不会改变任何 expert 的宽度和 channel，因而不会改善模型精度。
+
+### 17.6 什么时候 Greedy 与 MILP 等价
+
+1. **Greedy 得到 $D=0$：** 已经达到目标函数理论下界，必然全局最优。
+2. **MILP 证明的 optimal objective 与 Greedy 相同：** 两者的 permutation 可以不同，但对当前目标等价。
+3. **每层四个 $q_{\ell,k}$ 本来就相等：** 该层任意 permutation 都一样；若每层都满足，所有 placement 都完全等价。
+4. **层负载存在可被 Greedy 找到的完整对称块：** 例如例 1 中四个相同层分别使用四个循环 permutation。
+
+另外，当 Greedy 和 MILP 都低于 tolerance 时，可以称为**部署上等价**，但不代表它们的 $D$ 数学上相同。
+
+### 17.7 实测时间与第一版选择
+
+以当前机器、SciPy/HiGHS 和固定 seed 的 placement-only 测试为例：
+
+| 实例 | Greedy | MILP | 备注 |
+| --- | ---: | ---: | --- |
+| 随机 4 层 | 0.0022 s | 0.0784 s | Greedy $D=960$，MILP $D=704$ |
+| 随机 8 层 | 0.0216 s | >30 s | MILP 在 30 s 外部超时时尚未结束 |
+| 48 层 smoke plan | 约 0.024 s | >120 s | 先前 MILP smoke run 超过 2 分钟后中止 |
+
+这些数字只说明 MILP 耗时高度依赖实例，不是通用性能承诺。某些更大实例可能因为下界更紧而很快，某些小实例也可能因为大量对称候选而很慢。
+
+第一版的建议策略是：
+
+1. 默认使用 Greedy；
+2. 如果相对最大偏差已低于 tolerance，直接接受，不为了证明一个与精度无关的更小 $D$ 强制跑 MILP；
+3. 如果 Greedy 超过 tolerance，再用 `placement_method="milp"` 做离线最优性求解；
+4. 若 MILP 也证明无法达到 tolerance，则需要回到宽度规划阶段改变每层的档位数量，而不是继续换 permutation。
+
+如果以后需要介于两者之间的方法，可以增加多起点 Greedy、2-opt 两层联合交换，或者为 MILP 设置 time limit 并接受带 optimality gap 的 incumbent。这些都可以提高解质量，但只有完整 MILP 以 `optimal` 结束或达到显式理论下界时，才能声称全局最优。
