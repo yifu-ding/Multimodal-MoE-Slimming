@@ -28,6 +28,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--prune-ratio", type=float, default=0.30)
     parser.add_argument("--placement-tolerance", type=float, default=0.01)
+    parser.add_argument(
+        "--balance-tier-counts",
+        action="store_true",
+        help="Use strongly balanced tier counts for a performance-only diagnostic plan.",
+    )
     return parser.parse_args()
 
 
@@ -91,6 +96,7 @@ def main() -> int:
         widths=(0, 384, 512, 640, 768),
         placement_tolerance=args.placement_tolerance,
         strict_placement_tolerance=False,
+        balance_tier_counts=args.balance_tier_counts,
         verbose=True,
     )
     plan.update(
@@ -102,6 +108,9 @@ def main() -> int:
             "source_model_revision": model_path.name,
             "plan_purpose": "performance_only",
             "score_proxy": "mean_abs_gate_plus_up_plus_down_weights",
+            "tier_count_policy": (
+                "balanced_exact_budget" if args.balance_tier_counts else "score_aware"
+            ),
         }
     )
     validate_ep4_plan(plan)

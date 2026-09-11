@@ -1,116 +1,109 @@
 # Qwen3-VL EP4 效率实验画图说明
 
-## 实验范围
+## 最终数据
 
-当前已完成并可用于画图的是 30% 和 50% 剪枝实验：
-
-- 模型：`Qwen/Qwen3-VL-30B-A3B-Instruct`
-- 任务：GQA
-- 硬件：4 x NVIDIA H20
-- 后端：vLLM 0.11.2，CUDA fused-MoE，EP=4
-- 剪枝比例：30%、50%
-- 三种策略：`padded`、`multi_kernel`、`cross_layer`
-- batch size：8、16、32、64、128、256、512
-- 每个点：1 个 warmup batch，4 个 measured batch
-- `gpu_memory_utilization=0.90`，KV cache 由 vLLM 自动分配
-
-数据目录：
+画图只使用本轮 balanced、prefill-only 四卡 sweep：
 
 ```text
-artifacts/efficiency_figure/qwen3_gqa_ep4/batch_sweep/prune_30/
-artifacts/efficiency_figure/qwen3_gqa_ep4/batch_sweep/prune_50/
+artifacts/efficiency_figure/qwen3_gqa_ep4/batch_sweep_balanced_prefill/prune_30/
+artifacts/efficiency_figure/qwen3_gqa_ep4/batch_sweep_balanced_prefill/prune_50/
 ```
 
-每个剪枝比例目录都包含以下主要文件：
+每个剪枝比例目录包含：
 
-- `throughput_memory_curve.csv`：三种策略的完整 batch-size 曲线，共 21 个点
+- `throughput_memory_curve.csv`：三种策略的完整 batch-size 曲线，共 21 个画图点
 - `best_by_strategy.csv`：每种策略在已测试范围内的最佳吞吐点
 - `sweep_status.tsv`：每个点的完成状态和搜索终止状态
-- `sweep_summary.json`：CSV 内容的结构化汇总
+- `sweep_summary.json`：上述结果的结构化汇总
 
-## 推荐主图
+旧的 `batch_sweep`、单点测试、unbalanced 分配和 block12 ablation 已删除，不应再用于画图。
 
-建议使用两面板图，而不是将所有信息压在同一个双 Y 轴中。
+## 实验协议
 
-### (a) Saturation throughput vs. batch size
+- 模型：`Qwen/Qwen3-VL-30B-A3B-Instruct`
+- 模型结构：48 个 MoE 层，每层 128 个专家，原始专家宽度 768
+- 任务：GQA，使用真实图像
+- 硬件：4 x NVIDIA H20；每个点开始前确认四卡无其他 compute process 且显存占用不超过 64 MiB
+- 后端：vLLM 0.11.2、CUDA、BF16、TP=4、EP=4、eager mode
+- MoE 执行：vLLM fused-MoE kernel
+- 剪枝比例：30%、50%
+- 宽度档位：0、384、512、640、768
+- 策略：`padded`、`multi_kernel`、逐层 greedy `cross_layer`
+- batch size：8、16、32、64、128、256、512
+- 每个点：1 个 warmup batch + 4 个 measured batch
+- 生成设置：`max_new_tokens=1`，只执行 prefill 和产生首 token，不包含迭代 decode
+- 显存设置：`gpu_memory_utilization=0.90`，未固定 KV cache，交由 vLLM 自动分配
 
-- X 轴：`batch_size`，使用以 2 为底的离散刻度
-- Y 轴：`requests_per_second`
+balanced plan 使用真实 Qwen 权重的 gate/up/down mean-absolute magnitude 确定专家身份和通道顺序，但为纯性能实验强制平衡四个活跃宽度档位。它不用于精度结论。
+
+| Pruning | 每层 Width 384 | 每层 Width 512 | 每层 Width 640 | 每层 Width 768 | 每层 Width 0 | 实际剪枝率 |
+|---|---:|---:|---:|---:|---:|---:|
+| 30% | 29-30 | 29-30 | 29-30 | 29-30 | 8-9 | 29.9995% |
+| 50% | 21-22 | 21-22 | 21-22 | 21-22 | 42-43 | 50.0000% |
+
+## 主结果
+
+以下是 batch size 512 的结果。所有策略在两个剪枝率下均成功运行到 512；`capped` 表示达到本轮预设上限，不表示 512 是 OOM 前的真实上限。
+
+| Pruning | Strategy | Requests/s | Input tokens/s | p95 batch latency (s) | Peak (GiB/GPU) | KV (GiB/GPU) | Non-KV peak (GiB/GPU) |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 30% | padded | 77.03 | 22,966 | 7.230 | 92.38 | 58.13 | 34.25 |
+| 30% | multi-kernel | 74.44 | 22,195 | 7.636 | 91.15 | 50.38 | 40.77 |
+| 30% | cross-layer | 77.83 | 23,206 | 7.108 | 92.40 | 62.15 | 30.25 |
+| 50% | padded | 75.96 | 22,648 | 7.222 | 92.37 | 58.13 | 34.24 |
+| 50% | multi-kernel | 74.17 | 22,113 | 7.641 | 91.19 | 55.55 | 35.64 |
+| 50% | cross-layer | 77.06 | 22,975 | 7.113 | 92.43 | 64.84 | 27.59 |
+
+batch size 512 时：
+
+- 30%：cross-layer 相比 padded 吞吐提高 1.04%，Non-KV 峰值减少 4.00 GiB/GPU；相比 multi-kernel 吞吐提高 4.56%，Non-KV 峰值减少 10.52 GiB/GPU。
+- 50%：cross-layer 相比 padded 吞吐提高 1.44%，Non-KV 峰值减少 6.65 GiB/GPU；相比 multi-kernel 吞吐提高 3.90%，Non-KV 峰值减少 8.05 GiB/GPU。
+
+## 推荐画法
+
+推荐使用 2 x 2 图，两列分别对应 30% 和 50% 剪枝率：
+
+- 上排：X 轴 `batch_size`，Y 轴 `requests_per_second`
+- 下排：X 轴 `batch_size`，Y 轴 `max_non_kv_peak_memory_mib / 1024`（GiB/GPU）
 - 三条曲线：`padded`、`multi_kernel`、`cross_layer`
-- 可在附图中将 Y 轴替换成 `total_tokens_per_second`
+- 吞吐补充图可将 Y 轴替换为 `input_tokens_per_second`
 
-GQA 的答案很短，`output_tokens_per_second` 容易受少量生成 token 波动影响；主图使用 req/s 更能反映端到端多模态请求处理能力。`total_tokens_per_second` 主要由输入 token 决定，适合作为补充指标。
-
-### (b) Non-KV peak memory vs. batch size
-
-- X 轴：`batch_size`
-- Y 轴：`max_non_kv_peak_memory_mib / 1024`，单位 GiB/GPU
-- 三条曲线与 (a) 使用相同颜色和 marker
-- 使用四卡中的最大值，而不是四卡均值，因为最重 rank 决定可运行上限
-
-该指标按每个实验点实际分配的 KV cache 单独扣除：
+主内存指标使用四卡最大 Non-KV 峰值，因为最重 rank 决定可运行上限。CSV 已提供 `max_non_kv_peak_memory_mib`，其计算为：
 
 ```text
-Non-KV peak = max_peak_memory_mib / 1024 - gpu_kv_cache_gib
+Non-KV peak = max_peak_memory_mib - gpu_kv_cache_gib * 1024
 ```
 
-CSV 已直接提供 `max_non_kv_peak_memory_mib`，画图时不需要再次计算。这里的 Non-KV 包含模型权重、CUDA context、视觉 encoder cache、通信与 MoE workspace、allocator cache 和激活；不要将它标成纯“权重+激活”。
+Non-KV 包含模型权重、CUDA context、视觉 encoder cache、通信与 MoE workspace、allocator cache 和激活，不应标为纯“权重+激活”。vLLM 会把 90% 显存预算中的剩余空间分配给 KV cache，因此三种策略的总峰值接近是正常现象；省下的 Non-KV 显存体现为更大的 KV capacity。
 
-## 推荐内存分解图
+## 复现命令
 
-为了说明三种策略的总峰值为何接近，建议再画一个 batch 512 的堆叠柱状图：
+先生成 balanced plan（50% 时把两个 `30` 和 `0.30` 分别改为 `50` 和 `0.50`）：
 
-- 下段：`max_non_kv_peak_memory_mib / 1024`
-- 上段：`gpu_kv_cache_gib`
-- 柱顶：`max_peak_memory_mib / 1024`
-- 柱旁标注：`gpu_kv_cache_tokens`
+```bash
+MODEL_PATH=/path/to/models--Qwen--Qwen3-VL-30B-A3B-Instruct/snapshots/9c4b90e1e4ba969fd3b5378b57d966d725f1b86c
+python scripts/build_qwen_weight_proxy_ep4_plan.py \
+  --model-path "$MODEL_PATH" \
+  --output artifacts/efficiency_figure/qwen3_gqa_ep4/weight_proxy_ep4_30_balanced.pt \
+  --prune-ratio 0.30 \
+  --balance-tier-counts
+```
 
-vLLM 会将 90% 显存预算中剩余的空间自动分配给 KV cache。因此，总显存接近不代表三种策略的模型与 workspace 开销接近；更低的 Non-KV 占用会体现为更大的 KV capacity。
+再运行四卡 sweep：
 
-batch 512 的 50% 剪枝结果如下：
+```bash
+EP4_PLAN=artifacts/efficiency_figure/qwen3_gqa_ep4/weight_proxy_ep4_30_balanced.pt \
+OUTPUT_ROOT=artifacts/efficiency_figure/qwen3_gqa_ep4/batch_sweep_balanced_prefill/prune_30 \
+START_BATCH_SIZE=8 MAX_BATCH_SIZE=512 \
+MEASURED_BATCHES=4 WARMUP_BATCHES=1 \
+STRATEGIES=padded,multi_kernel,cross_layer \
+PREFILL_TASK=gqa_prefill PREFILL_MAX_NEW_TOKENS=1 \
+GPU_MEMORY_UTILIZATION=0.90 \
+bash scripts/run_qwen_ep4_batch_sweep.sh
+```
 
-| Strategy | req/s | p95 batch latency (s) | Peak (GiB/GPU) | KV (GiB/GPU) | Non-KV peak (GiB/GPU) | KV capacity (tokens) |
-|---|---:|---:|---:|---:|---:|---:|
-| padded | 65.92 | 8.42 | 92.38 | 58.13 | 34.25 | 2,539,520 |
-| multi-kernel | 62.83 | 8.90 | 91.09 | 55.49 | 35.60 | 2,424,592 |
-| cross-layer | 68.44 | 8.09 | 92.40 | 64.83 | 27.57 | 2,832,160 |
+## 限制
 
-在该点，cross-layer 相比 padded 的 req/s 提高约 3.8%，Non-KV 峰值降低约 6.68 GiB/GPU；相比 multi-kernel 的 req/s 提高约 8.9%，Non-KV 峰值降低约 8.03 GiB/GPU。
-
-batch 512 的 30% 剪枝结果如下：
-
-| Strategy | req/s | p95 batch latency (s) | Peak (GiB/GPU) | KV (GiB/GPU) | Non-KV peak (GiB/GPU) | KV capacity (tokens) |
-|---|---:|---:|---:|---:|---:|---:|
-| padded | 69.54 | 7.80 | 92.38 | 58.13 | 34.25 | 2,539,520 |
-| multi-kernel | 64.04 | 8.56 | 91.08 | 50.30 | 40.78 | 2,197,552 |
-| cross-layer | 68.62 | 7.86 | 92.46 | 62.16 | 30.30 | 2,715,680 |
-
-30% 剪枝下，batch 512 的 padded 吞吐比 cross-layer 高约 1.3%，但 cross-layer 的 Non-KV 峰值低约 3.95 GiB/GPU。画图时应保留这一结果，不把 50% 剪枝下的速度结论外推到 30%。
-
-## 可选单图方案
-
-如果版面只能容纳一张图，可使用双 Y 轴：
-
-- X 轴：`batch_size`
-- 左 Y 轴：`requests_per_second`，实线
-- 右 Y 轴：`max_non_kv_peak_memory_mib / 1024`，虚线
-- 颜色区分策略，线型区分指标
-
-不要用时间作为当前主图 X 轴。时间序列适合展示单次运行的瞬时显存与吞吐，但当前论文问题是不同并发下的饱和效率，batch size 曲线更直接，也更容易公平比较。
-
-## 状态与限制
-
-- 两个剪枝比例下的三种策略都在 batch 512 成功，`search_terminal_status=capped`。
-- `capped` 表示到达本轮预设上限和 GQA 样本预算，并不表示 batch 512 是 OOM 前的真实最大稳定 batch。
-- `activation_workspace_delta_*` 是 warmup 后基线到正式测量峰值的增量。CUDA allocator 已可能在 warmup 中缓存 workspace，因此该列可能只有数 MiB，不能作为完整激活显存使用。
-- `rank0_model_loading_gib` 是 vLLM rank 0 日志中的加载阶段指标，可作为诊断项，不应替代四卡最大 Non-KV 峰值作为主内存指标。
-- 当前每个点只有 4 个 measured batch。p95 适合展示趋势；若作为论文中的高精度尾延迟结论，应增加重复次数。
-
-## 样式建议
-
-- `padded`：灰色圆点
-- `multi_kernel`：橙色三角
-- `cross_layer`：蓝绿色方块
-- batch size 使用明确的离散刻度，不使用连续插值
-- 吞吐图从 0 起始；内存图可从 0 起始，或在图注中明确截断范围
-- 图注中写清 `4 x H20`、`vLLM fused-MoE`、`GQA`、剪枝比例和 `gpu_memory_utilization=0.90`
+- 当前每个点只有 4 个 measured batch。p95 可用于趋势图；若作为高精度尾延迟结论，应增加重复次数。
+- `activation_workspace_delta_*` 从 warmup 后基线计算。allocator 可能已在 warmup 缓存 workspace，因此不能将该列视为完整激活显存。
+- `rank0_model_loading_gib` 只用于诊断，不应替代四卡最大 Non-KV 峰值。

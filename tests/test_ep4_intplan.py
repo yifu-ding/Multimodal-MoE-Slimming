@@ -2,6 +2,8 @@ import torch
 
 from src.generate_mask.ep4_intplan import (
     DEFAULT_WIDTHS,
+    _quantize_balanced_widths_to_budget,
+    plan_ep4_from_masks,
     plan_ep4_intplan,
     solve_cross_layer_placement,
 )
@@ -84,6 +86,40 @@ def test_prune_ratio_is_not_interpreted_as_keep_ratio():
     assert abs(result["actual_prune_ratio"] - 0.30) < 128 / scores.numel()
 
 
+def test_balanced_performance_tiers_hit_qwen_global_budgets():
+    raw_counts = torch.arange(48 * 128, dtype=torch.int64).reshape(48, 128) % 769
+    total_channels = 48 * 128 * 768
+    expected_global_counts = {
+        0.30: [1433, 1433, 1434, 1434],
+        0.50: [1024, 1024, 1024, 1024],
+    }
+
+    for prune_ratio, expected_counts in expected_global_counts.items():
+        target = round((1.0 - prune_ratio) * total_channels / 128) * 128
+        widths, actual = _quantize_balanced_widths_to_budget(
+            raw_counts=raw_counts,
+            active_widths=(768, 640, 512, 384),
+            unit=128,
+            target_keep_channels=target,
+        )
+        active_counts = torch.stack(
+            [(widths == width).sum() for width in (384, 512, 640, 768)]
+        )
+        per_layer_counts = torch.stack(
+            [(widths == width).sum(dim=1) for width in (384, 512, 640, 768)],
+            dim=1,
+        )
+
+        assert actual == target
+        assert active_counts.tolist() == expected_counts
+        assert int((active_counts.max() - active_counts.min()).item()) <= 1
+        per_layer_spread = (
+            per_layer_counts.max(dim=1).values - per_layer_counts.min(dim=1).values
+        )
+        assert int(per_layer_spread.max()) <= 1
+        assert int((widths == 0).sum().item()) > 0
+
+
 def test_infeasible_budget_is_rejected_when_all_active_tiers_are_mandatory():
     generator = torch.Generator().manual_seed(11)
     scores = torch.rand((1, 4, 768), generator=generator)
@@ -116,3 +152,31 @@ def test_strict_placement_tolerance_rejects_unbalanced_single_layer():
         assert "exceeds tolerance" in str(error)
     else:
         raise AssertionError("expected strict placement tolerance to reject the plan")
+
+
+def test_plan_from_masks_preserves_mask_priority_and_mapping_invariants():
+    generator = torch.Generator().manual_seed(19)
+    scores = torch.rand((4, 8, 768), generator=generator)
+    base_masks = torch.zeros_like(scores, dtype=torch.bool)
+    base_masks[..., :538] = True
+    result = plan_ep4_from_masks(
+        base_masks,
+        torch.tensor([0.4, 1.2, 0.8, 2.0]),
+        torch.rand((4, 8), generator=generator) + 0.1,
+        scores,
+        prune_ratio=0.30,
+        placement_tolerance=0.20,
+    )
+
+    assert result["plan_source"] == "maes_intermediate_masks"
+    assert int(result["expert_widths"].sum()) == result["target_keep_channels"]
+    assert result["intermediate_masks"].sum(dim=-1).equal(result["expert_widths"])
+    removed = result["expert_widths"] == 0
+    assert (result["expert_to_rank"][removed] == -1).all()
+    assert (result["expert_to_local_id"][removed] == -1).all()
+
+    # Any expert quantized below the base keep count must contain only channels
+    # that were already selected by the source mask.
+    shrunk = result["expert_widths"] <= 512
+    selected_outside_base = result["intermediate_masks"][..., 538:].any(dim=-1)
+    assert not bool((shrunk & selected_outside_base).any())

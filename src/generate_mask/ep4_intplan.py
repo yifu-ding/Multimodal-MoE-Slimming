@@ -287,6 +287,116 @@ def _prefix_value(prefix: torch.Tensor, layer: int, expert: int, width: int) -> 
     return float(prefix[layer, expert, width - 1].item())
 
 
+def _quantize_balanced_widths_to_budget(
+    raw_counts: torch.Tensor,
+    active_widths: tuple[int, ...],
+    unit: int,
+    target_keep_channels: int,
+) -> tuple[torch.Tensor, int]:
+    """Build an exact-budget plan with balanced active-tier expert counts.
+
+    This mode is intended for performance experiments where balanced fused-MoE
+    group sizes matter more than preserving the score-derived width histogram.
+    Expert identities are still assigned monotonically by their raw keep counts.
+    """
+    num_layers, num_experts = raw_counts.shape
+    active_ascending = tuple(sorted(active_widths))
+    tier_units = tuple(width // unit for width in active_ascending)
+    if any(width % unit != 0 for width in active_ascending):
+        raise ValueError(f"active widths must be divisible by width unit {unit}")
+    if target_keep_channels % unit != 0:
+        raise ValueError(
+            f"target_keep_channels={target_keep_channels} is not divisible by width unit {unit}"
+        )
+
+    target_units = target_keep_channels // unit
+    num_tiers = len(active_ascending)
+    total_experts = num_layers * num_experts
+    best_counts: tuple[int, ...] | None = None
+    best_key: tuple[int, int] | None = None
+    minimum_active = num_layers * num_tiers
+
+    # For a fixed active-expert total, the most balanced tier counts are q or
+    # q+1. Enumerating which tiers receive the remainder gives the exact global
+    # channel budget without a large integer program.
+    for active_total in range(minimum_active, total_experts + 1):
+        base_count, remainder = divmod(active_total, num_tiers)
+        for extra_tiers in itertools.combinations(range(num_tiers), remainder):
+            counts = [base_count] * num_tiers
+            for tier in extra_tiers:
+                counts[tier] += 1
+            if min(counts) < num_layers:
+                continue
+            keep_units = sum(count * width for count, width in zip(counts, tier_units))
+            if keep_units != target_units:
+                continue
+            key = (max(counts) - min(counts), -active_total)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_counts = tuple(counts)
+
+    if best_counts is None:
+        raise ValueError(
+            "the pruning target cannot be represented with globally balanced active tiers: "
+            f"target_keep={target_keep_channels}, layers={num_layers}, experts={num_experts}, "
+            f"active_widths={active_ascending}"
+        )
+
+    # Spread each tier's remainder across layers while keeping the total number
+    # of active experts per layer balanced. Raw layer budgets only break ties.
+    layer_tier_counts = torch.tensor(
+        [[count // num_layers for count in best_counts] for _ in range(num_layers)],
+        dtype=torch.int64,
+    )
+    row_extras = torch.zeros(num_layers, dtype=torch.int64)
+    raw_layer_units = raw_counts.sum(dim=1, dtype=torch.int64).float() / float(unit)
+    base_layer_units = (layer_tier_counts * torch.tensor(tier_units)).sum(dim=1).float()
+    residual_units = raw_layer_units - base_layer_units
+    tier_order = sorted(
+        range(num_tiers),
+        key=lambda tier: (-(best_counts[tier] % num_layers), -tier_units[tier], tier),
+    )
+    for tier in tier_order:
+        remainder = best_counts[tier] % num_layers
+        candidates = sorted(
+            range(num_layers),
+            key=lambda layer: (
+                int(row_extras[layer].item()),
+                -float(residual_units[layer].item()),
+                layer,
+            ),
+        )
+        for layer in candidates[:remainder]:
+            layer_tier_counts[layer, tier] += 1
+            row_extras[layer] += 1
+            residual_units[layer] -= tier_units[tier]
+
+    expected_global = torch.tensor(best_counts, dtype=torch.int64)
+    if not layer_tier_counts.sum(dim=0).equal(expected_global):
+        raise RuntimeError("balanced tier scheduler did not preserve global tier counts")
+    per_layer_spread = layer_tier_counts.max(dim=1).values - layer_tier_counts.min(dim=1).values
+    if int(per_layer_spread.max().item()) > 1:
+        raise RuntimeError("balanced tier scheduler produced a per-layer tier-count spread above 1")
+
+    widths = torch.zeros_like(raw_counts)
+    for layer in range(num_layers):
+        slots: list[int] = []
+        for tier, width in enumerate(active_ascending):
+            slots.extend([width] * int(layer_tier_counts[layer, tier].item()))
+        slots.extend([0] * (num_experts - len(slots)))
+        if len(slots) != num_experts:
+            raise RuntimeError(f"balanced tier scheduler overfilled layer {layer}")
+        expert_order = torch.argsort(raw_counts[layer], stable=True)
+        widths[layer, expert_order] = torch.tensor(sorted(slots), dtype=widths.dtype)
+
+    final_keep = int(widths.sum().item())
+    if final_keep != target_keep_channels:
+        raise RuntimeError(
+            f"balanced tier budget mismatch: expected {target_keep_channels}, got {final_keep}"
+        )
+    return widths, final_keep
+
+
 def _quantize_widths_to_budget(
     raw_counts: torch.Tensor,
     sorted_scores: torch.Tensor,
@@ -295,8 +405,17 @@ def _quantize_widths_to_budget(
     active_widths: tuple[int, ...],
     unit: int,
     target_keep_channels: int,
+    balance_tier_counts: bool = False,
 ) -> tuple[torch.Tensor, int]:
     """Quantize by mandatory-tier anchors followed by marginal-cost upgrades."""
+    if balance_tier_counts:
+        return _quantize_balanced_widths_to_budget(
+            raw_counts=raw_counts,
+            active_widths=active_widths,
+            unit=unit,
+            target_keep_channels=target_keep_channels,
+        )
+
     num_layers, num_experts = raw_counts.shape
     active_ascending = tuple(sorted(active_widths))
     upgrade_widths = (0,) + active_ascending
@@ -779,6 +898,7 @@ def plan_ep4_intplan(
     layer_smooth_fn: str = "sqrt",
     binary_search_max_iter: int = 32,
     fix_first_layer_placement: bool = True,
+    balance_tier_counts: bool = False,
     verbose: bool = False,
 ) -> Dict[str, Any]:
     """Build an EP4 width and placement plan.
@@ -799,6 +919,9 @@ def plan_ep4_intplan(
             ``"milp"`` for an exact small-instance/offline reference.
         placement_local_search_passes: Maximum coordinate-descent passes used
             by the greedy placement method.
+        balance_tier_counts: Force the four active width tiers to contain as
+            close to the same number of experts as the exact budget permits.
+            This is useful for performance-only fused-MoE experiments.
 
     Returns:
         A dictionary containing raw/quantized channel counts, masks, per-layer
@@ -857,6 +980,7 @@ def plan_ep4_intplan(
         active_widths=active_widths,
         unit=unit,
         target_keep_channels=target_keep_channels,
+        balance_tier_counts=balance_tier_counts,
     )
 
     all_widths = tuple(sorted(normalized_widths, reverse=True))
@@ -914,6 +1038,7 @@ def plan_ep4_intplan(
         "active_width_counts": active_width_counts,
         "layer_sensitivity_weights": layer_weights,
         "expert_sensitivity_weights": expert_weights,
+        "tier_count_balance": bool(balance_tier_counts),
     }
     result.update(placement)
     result.update(mapping)
@@ -930,8 +1055,164 @@ def plan_ep4_intplan(
     return result
 
 
+@torch.no_grad()
+def plan_ep4_from_masks(
+    intermediate_masks: torch.Tensor,
+    layer_sensitivity: torch.Tensor,
+    expert_sensitivity: torch.Tensor,
+    scores: torch.Tensor,
+    prune_ratio: float,
+    *,
+    widths: Sequence[int] = DEFAULT_WIDTHS,
+    ep_size: int = 4,
+    placement_tolerance: float = 0.01,
+    strict_placement_tolerance: bool = False,
+    placement_method: str = "greedy",
+    placement_local_search_passes: int = 100,
+    layer_smooth_times: int = 2,
+    layer_smooth_fn: str = "sqrt",
+    fix_first_layer_placement: bool = True,
+    balance_tier_counts: bool = False,
+    verbose: bool = False,
+) -> Dict[str, Any]:
+    """Quantize an existing pruning mask into an executable EP4 plan.
+
+    The input mask is produced by the regular MAES pipeline, including its
+    modality-aware budgeting. Its per-expert channel counts are treated as the
+    continuous allocation target. Within each expert, channels selected by the
+    input mask remain ahead of unselected channels, with ``scores`` breaking
+    ties inside both groups.
+    """
+    if not isinstance(intermediate_masks, torch.Tensor) or intermediate_masks.ndim != 3:
+        raise ValueError(
+            "intermediate_masks must be a [layers, experts, channels] tensor"
+        )
+    masks = intermediate_masks.detach().to(device="cpu", dtype=torch.bool)
+    (
+        layer_sensitivity,
+        expert_sensitivity,
+        scores,
+        normalized_widths,
+        active_widths,
+        unit,
+    ) = _validate_inputs(
+        layer_sensitivity=layer_sensitivity,
+        expert_sensitivity=expert_sensitivity,
+        scores=scores,
+        prune_ratio=prune_ratio,
+        widths=widths,
+        ep_size=ep_size,
+    )
+    if masks.shape != scores.shape:
+        raise ValueError(
+            "intermediate_masks shape must equal scores shape: "
+            f"expected {tuple(scores.shape)}, got {tuple(masks.shape)}"
+        )
+
+    num_layers, num_experts, intermediate_size = scores.shape
+    raw_counts = masks.sum(dim=-1, dtype=torch.int64)
+
+    # Stable two-pass ordering: score descending inside each group, followed
+    # by selected channels before unselected channels.
+    score_order = torch.argsort(scores, dim=-1, descending=True, stable=True)
+    selected_in_score_order = torch.gather(masks, dim=-1, index=score_order)
+    selected_first = torch.argsort(
+        (~selected_in_score_order).to(torch.int8), dim=-1, stable=True
+    )
+    sorted_indices = torch.gather(score_order, dim=-1, index=selected_first)
+    sorted_scores = torch.gather(scores, dim=-1, index=sorted_indices).clamp_min(0.0)
+
+    layer_weights = _prepare_layer_weights(
+        layer_sensitivity,
+        smooth_times=layer_smooth_times,
+        smooth_fn=layer_smooth_fn,
+    )
+    expert_weights = _loss_to_layerwise_weights(expert_sensitivity)
+    total_channels = num_layers * num_experts * intermediate_size
+    continuous_target_keep = (1.0 - float(prune_ratio)) * total_channels
+    target_keep_units = int(round(continuous_target_keep / unit))
+    target_keep_channels = target_keep_units * unit
+    expert_widths, actual_keep_channels = _quantize_widths_to_budget(
+        raw_counts=raw_counts,
+        sorted_scores=sorted_scores,
+        layer_weights=layer_weights,
+        expert_weights=expert_weights,
+        active_widths=active_widths,
+        unit=unit,
+        target_keep_channels=target_keep_channels,
+        balance_tier_counts=balance_tier_counts,
+    )
+
+    all_widths = tuple(sorted(normalized_widths, reverse=True))
+    width_counts = torch.stack(
+        [
+            torch.stack(
+                [(expert_widths[layer] == width).sum() for width in all_widths]
+            )
+            for layer in range(num_layers)
+        ]
+    ).to(torch.int64)
+    active_columns = [all_widths.index(width) for width in active_widths]
+    active_width_counts = width_counts[:, active_columns]
+    placement = solve_cross_layer_placement(
+        width_counts=active_width_counts,
+        active_widths=active_widths,
+        tolerance=placement_tolerance,
+        fix_first_layer=fix_first_layer_placement,
+        method=placement_method,
+        max_local_search_passes=placement_local_search_passes,
+    )
+    if strict_placement_tolerance and not placement["tolerance_satisfied"]:
+        raise RuntimeError(
+            "best cross-layer placement exceeds tolerance: "
+            f"relative_deviation={placement['relative_max_rank_weight_deviation']:.6f}, "
+            f"tolerance={placement_tolerance:.6f}"
+        )
+
+    mapping = _build_masks_and_mappings(
+        expert_widths=expert_widths,
+        sorted_indices=sorted_indices,
+        active_widths=active_widths,
+        tier_to_rank=placement["tier_to_rank"],
+    )
+    actual_prune_ratio = 1.0 - float(actual_keep_channels) / float(total_channels)
+    result: Dict[str, Any] = {
+        "plan_source": "maes_intermediate_masks",
+        "prune_ratio": float(prune_ratio),
+        "keep_ratio": 1.0 - float(prune_ratio),
+        "actual_prune_ratio": actual_prune_ratio,
+        "actual_keep_ratio": 1.0 - actual_prune_ratio,
+        "target_keep_channels": int(target_keep_channels),
+        "actual_keep_channels": int(actual_keep_channels),
+        "width_unit": int(unit),
+        "widths": all_widths,
+        "active_widths": active_widths,
+        "base_K_E_inter": raw_counts,
+        "K_E_inter": expert_widths,
+        "expert_widths": expert_widths,
+        "width_counts": width_counts,
+        "active_width_counts": active_width_counts,
+        "layer_sensitivity_weights": layer_weights,
+        "expert_sensitivity_weights": expert_weights,
+        "tier_count_balance": bool(balance_tier_counts),
+    }
+    result.update(placement)
+    result.update(mapping)
+    if verbose:
+        print(
+            "[EP4 mask plan] "
+            f"target_prune={float(prune_ratio):.6f}, "
+            f"actual_prune={actual_prune_ratio:.6f}, "
+            f"rank_loads={placement['rank_weight_loads'].tolist()}, "
+            f"relative_deviation={placement['relative_max_rank_weight_deviation']:.6f}, "
+            f"tolerance_satisfied={placement['tolerance_satisfied']}"
+        )
+    return result
+
+
 __all__ = [
     "DEFAULT_WIDTHS",
+    "plan_ep4_from_masks",
     "plan_ep4_intplan",
     "solve_cross_layer_placement",
 ]

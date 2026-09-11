@@ -1,53 +1,54 @@
-# Qwen3-VL EP4 efficiency data
+# Qwen3-VL EP4 balanced prefill efficiency data
 
-This directory contains four-GPU measurements for
+This directory contains the final plot-ready four-GPU measurements for
 `Qwen/Qwen3-VL-30B-A3B-Instruct` after 30% and 50% structured MoE channel
-pruning. The model has 48 MoE layers, 128 experts per layer, and an original
-expert intermediate width of 768.
+pruning.
+
+Use only these result directories:
+
+```text
+batch_sweep_balanced_prefill/prune_30/
+batch_sweep_balanced_prefill/prune_50/
+```
+
+Each directory contains `throughput_memory_curve.csv` (21 points),
+`best_by_strategy.csv`, `sweep_status.tsv`, and `sweep_summary.json`. The curve
+CSV is the primary plotting input.
 
 ## Protocol
 
-- Hardware: 4 x NVIDIA H20, verified idle before every strategy
-- Backend: vLLM 0.11.2, CUDA, BF16, eager mode, TP=4, EP=4
+- Hardware: 4 x NVIDIA H20, verified idle before every point
+- Backend: vLLM 0.11.2, CUDA, BF16, eager mode, TP4 + EP4
 - MoE execution: vLLM fused-MoE kernels
-- Task: GQA with real images
-- Batch size: 8
-- Samples: 8 warmup followed by 64 measured samples
-- KV cache: 4 GiB per rank
+- Task: GQA with real images, prefill only (`max_new_tokens=1`)
+- Pruning ratios: 30% and 50%
+- Strategies: padded, multi-kernel, and per-layer greedy cross-layer
+- Batch sizes: 8, 16, 32, 64, 128, 256, and 512
+- Repetitions: 1 warmup batch + 4 measured batches per point
+- Memory: `gpu_memory_utilization=0.90`; vLLM automatically sizes KV cache
 - Width tiers: 0, 384, 512, 640, and 768
 
-The plans were derived from the real checkpoint's gate/up/down weights using
-mean absolute weight magnitude as a performance-experiment proxy. They should
-not be treated as substitutes for calibration-based scores in accuracy claims.
+The performance-only plans balance the four active width tiers. At 30%
+pruning, every layer has 29-30 experts in each active tier and 8-9 zero-width
+experts. At 50%, each active tier has 21-22 experts per layer and the zero tier
+has 42-43. Actual pruning is 29.9995% and 50.0000%, respectively.
 
-## Adjusted width counts
+The real checkpoint's gate/up/down mean-absolute weight magnitude determines
+expert identities and channel order. These balanced plans are intended for
+efficiency measurements and should not be used for accuracy claims.
 
-| Pruning | Width 0 | Width 384 | Width 512 | Width 640 | Width 768 |
-|---|---:|---:|---:|---:|---:|
-| 30% | 0 | 70 | 4823 | 1203 | 48 |
-| 50% | 96 | 5904 | 48 | 48 | 48 |
+## Plotting
 
-The actual pruning ratios are 29.9995% and 50.0000%. The 30% greedy placement
-has 0.0194% maximum relative rank-load deviation. The 50% placement has 1.3672%
-deviation, which does not satisfy the configured 1% placement tolerance.
+For each pruning ratio, plot:
 
-## Summary
+- `requests_per_second` against `batch_size`
+- `max_non_kv_peak_memory_mib / 1024` against `batch_size`
+- optionally, `input_tokens_per_second` against `batch_size`
 
-| Pruning | Strategy | Requests/s | Total tokens/s | Mean peak MiB | Max peak MiB |
-|---|---|---:|---:|---:|---:|
-| 30% | padded | 5.2702 | 1538.88 | 29671.0 | 29671.0 |
-| 30% | multi_kernel | 4.2098 | 1230.13 | 35709.5 | 35969.0 |
-| 30% | cross_layer | 4.8337 | 1412.05 | 26261.0 | 26527.0 |
-| 50% | padded | 4.5129 | 1321.21 | 29671.0 | 29671.0 |
-| 50% | multi_kernel | 3.2293 | 945.09 | 31092.0 | 31617.0 |
-| 50% | cross_layer | 4.5771 | 1340.79 | 23254.0 | 23775.0 |
+Use the maximum memory across ranks because the heaviest rank determines the
+capacity limit. Non-KV peak includes weights, CUDA context, communication and
+MoE workspaces, allocator cache, and activations. It is not a pure
+weights-plus-activations measurement.
 
-Use `prune_*/batch_metrics.csv` for a sample-index plot combining memory and
-throughput. It contains cumulative samples, elapsed time, per-batch and
-cumulative throughput, four-rank memory statistics, utilization, and power.
-Use `prune_*/gpu_timeseries.csv` for the 200 ms per-GPU memory trace. Negative
-elapsed times in the GPU trace are model loading and warmup observations before
-the measured interval.
-
-Requests/s is the preferred primary throughput metric because the generated
-output-token count differs slightly across strategies.
+See `docs/qwen3_ep4_efficiency_plotting.md` for exact commands, the batch-512
+summary, metric interpretation, and figure recommendations.

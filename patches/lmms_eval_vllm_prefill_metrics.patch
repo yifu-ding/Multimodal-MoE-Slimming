@@ -1,0 +1,14 @@
+diff --git a/lmms-eval/lmms_eval/models/chat/vllm.py b/lmms-eval/lmms_eval/models/chat/vllm.py
+--- a/lmms-eval/lmms_eval/models/chat/vllm.py
++++ b/lmms-eval/lmms_eval/models/chat/vllm.py
+@@ -211,10 +211,10 @@ class VLLM(VLLMSimple):
+         for metric in metrics:
+             name = metric.name
+-            if "time_to_first_token" in name:
++            if "time_to_first_token" in name and metric.count:
+                 ttft = metric.sum / metric.count
+-            if "time_per_output_token_seconds" in name:
++            if "time_per_output_token_seconds" in name and metric.count:
+                 tpot = metric.sum / metric.count
+             if name == "vllm:generation_tokens":
+                 generation_tokens = metric.value
