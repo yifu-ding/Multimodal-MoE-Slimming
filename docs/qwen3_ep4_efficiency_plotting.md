@@ -2,12 +2,13 @@
 
 ## 实验范围
 
-当前已完成并可用于画图的是 50% 剪枝实验：
+当前已完成并可用于画图的是 30% 和 50% 剪枝实验：
 
 - 模型：`Qwen/Qwen3-VL-30B-A3B-Instruct`
 - 任务：GQA
 - 硬件：4 x NVIDIA H20
 - 后端：vLLM 0.11.2，CUDA fused-MoE，EP=4
+- 剪枝比例：30%、50%
 - 三种策略：`padded`、`multi_kernel`、`cross_layer`
 - batch size：8、16、32、64、128、256、512
 - 每个点：1 个 warmup batch，4 个 measured batch
@@ -16,10 +17,11 @@
 数据目录：
 
 ```text
+artifacts/efficiency_figure/qwen3_gqa_ep4/batch_sweep/prune_30/
 artifacts/efficiency_figure/qwen3_gqa_ep4/batch_sweep/prune_50/
 ```
 
-主要文件：
+每个剪枝比例目录都包含以下主要文件：
 
 - `throughput_memory_curve.csv`：三种策略的完整 batch-size 曲线，共 21 个点
 - `best_by_strategy.csv`：每种策略在已测试范围内的最佳吞吐点
@@ -65,7 +67,7 @@ CSV 已直接提供 `max_non_kv_peak_memory_mib`，画图时不需要再次计�
 
 vLLM 会将 90% 显存预算中剩余的空间自动分配给 KV cache。因此，总显存接近不代表三种策略的模型与 workspace 开销接近；更低的 Non-KV 占用会体现为更大的 KV capacity。
 
-batch 512 的当前结果如下：
+batch 512 的 50% 剪枝结果如下：
 
 | Strategy | req/s | p95 batch latency (s) | Peak (GiB/GPU) | KV (GiB/GPU) | Non-KV peak (GiB/GPU) | KV capacity (tokens) |
 |---|---:|---:|---:|---:|---:|---:|
@@ -74,6 +76,16 @@ batch 512 的当前结果如下：
 | cross-layer | 68.44 | 8.09 | 92.40 | 64.83 | 27.57 | 2,832,160 |
 
 在该点，cross-layer 相比 padded 的 req/s 提高约 3.8%，Non-KV 峰值降低约 6.68 GiB/GPU；相比 multi-kernel 的 req/s 提高约 8.9%，Non-KV 峰值降低约 8.03 GiB/GPU。
+
+batch 512 的 30% 剪枝结果如下：
+
+| Strategy | req/s | p95 batch latency (s) | Peak (GiB/GPU) | KV (GiB/GPU) | Non-KV peak (GiB/GPU) | KV capacity (tokens) |
+|---|---:|---:|---:|---:|---:|---:|
+| padded | 69.54 | 7.80 | 92.38 | 58.13 | 34.25 | 2,539,520 |
+| multi-kernel | 64.04 | 8.56 | 91.08 | 50.30 | 40.78 | 2,197,552 |
+| cross-layer | 68.62 | 7.86 | 92.46 | 62.16 | 30.30 | 2,715,680 |
+
+30% 剪枝下，batch 512 的 padded 吞吐比 cross-layer 高约 1.3%，但 cross-layer 的 Non-KV 峰值低约 3.95 GiB/GPU。画图时应保留这一结果，不把 50% 剪枝下的速度结论外推到 30%。
 
 ## 可选单图方案
 
@@ -88,7 +100,7 @@ batch 512 的当前结果如下：
 
 ## 状态与限制
 
-- 三种策略在 batch 512 均成功，`search_terminal_status=capped`。
+- 两个剪枝比例下的三种策略都在 batch 512 成功，`search_terminal_status=capped`。
 - `capped` 表示到达本轮预设上限和 GQA 样本预算，并不表示 batch 512 是 OOM 前的真实最大稳定 batch。
 - `activation_workspace_delta_*` 是 warmup 后基线到正式测量峰值的增量。CUDA allocator 已可能在 warmup 中缓存 workspace，因此该列可能只有数 MiB，不能作为完整激活显存使用。
 - `rank0_model_loading_gib` 是 vLLM rank 0 日志中的加载阶段指标，可作为诊断项，不应替代四卡最大 Non-KV 峰值作为主内存指标。
@@ -101,4 +113,4 @@ batch 512 的当前结果如下：
 - `cross_layer`：蓝绿色方块
 - batch size 使用明确的离散刻度，不使用连续插值
 - 吞吐图从 0 起始；内存图可从 0 起始，或在图注中明确截断范围
-- 图注中写清 `4 x H20`、`vLLM fused-MoE`、`GQA`、`50% pruning` 和 `gpu_memory_utilization=0.90`
+- 图注中写清 `4 x H20`、`vLLM fused-MoE`、`GQA`、剪枝比例和 `gpu_memory_utilization=0.90`

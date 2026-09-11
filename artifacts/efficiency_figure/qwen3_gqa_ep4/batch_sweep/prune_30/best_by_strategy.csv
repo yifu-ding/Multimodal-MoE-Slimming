@@ -1,0 +1,4 @@
+strategy,best_batch_size,best_requests_per_second,best_input_tokens_per_second,best_output_tokens_per_second,best_total_tokens_per_second,best_batch_latency_p95_seconds,best_max_peak_memory_mib,best_max_non_kv_peak_memory_mib,max_stable_batch_size,search_terminal_status,gpu_kv_cache_tokens_at_best,gpu_kv_cache_gib_at_best,rank0_model_loading_gib_at_best
+padded,512,69.5378622740746,20732.774754277107,168.92132070972713,20901.696074986834,7.802839565277099,94595.0,35069.88,512,capped,2539520,58.13,17.7478
+multi_kernel,512,64.04339488226304,19094.594472286757,155.48035124736904,19250.074823534127,8.55877445936203,93263.0,41755.8,512,capped,2197552,50.3,23.931
+cross_layer,512,68.6204108213055,20459.235797280184,167.76484227650226,20627.000639556685,7.864335036277771,94679.0,31027.160000000003,512,capped,2715680,62.16,13.7112
