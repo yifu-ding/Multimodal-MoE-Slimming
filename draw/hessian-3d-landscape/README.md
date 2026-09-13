@@ -7,10 +7,12 @@
 
 - 图 (a)-(b)：在 3,968 个 layer-expert 方向上，autograd HVP 分数
   `H_ee/2` 与 routed expert 输出能量、单 expert 删除误差一致。
-- 图 (c)：展示上述两种等价关系的数值相对误差分布。
+- 图 (c)：量化计算收益。逐 expert 暴力消融需要每层进行 128 次 forward；
+  Gram/energy 形式从一次正常 routed forward 同时取得所有 expert 的精确分数。
 - 图 (d)-(f)：展示第 0 层低、中、高敏感度 expert 的真实 beta forward。
   在恒等重构点，一阶预测为零；而对角 Hessian 给出的抛物线与所有实测点
-  重合，其中也包括 `beta_e=0` 的单 expert 删除点。
+  重合，其中也包括 `beta_e=0` 的单 expert 删除点。图中同时明确报告：一阶
+  排序的 Spearman 未定义，因为所有分数都是零；二阶排序的 Spearman 为 1。
 
 本图不包含任何双 expert 联合删除。
 
@@ -18,6 +20,45 @@
 experts，并使用校准 manifest 的前 32 个样本。这里没有必要运行模型的所有
 层，因为本实验验证的是逐点成立的代数等价关系，而不是对总体均值进行统计
 估计。
+
+## 为什么图 (a)-(b) 是正确性检查，而不是精度优势
+
+固定 router 后，block 输出对单个 expert scale `beta_e` 是线性的。记该
+expert 的 routed contribution 为 `f_e(x)`，则相对恒等输出的 MSE 为
+
+```text
+L(beta_e) = (beta_e - 1)^2 * ||f_e(x)||^2.
+```
+
+因此
+
+```text
+H_ee / 2 = ||f_e(x)||^2 = expert_output_energy
+           = single_expert_ablation at beta_e = 0.
+```
+
+所以图 (a)-(b) 中的点贴合 `y=x` 是由线性缩放和 MSE 共同保证的恒等式。
+Pearson/Spearman 接近 1、相对误差约为 `1e-7`，证明的是 HVP 数值实现、
+FP32 累积和 fixed-router 处理正确，并不表示它击败了一个较弱的预测方法。
+
+该恒等式的实际收益体现在图 (c)：暴力得到全部单 expert 删除代价，需要对
+每层 128 个 experts 分别做扰动 forward；Gram/energy 形式可以复用一次正常
+routed forward 中的 contribution，同时得到全部精确分数，即 128 次对 1 次。
+这里的“1 次”指 Gram/energy 数据获取，不应表述成“一次 HVP 得到全部 Hessian
+对角元”。本仓库的精确 HVP 验证实现使用分块 batched VJP，可能包含多次
+backward 调用。
+
+## 为什么一阶为零不是 strawman
+
+在 `beta_e=1` 的恒等重构点，`L=0` 且取得 MSE 最小值，因此根据极值点的一阶
+必要条件，所有 experts 都有 `g_e=dL/d beta_e=0`。一阶分数由此退化成一个
+常数，无法产生 expert 排序；其相对于真实删除代价的 Spearman 相关系数未定义。
+二阶分数随 expert 改变，对真实删除代价的 Spearman 为 `1.000000`。
+
+图 (d)-(f) 将这一点放在 P10、P50、P90 三种敏感度上直接展示：一阶预测对
+三者都给出相同的零，二阶曲率则给出不同抛物线并穿过真实 forward 点。这与
+Optimal Brain Damage 和 Optimal Brain Surgeon 中使用曲率区分待删除单元的
+经典论证一致。
 
 ## 每个数据点是什么意思
 

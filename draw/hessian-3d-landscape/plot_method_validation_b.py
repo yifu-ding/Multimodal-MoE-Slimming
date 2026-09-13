@@ -25,7 +25,6 @@ GRID = "#DCE1E5"
 TEAL = "#168681"
 RED = "#C4473A"
 GRAY = "#858A8E"
-BLUE = "#356C9B"
 
 plt.rcParams.update(
     {
@@ -55,6 +54,7 @@ def load(data_dir: Path) -> tuple[dict, dict[str, np.ndarray], list[dict]]:
         "hvp": np.asarray([float(row["hvp_hessian_half"]) for row in score_rows]),
         "energy": np.asarray([float(row["expert_output_energy"]) for row in score_rows]),
         "ablation": np.asarray([float(row["single_expert_ablation"]) for row in score_rows]),
+        "gradient": np.asarray([float(row["identity_gradient"]) for row in score_rows]),
     }
 
     with (data_dir / "method_validation_B_beta_curves.csv").open(encoding="utf-8") as handle:
@@ -106,9 +106,10 @@ def main() -> None:
     hvp = scores["hvp"]
     energy = scores["energy"]
     ablation = scores["ablation"]
+    gradient_values = scores["gradient"]
     valid = np.isfinite(hvp) & np.isfinite(energy) & np.isfinite(ablation) & (hvp > 0)
-    layer_ids, hvp, energy, ablation = (
-        values[valid] for values in (layer_ids, hvp, energy, ablation)
+    layer_ids, hvp, energy, ablation, gradient_values = (
+        values[valid] for values in (layer_ids, hvp, energy, ablation, gradient_values)
     )
     if hvp.size < 3:
         raise ValueError("Fewer than three active layer-expert observations are available.")
@@ -117,18 +118,13 @@ def main() -> None:
         "energy_vs_hvp": metric_summary(hvp, energy),
         "ablation_vs_hvp": metric_summary(hvp, ablation),
     }
-    errors = {
-        "energy": np.abs(energy - hvp) / np.maximum(np.abs(hvp), 1e-30),
-        "ablation": np.abs(ablation - hvp) / np.maximum(np.abs(hvp), 1e-30),
-    }
-
     fig, axes = plt.subplots(2, 3, figsize=(11.8, 7.2))
     fig.subplots_adjust(left=0.075, right=0.985, top=0.86, bottom=0.09, hspace=0.92, wspace=0.30)
     positive_values = np.concatenate((hvp, energy[energy > 0], ablation[ablation > 0]))
     limits = (float(positive_values.min()) * 0.85, float(positive_values.max()) * 1.18)
     for panel_idx, (ax, values, title, ylabel, summary) in enumerate((
-        (axes[0, 0], energy, "(a) HVP vs. expert-output energy", r"$s_e^{\rm energy}$", summaries["energy_vs_hvp"]),
-        (axes[0, 1], ablation, "(b) HVP vs. single-expert ablation", r"$s_e^{\rm ablate}$", summaries["ablation_vs_hvp"]),
+        (axes[0, 0], energy, "(a) Sanity check: HVP vs. Gram energy", r"$s_e^{\rm energy}$", summaries["energy_vs_hvp"]),
+        (axes[0, 1], ablation, "(b) Sanity check: HVP vs. single removal", r"$s_e^{\rm ablate}$", summaries["ablation_vs_hvp"]),
     )):
         scatter = ax.scatter(hvp, values, c=layer_ids, cmap="viridis", s=8, alpha=0.48, linewidths=0)
         ax.plot(limits, limits, color=RED, linestyle="--", linewidth=1.3, label=r"$y=x$")
@@ -151,21 +147,38 @@ def main() -> None:
             colorbar.set_label("Layer", fontsize=8, labelpad=2)
         finish_axes(ax)
 
-    for key, color, label in (
-        ("energy", TEAL, "Energy / HVP"),
-        ("ablation", BLUE, "Ablation / HVP"),
-    ):
-        x = np.sort(np.maximum(errors[key], 1e-12))
-        y = np.arange(1, x.size + 1) / x.size
-        axes[0, 2].plot(x, y, color=color, linewidth=2.0, label=label)
-    axes[0, 2].axvline(1e-4, color=GRAY, linestyle="--", linewidth=1.0, label=r"$10^{-4}$ target")
-    axes[0, 2].axvline(1e-2, color=RED, linestyle=":", linewidth=1.2, label=r"$10^{-2}$ limit")
-    axes[0, 2].set_xscale("log")
-    axes[0, 2].set_xlabel("Relative error")
-    axes[0, 2].set_ylabel("Cumulative fraction")
-    axes[0, 2].set_ylim(0, 1.02)
-    axes[0, 2].set_title("(c) Numerical agreement")
-    axes[0, 2].legend(frameon=False, fontsize=8, loc="lower right")
+    gradient_max_abs = float(np.max(np.abs(gradient_values)))
+    if gradient_max_abs > 1e-12:
+        raise ValueError(f"Expected first-order degeneracy, got max |g|={gradient_max_abs:.3e}.")
+    experts_per_layer = [int(np.sum(layer_ids == layer)) for layer in np.unique(layer_ids)]
+    if len(set(experts_per_layer)) != 1:
+        raise ValueError("Expected the same number of active experts in every plotted layer.")
+    num_experts = experts_per_layer[0]
+    cost_values = (num_experts, 1)
+    bars = axes[0, 2].bar(
+        (0, 1),
+        cost_values,
+        width=0.58,
+        color=(RED, TEAL),
+        alpha=0.9,
+        zorder=2,
+    )
+    axes[0, 2].set_yscale("log")
+    axes[0, 2].set_ylim(0.7, num_experts * 2.2)
+    axes[0, 2].set_xticks((0, 1), ("Brute-force\nablation", "Gram / energy\n(this work)"))
+    axes[0, 2].set_ylabel("Forward evaluations per layer")
+    axes[0, 2].set_title("(c) Cost of the same exact score")
+    axes[0, 2].bar_label(bars, labels=(str(num_experts), "1"), padding=4, fontsize=9)
+    axes[0, 2].text(
+        0.72,
+        0.68,
+        rf"${num_experts}\times$ fewer evaluations",
+        transform=axes[0, 2].transAxes,
+        ha="center",
+        va="center",
+        fontsize=9,
+        color=TEXT,
+    )
     finish_axes(axes[0, 2])
 
     sweep_layer = int(metadata["sweep_layer"])
@@ -229,16 +242,24 @@ def main() -> None:
 
     handles = [
         Line2D([0], [0], color=TEAL, linewidth=2.3, label="diagonal Hessian prediction"),
-        Line2D([0], [0], color=GRAY, linestyle="--", linewidth=1.4, label="first-order prediction"),
+        Line2D([0], [0], color=GRAY, linestyle="--", linewidth=1.4, label=r"first order: $g_e(\beta_e-1)=0$"),
         Line2D([0], [0], marker="o", linestyle="none", markerfacecolor="white", markeredgecolor=TEXT, label="measured forward"),
         Line2D([0], [0], marker="D", linestyle="none", color=RED, label=r"single removal ($\beta_e=0$)"),
     ]
     fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.465), ncol=4, frameon=False, fontsize=9)
-    fig.text(0.5, 0.495, "All comparisons are single-expert; no pairwise removal is used.", ha="center", va="bottom", fontsize=9)
+    fig.text(
+        0.5,
+        0.495,
+        "Ranking vs. true removal: first order Spearman = undefined "
+        r"(all $g_e=0$); second order Spearman = 1.000000.",
+        ha="center",
+        va="bottom",
+        fontsize=9,
+    )
     num_samples = int(metadata["num_samples"])
     num_layers = len(metadata["layers"])
     fig.suptitle(
-        "Observation B: Hessian = Gram = single-expert ablation\n"
+        "Observation B: implementation sanity check and first-order degeneracy\n"
         f"{num_layers} MoE layers; {num_samples} frozen calibration samples",
         y=0.975,
         fontsize=13,
@@ -259,6 +280,16 @@ def main() -> None:
         "num_layers": num_layers,
         "num_samples": num_samples,
         "sweep_layer": sweep_layer,
+        "first_order_vs_ablation": {
+            "spearman": None,
+            "reason": "undefined because every identity-gradient score is zero",
+            "max_abs_identity_gradient": gradient_max_abs,
+        },
+        "forward_evaluations_per_layer": {
+            "brute_force_single_expert_ablation": num_experts,
+            "gram_energy_reuse": 1,
+            "reduction_factor": num_experts,
+        },
         **summaries,
         "beta_sweeps": sweep_summaries,
     }

@@ -4,6 +4,16 @@
   "num_layers": 31,
   "num_samples": 32,
   "sweep_layer": 0,
+  "first_order_vs_ablation": {
+    "spearman": null,
+    "reason": "undefined because every identity-gradient score is zero",
+    "max_abs_identity_gradient": 0.0
+  },
+  "forward_evaluations_per_layer": {
+    "brute_force_single_expert_ablation": 128,
+    "gram_energy_reuse": 1,
+    "reduction_factor": 128
+  },
   "energy_vs_hvp": {
     "pearson": 0.9999999999999992,
     "spearman": 1.0,
