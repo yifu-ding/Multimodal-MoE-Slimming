@@ -44,6 +44,7 @@ def patch_qwen_fused_experts_forward(block: nn.Module):
             "saved_visual_mask",
             "saved_score_mask",
             "saved_router_weights",
+            "saved_token_indices",
         ):
             setattr(self, name, [None] * num_experts)
 
@@ -116,6 +117,7 @@ def patch_qwen_fused_experts_forward(block: nn.Module):
             self.saved_visual_mask[expert_idx] = visual_mask[token_idx]
             self.saved_score_mask[expert_idx] = score_mask[token_idx]
             self.saved_router_weights[expert_idx] = expert_routing_weights
+            self.saved_token_indices[expert_idx] = token_idx
 
             if current_state.requires_grad:
                 current_state.register_hook(_save_grad_attr(self, expert_idx, "saved_gate_in_grad"))
