@@ -197,6 +197,7 @@ def _identity_point_gradient_and_hessian_diag(
     baseline: torch.Tensor,
     score_mask: torch.Tensor,
     *,
+    loss_fn: str,
     block_dtype: torch.dtype,
     device_type: str,
     autocast_enabled: bool,
@@ -208,7 +209,9 @@ def _identity_point_gradient_and_hessian_diag(
     Returns (dL/dalpha, diag(d^2L/dalpha^2), base_loss), each evaluated at the
     identity reconstruction point alpha=1. Halves the double-backward chunk
     size on CUDA OOM, matching the autotuning behavior previously provided by
-    ``compute_expert_second_order_batched`` for this workload.
+    ``compute_expert_second_order_batched`` for this workload. ``loss_fn`` is
+    generic (l2 or kl_div): the identity_gradient=0 property at alpha=1 holds
+    for any loss whose global minimum is at pred==target, not just l2.
     """
     chunk_size = max(int(active_indices.numel()), 1)
     while True:
@@ -221,7 +224,7 @@ def _identity_point_gradient_and_hessian_diag(
                     pred=pred,
                     teacher_target=baseline,
                     attn_mask=score_mask,
-                    loss_fn="l2",
+                    loss_fn=loss_fn,
                 )
             base_loss_value = float(loss.detach().item())
             d1 = torch.autograd.grad(loss, alpha, create_graph=True, allow_unused=True)[0]
@@ -267,6 +270,50 @@ def _identity_point_gradient_and_hessian_diag(
         return gradient_value, hessian_diag, base_loss_value
 
 
+def _true_ablation_via_forward(
+    block,
+    alpha: torch.Tensor,
+    in_args,
+    in_kwargs,
+    baseline: torch.Tensor,
+    score_mask: torch.Tensor,
+    active_indices: torch.Tensor,
+    *,
+    loss_fn: str,
+    block_dtype: torch.dtype,
+    device_type: str,
+    autocast_enabled: bool,
+    base_loss_value: float,
+    num_experts: int,
+) -> torch.Tensor:
+    """Real forced beta_e=0 forward per active expert (no Gram/energy shortcut).
+
+    The closed-form Gram identity in ``fused_energy_and_ablation`` only equals
+    the true single-expert removal cost because l2 is an exact quadratic in
+    each expert's (affine) output contribution. For a loss that goes through a
+    nonlinearity first (e.g. kl_div's softmax), that identity no longer holds,
+    so the true ablation cost has to be measured with one real forward per
+    active expert instead of derived from the raw routed-contribution vectors.
+    Reuses the alpha-vector patch already installed on ``block``'s experts.
+    """
+    ablation = torch.zeros(num_experts, device=alpha.device, dtype=torch.float64)
+    with torch.no_grad(), suspend_tensor_saving(block):
+        for expert_idx in active_indices.tolist():
+            alpha.data.fill_(1.0)
+            alpha.data[expert_idx] = 0.0
+            with torch.autocast(device_type=device_type, dtype=block_dtype, enabled=autocast_enabled):
+                pred = unwrap_output(block(*in_args, **in_kwargs))
+                loss, _ = compute_block_loss(
+                    pred=pred,
+                    teacher_target=baseline,
+                    attn_mask=score_mask,
+                    loss_fn=loss_fn,
+                )
+            ablation[expert_idx] = float(loss.item()) - base_loss_value
+        alpha.data.fill_(1.0)
+    return ablation
+
+
 def _prepare_block_inputs(bundle, model, source_block, block, batch, metadata, teacher_state):
     teacher_state.clear()
     inputs = prepare_raw_batch_inputs(bundle, batch)
@@ -291,6 +338,7 @@ def collect_layer(
     betas: list[float],
     run_sweep: bool,
     validation_dtype: torch.dtype,
+    loss_fn: str = "l2",
 ) -> dict:
     model = bundle.model
     source_block = teacher_block(bundle, layer_idx)
@@ -331,7 +379,6 @@ def collect_layer(
                 experts, num_experts=num_experts
             )
             energy_sum.add_(batch_energy)
-            ablation_sum.add_(batch_ablation)
             active_counts.add_(active.long())
 
             experts.forward = original_expert_forward
@@ -346,15 +393,37 @@ def collect_layer(
                     in_kwargs,
                     baseline,
                     score_mask,
+                    loss_fn=loss_fn,
                     block_dtype=block_dtype,
                     device_type=device_type,
                     autocast_enabled=autocast_enabled,
                     active_indices=active_indices,
                     num_experts=num_experts,
                 )
+                if loss_fn != "l2" and active_indices.numel() > 0:
+                    # The l2-only Gram/energy shortcut in fused_energy_and_ablation
+                    # no longer equals the true removal cost once the loss goes
+                    # through a nonlinearity (kl_div's softmax), so replace it
+                    # with a real forced beta_e=0 forward per active expert.
+                    batch_ablation = _true_ablation_via_forward(
+                        block,
+                        probe_alpha,
+                        in_args,
+                        in_kwargs,
+                        baseline,
+                        score_mask,
+                        active_indices,
+                        loss_fn=loss_fn,
+                        block_dtype=block_dtype,
+                        device_type=device_type,
+                        autocast_enabled=autocast_enabled,
+                        base_loss_value=base_loss_value,
+                        num_experts=num_experts,
+                    ).float()
             finally:
                 _restore_patched_expert(probe_alpha_state)
                 block.zero_grad(set_to_none=True)
+            ablation_sum.add_(batch_ablation.double().cpu())
             hessian_sum.add_(hessian_diag.double().cpu())
             gradient_sum.add_(gradient_value.double().cpu())
             base_loss_sum += base_loss_value
@@ -414,7 +483,7 @@ def collect_layer(
                                     pred=pred,
                                     teacher_target=baseline,
                                     attn_mask=score_mask,
-                                    loss_fn="l2",
+                                    loss_fn=loss_fn,
                                 )
                                 measured[item["label"]][beta_idx] += float(loss.float().item())
                                 # Plan (1): re-differentiate at this beta_0 instead of
@@ -475,6 +544,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--betas", type=float, nargs="+", default=list(DEFAULT_BETAS))
     parser.add_argument(
+        "--loss-fn",
+        default="l2",
+        choices=("l2", "kl_div"),
+        help=(
+            "Loss for the identity-point gradient/Hessian probe and beta sweep. "
+            "l2 uses the fast Gram/energy shortcut for single_expert_ablation "
+            "(exact under l2). kl_div goes through softmax first, breaking that "
+            "shortcut's affine-output assumption, so ablation is instead measured "
+            "with a real forced beta_e=0 forward per active expert "
+            "(see draw/hessian-3d-landscape/README.md plan 3)."
+        ),
+    )
+    parser.add_argument(
         "--max-samples",
         type=int,
         default=None,
@@ -531,7 +613,7 @@ def run(args: argparse.Namespace) -> Path:
         "selection_manifest_sha256": manifest_sha256,
         "batch_size": batch_size,
         "num_samples": len(samples),
-        "loss_fn": "l2",
+        "loss_fn": args.loss_fn,
         "normalization": "sum of hidden-dimension MSE divided by score-token count",
         "validation_dtype": args.validation_dtype,
         "sweep_layer": args.sweep_layer,
@@ -583,6 +665,7 @@ def run(args: argparse.Namespace) -> Path:
             [float(beta) for beta in args.betas],
             run_sweep=int(layer_idx) == args.sweep_layer,
             validation_dtype=validation_dtype,
+            loss_fn=args.loss_fn,
         )
         temporary = output_path.with_suffix(output_path.suffix + ".tmp")
         torch.save(

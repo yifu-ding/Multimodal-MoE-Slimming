@@ -125,6 +125,7 @@ def main() -> None:
         ),
         "num_samples": int(payload["metadata"]["num_samples"]),
         "batch_size": int(payload["metadata"]["batch_size"]),
+        "loss_fn": str(payload["metadata"].get("loss_fn", "l2")),
         "layers": [int(layer) for layer in sorted(payload["layers"])],
         "num_layer_expert_points": num_points,
         "normalization": payload["metadata"]["normalization"],

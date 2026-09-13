@@ -6,6 +6,7 @@
   "sample_selection": "first 32 samples of the frozen calibration manifest",
   "num_samples": 32,
   "batch_size": 16,
+  "loss_fn": "l2",
   "layers": [
     0
   ],
