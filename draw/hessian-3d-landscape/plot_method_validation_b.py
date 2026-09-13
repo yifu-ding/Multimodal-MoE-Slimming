@@ -199,6 +199,23 @@ def main() -> None:
     betas = curves[0]["betas"]
     dense_beta = np.linspace(float(betas.min()), float(betas.max()), 300)
     sensitivity_titles = ("Low sensitivity", "Medium sensitivity", "High sensitivity")
+    # Shared y-ranges across panels (c)-(e) so the three experts' curves are
+    # directly comparable by height, not just by differing tick labels --
+    # H_ee/2 spans about 8x between the low- and high-sensitivity expert.
+    left_max = max(float(curve["measured"].max()) for curve in curves)
+    left_min = min(float(curve["measured"].min()) for curve in curves)
+    left_pad = 0.06 * (left_max - left_min)
+    shared_left_ylim = (left_min - left_pad, left_max + left_pad)
+    has_local_gradient_data = any("local_gradient" in curve for curve in curves)
+    if has_local_gradient_data:
+        right_max = max(
+            float(curve["local_gradient"].max()) for curve in curves if "local_gradient" in curve
+        )
+        right_min = min(
+            float(curve["local_gradient"].min()) for curve in curves if "local_gradient" in curve
+        )
+        right_pad = 0.06 * (right_max - right_min)
+        shared_right_ylim = (right_min - right_pad, right_max + right_pad)
     sweep_summaries = []
     for panel_idx, (ax, curve, title) in enumerate(zip(bottom_axes, curves, sensitivity_titles)):
         expert_idx = int(curve["expert_idx"])
@@ -261,6 +278,7 @@ def main() -> None:
         )
         ax.set_xlabel(r"Expert scale $\beta_e$")
         ax.set_ylabel(r"per-token $\Delta\mathcal{L}_{\rm MSE}$")
+        ax.set_ylim(shared_left_ylim)
         ax.text(
             0.96,
             0.92,
@@ -272,20 +290,23 @@ def main() -> None:
         )
         # README plan (1): at each swept beta_0, evaluate the local slope
         # directly (real forward+backward at that beta_0) instead of
-        # extrapolating identity_gradient from beta=1. Drawn on its own right
-        # axis (slope magnitude), not overlaid on the left axis's loss curve
-        # -- a slope and a loss value are different units, and tangent
-        # segments drawn on top of the parabola made the panel read as one
-        # cluttered curve instead of two separate, comparable quantities.
+        # extrapolating identity_gradient from beta=1. This plots only the
+        # real measured local_gradient_at_beta values, connected point to
+        # point -- no fitted/theoretical curve underneath. An earlier version
+        # also drew the theoretical H_ee*(beta-1) line here, which sat almost
+        # exactly on top of the real markers (they agree to ~1e-7, see
+        # local_gradient_vs_hee_delta in the JSON) and made the panel look
+        # like a drawn line rather than real per-point measurements.
         if "local_gradient" in curve:
             local_gradient = curve["local_gradient"]
-            dense_local_slope = 2.0 * hessian_score * dense_delta
+            order = np.argsort(betas)
             right_ax = ax.twinx()
-            right_ax.plot(dense_beta, dense_local_slope, color=VIOLET, linewidth=1.8, zorder=2)
-            right_ax.scatter(betas, local_gradient, facecolor="white", edgecolor=VIOLET,
-                             marker="^", linewidth=1.0, s=30, zorder=3)
-            right_ax.set_ylabel(r"local slope $dL/d\beta_e$", color=VIOLET, fontsize=9)
+            right_ax.plot(betas[order], local_gradient[order], color=VIOLET, linewidth=1.4,
+                         marker="^", markersize=6, markerfacecolor="white",
+                         markeredgecolor=VIOLET, zorder=3)
+            right_ax.set_ylabel(r"measured $dL/d\beta_e$ at $\beta_0$", color=VIOLET, fontsize=9)
             right_ax.tick_params(axis="y", labelcolor=VIOLET, labelsize=8)
+            right_ax.set_ylim(shared_right_ylim)
             right_ax.spines["top"].set_visible(False)
         finish_axes(ax)
 
@@ -300,15 +321,14 @@ def main() -> None:
         Line2D([0], [0], marker="D", linestyle="none", color=RED, label=r"single removal ($\beta_e=0$)"),
     ]
     if has_local_gradient_any:
-        # Combined line+marker handle: the line is the exact H_ee*(beta-1)
-        # slope prediction, the triangle is the real re-derived measurement
-        # at each beta_0 -- both live on the right axis of panels (d)-(f),
-        # separate from the loss curve on the left axis.
+        # Real measured dL/dbeta at each swept beta_0, connected point to
+        # point -- right axis of panels (c)-(e), separate from the loss curve
+        # on the left axis. No fitted/theoretical line underneath.
         handles.insert(
             1,
-            Line2D([0], [0], color=VIOLET, linewidth=1.8, marker="^", markersize=6,
+            Line2D([0], [0], color=VIOLET, linewidth=1.4, marker="^", markersize=6,
                    markerfacecolor="white", markeredgecolor=VIOLET,
-                   label=r"local slope $dL/d\beta_e$ (right axis)"),
+                   label=r"measured $dL/d\beta_e$ (right axis)"),
         )
     else:
         handles.insert(
