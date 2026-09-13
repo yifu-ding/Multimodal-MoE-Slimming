@@ -81,6 +81,7 @@ def main() -> None:
         "second_order_prediction",
         "identity_gradient",
         "hvp_hessian_half",
+        "local_gradient_at_beta",
     )
     betas = sweep["beta_values"].double()
     layer_result = payload["layers"][sweep_layer]
@@ -93,7 +94,10 @@ def main() -> None:
             expert_idx = int(curve["expert_idx"])
             g_e = float(gradient[expert_idx])
             h_e = float(hessian[expert_idx])
-            for beta, measured in zip(betas, curve["measured_delta_per_token"].double()):
+            local_gradients = curve["local_gradient_at_beta_per_token"].double()
+            for beta, measured, local_gradient in zip(
+                betas, curve["measured_delta_per_token"].double(), local_gradients
+            ):
                 delta = float(beta) - 1.0
                 writer.writerow(
                     {
@@ -107,6 +111,7 @@ def main() -> None:
                         "second_order_prediction": f"{g_e * delta + h_e * delta**2:.17g}",
                         "identity_gradient": f"{g_e:.17g}",
                         "hvp_hessian_half": f"{h_e:.17g}",
+                        "local_gradient_at_beta": f"{float(local_gradient):.17g}",
                     }
                 )
 

@@ -23,7 +23,6 @@ from src.calibration.block_forward import _build_fixed_score_mask
 from src.calibration.collect_scores_main import _identity_collate, _load_selection_manifest
 from src.calibration.collector.loop_2_helpers import (
     _restore_patched_expert,
-    compute_expert_second_order_batched,
     patch_expert_output_alpha_vector,
     suspend_tensor_saving,
 )
@@ -190,6 +189,84 @@ def select_quantile_experts(score: torch.Tensor, active_counts: torch.Tensor) ->
     return selected
 
 
+def _identity_point_gradient_and_hessian_diag(
+    block,
+    alpha: torch.Tensor,
+    in_args,
+    in_kwargs,
+    baseline: torch.Tensor,
+    score_mask: torch.Tensor,
+    *,
+    block_dtype: torch.dtype,
+    device_type: str,
+    autocast_enabled: bool,
+    active_indices: torch.Tensor,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """Real forward+double-backward at alpha=1 (no closed-form shortcut).
+
+    Returns (dL/dalpha, diag(d^2L/dalpha^2), base_loss), each evaluated at the
+    identity reconstruction point alpha=1. Halves the double-backward chunk
+    size on CUDA OOM, matching the autotuning behavior previously provided by
+    ``compute_expert_second_order_batched`` for this workload.
+    """
+    chunk_size = max(int(active_indices.numel()), 1)
+    while True:
+        try:
+            with suspend_tensor_saving(block), torch.enable_grad(), torch.autocast(
+                device_type=device_type, dtype=block_dtype, enabled=autocast_enabled
+            ):
+                pred = unwrap_output(block(*in_args, **in_kwargs))
+                loss, _ = compute_block_loss(
+                    pred=pred,
+                    teacher_target=baseline,
+                    attn_mask=score_mask,
+                    loss_fn="l2",
+                )
+            base_loss_value = float(loss.detach().item())
+            d1 = torch.autograd.grad(loss, alpha, create_graph=True, allow_unused=True)[0]
+            hessian_diag = torch.zeros(num_experts, device=alpha.device, dtype=torch.float32)
+            if d1 is None:
+                gradient_value = torch.zeros(num_experts, device=alpha.device, dtype=torch.float32)
+            else:
+                gradient_value = d1.detach().float()
+                if d1.requires_grad and active_indices.numel() > 0:
+                    total_active = int(active_indices.numel())
+                    for start in range(0, total_active, chunk_size):
+                        end = min(start + chunk_size, total_active)
+                        chunk_indices = active_indices[start:end]
+                        grad_outputs = torch.eye(end - start, device=alpha.device, dtype=d1.dtype)
+                        d2_rows = torch.autograd.grad(
+                            d1[chunk_indices],
+                            alpha,
+                            grad_outputs=grad_outputs,
+                            is_grads_batched=True,
+                            retain_graph=end < total_active,
+                            create_graph=False,
+                            allow_unused=True,
+                        )[0]
+                        if d2_rows is None:
+                            continue
+                        local_positions = torch.arange(end - start, device=alpha.device)
+                        hessian_diag[chunk_indices] = d2_rows[local_positions, chunk_indices].detach().float()
+        except RuntimeError as error:
+            if "out of memory" not in str(error).lower() or chunk_size <= 1:
+                raise
+            next_chunk_size = max(1, chunk_size // 2)
+            print(
+                "[hessian-diag autotune] CUDA OOM with expert group "
+                f"size={chunk_size}; retrying with size={next_chunk_size}.",
+                flush=True,
+            )
+            block.zero_grad(set_to_none=True)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            chunk_size = next_chunk_size
+            continue
+        return gradient_value, hessian_diag, base_loss_value
+
+
 def _prepare_block_inputs(bundle, model, source_block, block, batch, metadata, teacher_state):
     teacher_state.clear()
     inputs = prepare_raw_batch_inputs(bundle, batch)
@@ -258,29 +335,29 @@ def collect_layer(
             active_counts.add_(active.long())
 
             experts.forward = original_expert_forward
-            probe_kwargs = {
-                "block_in_args": in_args,
-                "block_in_kwargs": in_kwargs,
-                "teacher_target": baseline,
-                "attn_mask": score_mask,
-                "loss_fn": "l2",
-                "loss_eps": 1e-6,
-                "autocast_dtype": block_dtype,
-                "autocast_device_type": device_type,
-                "hessian_probe_enabled": True,
-                "hessian_probe_validate": False,
-                "hessian_probe_pair": None,
-            }
-            compute_expert_second_order_batched(
-                cnt_block=block,
-                experts=experts,
-                has_activation_mask=active.tolist(),
-                _kwargs=probe_kwargs,
-            )
-            probe = probe_kwargs["_hessian_probe_batch"]
-            hessian_sum.add_(probe["hessian"].diag().double())
-            gradient_sum.add_(probe["gradient"].double())
-            base_loss_sum += float(probe["base_loss"])
+            active_indices = active.nonzero(as_tuple=False).flatten().to(block_device)
+            probe_alpha = torch.ones(num_experts, device=block_device, dtype=torch.float32, requires_grad=True)
+            probe_alpha_state = patch_expert_output_alpha_vector(experts, probe_alpha)
+            try:
+                gradient_value, hessian_diag, base_loss_value = _identity_point_gradient_and_hessian_diag(
+                    block,
+                    probe_alpha,
+                    in_args,
+                    in_kwargs,
+                    baseline,
+                    score_mask,
+                    block_dtype=block_dtype,
+                    device_type=device_type,
+                    autocast_enabled=autocast_enabled,
+                    active_indices=active_indices,
+                    num_experts=num_experts,
+                )
+            finally:
+                _restore_patched_expert(probe_alpha_state)
+                block.zero_grad(set_to_none=True)
+            hessian_sum.add_(hessian_diag.double().cpu())
+            gradient_sum.add_(gradient_value.double().cpu())
+            base_loss_sum += base_loss_value
             total_tokens += int(score_mask.sum().item())
             total_batches += 1
             patch_qwen_fused_experts_forward(block)
@@ -303,10 +380,13 @@ def collect_layer(
 
         if run_sweep:
             selected = select_quantile_experts(hessian_score, active_counts)
-            alpha = torch.ones(num_experts, device=block_device, dtype=torch.float32)
+            alpha = torch.ones(num_experts, device=block_device, dtype=torch.float32, requires_grad=True)
             alpha_state = patch_expert_output_alpha_vector(experts, alpha)
             route_recorder = RouteRecorder(experts)
             measured = {
+                item["label"]: torch.zeros(len(betas), dtype=torch.float64) for item in selected
+            }
+            local_gradient = {
                 item["label"]: torch.zeros(len(betas), dtype=torch.float64) for item in selected
             }
             sweep_tokens = 0
@@ -318,16 +398,17 @@ def collect_layer(
                         bundle, model, source_block, block, batch, metadata, teacher_state
                     )
                     route_recorder.reset()
-                    alpha.fill_(1.0)
-                    with torch.no_grad(), suspend_tensor_saving(block), torch.autocast(
+                    alpha.data.fill_(1.0)
+                    with torch.enable_grad(), suspend_tensor_saving(block), torch.autocast(
                         device_type=device_type, dtype=block_dtype, enabled=autocast_enabled
                     ):
-                        baseline = unwrap_output(block(*in_args, **in_kwargs)).detach()
+                        with torch.no_grad():
+                            baseline = unwrap_output(block(*in_args, **in_kwargs)).detach()
                         for item in selected:
                             expert_idx = int(item["expert_idx"])
                             for beta_idx, beta in enumerate(betas):
-                                alpha.fill_(1.0)
-                                alpha[expert_idx] = beta
+                                alpha.data.fill_(1.0)
+                                alpha.data[expert_idx] = beta
                                 pred = unwrap_output(block(*in_args, **in_kwargs))
                                 loss, _ = compute_block_loss(
                                     pred=pred,
@@ -336,6 +417,11 @@ def collect_layer(
                                     loss_fn="l2",
                                 )
                                 measured[item["label"]][beta_idx] += float(loss.float().item())
+                                # Plan (1): re-differentiate at this beta_0 instead of
+                                # extrapolating identity_gradient from beta=1.
+                                (grad,) = torch.autograd.grad(loss, alpha, allow_unused=True)
+                                grad_value = 0.0 if grad is None else float(grad[expert_idx].double().item())
+                                local_gradient[item["label"]][beta_idx] += grad_value
                     expected_calls = 1 + len(selected) * len(betas)
                     if route_recorder.calls != expected_calls:
                         raise RuntimeError(
@@ -356,7 +442,14 @@ def collect_layer(
             for item in selected:
                 values = measured[item["label"]] / float(sweep_tokens)
                 values = values - values[baseline_idx]
-                curves.append({**item, "measured_delta_per_token": values.float()})
+                local_gradient_values = (local_gradient[item["label"]] / float(sweep_tokens)).float()
+                curves.append(
+                    {
+                        **item,
+                        "measured_delta_per_token": values.float(),
+                        "local_gradient_at_beta_per_token": local_gradient_values,
+                    }
+                )
             result["beta_sweep"] = {
                 "beta_values": beta_tensor.float(),
                 "route_consistency_verified": True,
