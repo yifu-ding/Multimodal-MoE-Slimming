@@ -6,6 +6,172 @@
 新增真实实验：[beta=0.95 一阶与 beta=1 Hessian 的排序反例](README_beta095_experiment.md)。
 已完成 L2/KL 第0层32样本采集，结果和新图见 [beta095/RESULTS.md](beta095/RESULTS.md)。
 
+## 待补采：所有 expert 同步 beta sweep 的真实梯度（2026-09-13）
+
+**状态：待采集；本节是服务器运行规格，不是已经完成的实验结果。**
+目标是实测验证：同一层所有 expert 的缩放系数一起变化时，每个 expert 的
+一阶梯度是否随 beta 线性变化，以及相对于全体 beta=0 的梯度绝对值，
+不同 expert 的变化百分比是否一致。不要预设或筛选“存在非线性”的结果。
+
+### 范围与采集点
+
+- 仅采 **第0层全部128个 routed experts**，保留每个expert，包括梯度为0者。
+  其他层保持原模型状态，不同时缩放其他层。
+- 主采样点严格为用户指定的 **beta=[0, 0.25, 0.5, 0.75, 0.95]**。
+- Loss 分别采 **L2** 与 **hidden-state softmax KL**，分目录保存。
+  KL沿用现有采集器的方向 `KL(softmax(teacher_hidden) || softmax(student_hidden))`，
+  不是最终词表KL或下游任务交叉熵。
+- 沿用 `Qwen/Qwen3-VL-30B-A3B-Instruct`、原GQA校准manifest的前32个样本，
+  顺序、token mask和loss归一化与 `beta095/{l2,kl_div}/metadata.json` 一致。
+  原记录为2批、batch size=16、合计4096个score tokens；若环境需改batch size，
+  保留相同样本/token集合，记录变化，并重新核验数值。
+- 原manifest位置为 `/home/data/dyf/MARS-results/storage/calibration_manifests/gqa-256-seed42.json`，
+  SHA256为 `24c3a5e250c33ca53df6addb82ee78de2efe94f1bff2487ee754e6f6b347d6d5`。
+  路径可随服务器调整，内容哈希必须核对。
+
+### 最关键的操作：同值赋给向量，但分别对每个 expert 求导
+
+保留独立可求导的128维向量 `alpha`，每个分量控制对应expert的routed contribution。
+在每个采样点，先同时设置 `alpha[:] = beta`，再做一次真实forward/backward，
+用 `autograd.grad(loss, alpha)` 一次得到128个偏导数：
+
+```
+g_e(beta) = partial L(alpha) / partial alpha_e, evaluated at alpha=beta*ones
+```
+
+**不要把alpha替换成一个广播的可求导标量beta再求导。** 那样得到的是
+`dL(beta*ones)/dbeta = sum_e g_e(beta)`，只有一个总梯度，无法画expert-ID横轴。
+也不要逐个expert改beta、其余保持1或0.95；那是现有单expert扫描，并非本实验。
+
+伪代码（复用现有loss、mask和expert hook；不是可直接运行的完整脚本）：
+
+```python
+alpha = torch.ones(num_experts, device=device, requires_grad=True)
+# alpha是叶子向量；只冻结模型参数，不能冻结alpha或禁用student的autograd。
+for batch in calibration_batches:
+    inputs, kwargs, mask = original_teacher_block_inputs(batch)
+    with torch.no_grad():
+        alpha.fill_(1.0)
+        teacher = forward_block(inputs, kwargs).detach()
+    # teacher在整个batch的sweep中固定；beta=0也不能换teacher。
+    for beta in [0.0, 0.25, 0.5, 0.75, 0.95, 1.0]:
+        with torch.no_grad():
+            alpha.fill_(beta)  # 本层全部expert一起变，每次恢复完整向量
+        prediction = forward_block(inputs, kwargs)
+        loss = loss_sum(prediction, teacher, mask, loss_fn)
+        gradient = torch.autograd.grad(loss, alpha)[0]
+        save_batch_measurement(beta, loss.detach(), gradient.detach(), mask.sum())
+```
+
+- 只缩放router加权后的expert贡献；residual、router logits、路由权重、共享分支
+  保持原实现，**不重新归一化路由权重**。比较各beta的router indices/weights，
+  确认与同批全1参考一致。输入hidden states来自原模型，不串行传播上一个beta的输出。
+- teacher始终是该批原模型全1输出。每个点独立执行模型，不累积删除或扰动。
+- 与现有协议一致：copied block为FP32，loss算术为FP64；落盘梯度和loss累积用FP64。
+  如果采用不同精度，必须单独标记，不能与既有结果冒充同一数值实验。
+- **先跨batch/token累加signed gradient，再取绝对值**：
+  `g_e(beta)=sum_batch gradient_sum_e(beta)/sum_batch num_score_tokens`。
+  不先取绝对值再平均，不对不同token数的batch等权平均。
+- 原采集器 `src/calibration/collect_beta095_counterexamples.py` 中
+  `set_scale(alpha, beta)` 与 `measure_batch` 的全体求导方式可复用；
+  但其入口限制beta_work=0.95，且后续beta_curves是逐expert扫描。
+  **服务器端需要新增全体同步sweep入口/模式，不能直接把旧beta_curves当作本数据。**
+
+### 需要保存什么
+
+新增独立目录，不覆盖既有 `beta095/` 或 `data/`：
+
+```
+draw/hessian-3d-landscape/global_beta_sweep/
+    l2/
+        gradients.csv
+        losses.csv
+        metadata.json
+        validation.json
+        linearity.json
+        raw.pt
+    kl_div/
+        gradients.csv
+        losses.csv
+        metadata.json
+        validation.json
+        linearity.json
+        raw.pt
+```
+
+`gradients.csv`：每个 `(beta, expert)` 一行。主采样640行，加beta=1检查点后768行/每种loss。
+必需字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| layer, expert, loss_fn | 层号、expert ID、loss类型 |
+| beta_global | 本层全部128个alpha的共同值；不能用单expert beta含糊替代 |
+| num_score_tokens | 同一份聚合分母 |
+| gradient_signed | 聚合后的真实偏导g_e，不含额外beta因子 |
+| gradient_abs | abs(gradient_signed) |
+| gradient_at_global_zero | 对应expert在全体alpha=0时的signed gradient |
+| ratio_to_global_zero_pct | 100*abs(g_e(beta))/abs(g_e(0))；不稳定分母时留空 |
+| ratio_valid | 分母是否通过近零阈值检查 |
+| first_order_signed | 可选诊断列：-beta_global*gradient_signed |
+| first_order_abs | 可选诊断列：abs(beta_global*gradient_signed) |
+
+最后两列仅用于区分梯度与删除方向的一阶打分，**主图百分比必须用gradient_abs**。
+尤其beta=0时 `abs(beta*g)=0`，不能用这个打分作百分比分母。
+
+`losses.csv`：每个beta一行，保存 `layer,loss_fn,beta_global,num_score_tokens,loss`。
+这里是全体同步缩放产生的重构loss，不是独立删除某一个expert的loss。
+
+`raw.pt`：保存每个batch、每个beta的原始signed gradient向量、loss_sum、
+num_score_tokens、样本ID/顺序、重复测量和有限差分验证结果；保留梯度全精度，
+不能只留下百分比或舍入后的打印值。不需要保存整个模型或完整autograd计算图。
+
+`metadata.json`：至少包含模型、layer、num_experts、loss精确定义、
+`sweep_mode="all_experts_synchronous"`、主beta列表/检查beta列表、
+`teacher_background=1`、缩放位置、fixed_router、原manifest路径/hash、
+实际样本IDs、batch size、总token数、参数化 `independent_alpha_vector_at_equal_values`、
+block/loss/累积dtype、随机种子、代码commit、采集脚本hash及complete标记。
+
+### 数值验收与线性检查
+
+1. 核对每个beta恰有同一组128个expert、总token数一致，数值有限；路由完全一致。
+2. 在全局beta=0、0.5、0.95各重复一次独立forward/backward，保存每个expert
+   的重复梯度差异和loss差异，用于区分真实非线性与数值噪声。
+3. 对beta=0.5处expert ID 0、64、127进行中心差分检查，建议步长0.005和0.01。
+   这里为了验证每个偏导，临时仅将被验证expert改为beta±step，其他expert固定beta；
+   这些是验证记录，不能混进global_beta_sweep主表。
+4. 同轮beta=1检查loss和梯度接近0；保存实际值，不强制写0。
+   同轮beta=0.95与旧 `gradient_at_work` 在相同样本/归一化下核对，报告差异；
+   可参考历史数据，但本轮各点优先全部重新测量，避免跨run精度混杂。
+5. 对近零分母标记无效，而不是加epsilon后强行画百分比。
+   可预先采用 `tau=max(8*max_repeat_gradient_error, 32*eps_float32*max_e(abs(g_e(0))))`，
+   记录tau实际值和被屏蔽expert IDs；原始梯度行不丢弃。
+6. 逐expert用实际beta坐标拟合 `g_e(beta)=a_e*beta+b_e`（signed gradient），
+   输出斜率、截距、R²、最大绝对残差、残差/梯度变化范围；常数曲线的R²标为null。
+   beta间距不全相同，不能按点序号拟合，也不能直接比较未经步长归一化的增量。
+7. 独立计算 `r_e(beta)=g_e(beta)-(1-beta)*g_e(0)`，输出每beta/每expert的
+   signed residual、绝对残差和有效分母下的百分比偏差。与重复测量误差比较后，
+   才讨论是否存在可分辨的非线性；不要仅因浮点数不完全相等就声称非线性。
+8. 输出每个beta下有效expert百分比的min/max/mean/std，描述跨expert的变化幅度。
+   beta=0的有效比例应为100%；其余点来自真实测量，不按理论补齐或平滑。
+
+### 后续图怎么画，以及预期结论的边界
+
+- x轴：expert ID（0至127，按ID排列）；y轴：`|g_e(beta)| / |g_e(0)| * 100%`。
+- 每个主采样beta一条曲线/一种颜色，全部使用新测量；L2/KL分别成子图。
+  beta=1只用于验收，默认不加到主图；近零分母留缺口并报告数量。
+- 若不同beta的线相近，可另外画相对 `100*(1-beta)` 的偏差（单位percentage points），
+  但必须标清放大尺度和重复测量噪声，不能把噪声渲染成显著现象。
+- L2固定路由且输出对alpha仿射时，理论为
+  `g_e(beta*ones)=(beta-1)*(H*ones)_e`，故有效比例为 `100*(1-beta)%`。
+  对指定5点预期分别是100%、75%、50%、25%、5%。这是理论预期，不是已采到的结果。
+  若实测一致，应如实报告各expert共同缩放，而不是寻求不存在的差异。
+- KL不保证上述严格比例，由本轮实测决定是否有跨expert差异以及差异是否超过数值噪声。
+- 本次只需真实梯度和loss，**无需补采Hessian、逐expert独立删除、联合删除或其他层**。
+  若以后需要实测“梯度随全局beta的导数”，对应方向量是 `(H*ones)_e`，
+  不是单独的H_ee；不要把已有Hessian对角元直接当作这条global曲线的斜率。
+
+---
+
 ## 当前图：第 0 层 L2 / KL 对照
 
 当前 `method_validation_B.{png,pdf,json}` 使用同一份 GQA manifest 的前 32 个
