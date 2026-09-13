@@ -3,6 +3,9 @@
 本目录包含论文用图，以及复现该图所需的精简真实数据。观察实验 A 和此前的
 双 expert 三维 landscape 均标记为 **LEGACY / NOT USED**，不属于本图。
 
+新增真实实验：[beta=0.95 一阶与 beta=1 Hessian 的排序反例](README_beta095_experiment.md)。
+已完成 L2/KL 第0层32样本采集，结果和新图见 [beta095/RESULTS.md](beta095/RESULTS.md)。
+
 ## 当前图：第 0 层 L2 / KL 对照
 
 当前 `method_validation_B.{png,pdf,json}` 使用同一份 GQA manifest 的前 32 个

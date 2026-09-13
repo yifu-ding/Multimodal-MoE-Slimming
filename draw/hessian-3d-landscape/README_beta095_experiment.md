@@ -1,218 +1,183 @@
-# 非恒等工作点实验：完整 student 的 expert 输出统一缩放至 0.95
+# beta=0.95 一阶信号与 beta=1 Hessian 的 expert 排序反例
 
-状态：服务器端实现与采集说明，尚未实现新采集参数、尚无本实验实测结果。
-本文不改变已有 beta=1 的 L2 / KL 实验及其数据。
+状态：2026-09-13 已完成第0层 L2/KL 各32个真实 GQA 样本采集、曲线和数值验收。
+结果、反例表和图片见 [beta095/RESULTS.md](beta095/RESULTS.md)。
 
-## 实验问题
+## 核心发现：L2 已找到真实排序反例
 
-保持 student 完整、不删除任何 expert，把被测层所有 routed expert 的输出
-统一乘以 `beta_work=0.95`。teacher 使用同一输入下完整、未缩放的输出。
-在该工作点实测一阶梯度、Hessian 对角元以及逐 expert 删除代价，检验：
+**128 个 expert 中，一阶排序出现 637 对反转，占全部 8128 对的 7.84%；
+已有 beta=1 Hessian 对新增真实删除 forward 的排序完全一致，最大相对误差
+仅为 6.6e-7。** 一阶 Spearman 为0.964750，Hessian Spearman 为1.000000。
 
-1. 正常工作点是否产生足够高于数值噪声的非零梯度？
-2. 一阶分数与真实删除敏感度是否发生排序反转？
-3. 加入二阶项后，整体排序和删除代价预测是否改善？
-4. 是否存在真实删除代价较高、但一阶重要性分数较低的 expert 对？
+这些一阶值是在所有 student expert 同时缩放至0.95、teacher 保持原始输出时
+通过真实 autograd 得到的非零梯度；Hessian 和排序 ground truth 对应原模型
+beta=1。不是用 beta=0.95 的一阶加二阶混合分数冒充纯 Hessian。
 
-不预设一定存在反例或二阶必胜。若一阶排序同样好，应如实报告。
+一阶 signed 与 absolute 在本批数据中相同，因为128个梯度均为负。
+637是不同 expert 对的数量，不是637个 expert，也不将 signed/abs 重复计数。
 
-## 工作点：所有 experts 同时缩放，而非逐个单独缩放
+## 画图候选：真实更敏感，一阶反而更低
 
-模型：`Qwen/Qwen3-VL-30B-A3B-Instruct`。
-首轮使用第 0 层、与原实验相同 frozen GQA manifest 的前 32/256 个样本。
-复制完整 block，验证精度为 FP32；其余模型状态、输入及 score mask 保持一致。
+下面每对均为第0层，ID从0开始。写作 `A / B` 表示真实删除 loss 为 `A > B`，
+但一阶幅度分数为 `A < B`。百分比都以B为分母：
+`真实增加 = D_A/D_B - 1`，`一阶降低 = 1 - |g_A|/|g_B|`。
 
-定义绝对缩放参数向量 `b`，作用在 routed expert contribution 上：
+| expert 对 A / B | A真实删除 loss 更高 | A一阶分数反而更低 | 两者Hessian最大相对误差 | 选择理由 |
+| --- | ---: | ---: | ---: | --- |
+| **89 / 53** | **59.61%** | **33.43%** | 3.04e-7 | 两个方向都有明显差距，优先推荐 |
+| **92 / 103** | **31.40%** | **40.62%** | 1.79e-7 | 一阶反向差距尤其明显 |
+| **109 / 103** | **54.36%** | **31.05%** | 1.79e-7 | 两个方向都明显，可替换上一对 |
+| **124 / 98** | **44.34%** | **30.34%** | 1.57e-8 | 两个方向都明显，Hessian非常贴合 |
+| 4 / 53 | 83.51% | 19.04% | 3.04e-7 | 真实删除差距较大 |
+| 19 / 98 | 70.65% | 11.28% | 2.93e-8 | 按绝对删除差选出的第一对，已有完整曲线 |
+| 47 / 43 | 122.47% | 4.34% | 1.04e-7 | 真实敏感度相差超过2倍，但一阶反向较弱 |
 
-- teacher：`b = ones(num_experts)`，输出记为 `y_teacher`，固定并 detach。
-- student 基线：`b = full(num_experts, 0.95)`，输出记为 `y_work`。
-- 删除 expert e：其他坐标保持 `0.95`，只把 `b[e]` 改成 `0`。
-- 扫描 expert e：其他坐标保持 `0.95`，只改变 `b[e]`。
+若只画三对且希望不重复 expert，建议 **89/53、92/103、124/98**。
+原先按绝对删除差挑出的60/98、13/57，一阶反向幅度分别只有1.52%、0.89%，
+因此不是展示“明显反转”的首选。
 
-缩放位置沿用 `patch_expert_output_alpha_vector`；不要缩放整个 block 输出、
-residual stream、router logits 或 router weights。不重新归一化剩余路由权重。
-每次扰动前恢复整条向量至 `0.95`，避免删除累积。
+上述推荐是**采集完成后的画图筛选**，不改变全体统计和原先固定规则选出的9个
+代表。637对中有68对同时满足“真实删除至少高20%、一阶分数至少低20%”。
+完整候选表 [beta095/l2/plot_candidates.csv](beta095/l2/plot_candidates.csv)
+按 `min(真实增加比例, 一阶降低比例)` 降序排列，保留原始数值和Hessian误差。
+全体128个原始分数见 [beta095/l2/scores.csv](beta095/l2/scores.csv)。
 
-**不要只把被测 expert 单独缩放到 0.95、其他 experts 保持 1。**
-那样每个 expert 都在不同工作点被测；L2 下梯度仍与该 expert 能量严格成比例，
-无法检验这里关心的共同残差下的排序差异。
+这些候选的真实梯度、Hessian、独立删除 loss 均已采齐，可直接画分数/删除代价图。
+完整 beta 曲线只对先前选出的代表和展示对象采集；候选表的
+`both_full_curves_available` 标明一对是否已有两条完整扫描曲线，不能把缺失曲线
+用 Hessian 公式生成后当作真实测量。
 
-仅被测层做缩放；模型其他层保持原样。沿用原采集器捕获的 teacher block 输入，
-让 teacher 和 student 使用同一输入。这是 block 重构实验，不是端到端任务 loss 实验。
+## 目的与比较口径
 
-## loss 与真实敏感度
+本实验为画图寻找真实 expert 反例：原模型的 Hessian 能准确匹配单 expert
+删除 loss，而在统一轻微缩放后实际测得的非零一阶信号给出相反的敏感度排序。
+不预设一定存在反例；全体排序统计和全部符合规则的反例一起输出。
 
-分别跑 `l2` 和 `kl_div`，分开存储。沿用现有 `compute_block_loss` 的定义，
-并在 metadata 记录实际归一化方式。当前 KL 是 block hidden 输出上的 softmax KL，
-不是最终词表分布的 KL，也不是 GQA 答案交叉熵。
+两个工作点承担不同角色，不能混为一次 Taylor 展开：
 
-令 `L(b) = loss(student(b), y_teacher)`，所有量按同一 score-token 数归一化。
+| 数据 | 求值位置 | 用途 |
+| --- | --- | --- |
+| 真实 Hessian `H_ee(1)/2` | 所有 expert 的 beta=1 | 复用已有真实 autograd/HVP，预测原模型删除 loss |
+| 真实删除代价 `D_e(1)` | 背景全1，仅 expert e 从1变0 | 本图唯一 ground truth；新增逐个独立 forward |
+| 真实梯度 `g_e(0.95)` | 所有 expert 同时缩放到0.95 | 获得非零一阶敏感度代理，比较排序 |
+| `D_e(0.95)` | 背景全0.95，仅 expert e 变0 | 单独保存的诊断量，不是主图 ground truth |
 
-```text
-L_work      = 真实 forward 得到的 L(0.95, ..., 0.95)
-g_e         = 工作点真实 autograd 一阶导数 dL/db_e
-H_ee        = 工作点真实二阶 autograd / HVP 对角元
-L_remove_e  = 真实 forward 得到的 L(b_e=0, b_others=0.95)
-D_e         = L_remove_e - L_work
-```
+teacher 始终保持完整原始输出并 detach。仅被测层 routed contribution 缩放，
+residual、router logits 和权重不缩放，不重新归一化路由。
+每次扰动都恢复完整缩放向量，禁止删除累积。
 
-`D_e` 是本实验敏感度的唯一 ground truth，不能由梯度、Hessian 或 Gram 公式填充。
-L2 也必须逐 expert 真实删除 forward，不能沿用旧采集器的 energy 消融捷径。
-保存绝对 loss 和差值，允许 `D_e` 为负；负值表示删除减少了当前重构误差，不要截断。
-
-对每个活跃 expert 采集以上全部数据，不先筛选“好看的”9个。
-
-## 公平比较的分数
-
-导数相对于绝对参数 `b_e` 计算。删除步长是 `delta = -0.95`，不是 `-1`：
-
-```text
-first_order_signed = -0.95 * g_e
-first_order_abs    = abs(0.95 * g_e)
-second_order      = -0.95 * g_e + 0.5 * 0.95**2 * H_ee
-hessian_only      = 0.5 * 0.95**2 * H_ee
-ground_truth      = D_e
-```
-
-这些是用真实导数计算的打分，不能称为真实删除 loss；真实删除值必须来自独立 forward。
-有非零残差时，完整二阶打分包含一阶项；单独报告 Hessian-only 的表现，
-不要把完整二阶分数的优势归因成 Hessian-only 的优势。
-
-`first_order_signed` 是一阶 Taylor 删除代价；`first_order_abs` 是幅度重要性基线。
-二者分别评估排序，避免把负梯度数值较小误解成一阶重要性较低。
-
-如果实现改用相对参数 `a`（`b=0.95*a`，工作点 `a=1`），导数会变换；
-必须记录 parameterization 并同步修改公式。首选直接使用绝对 `b`，避免歧义。
-
-## 为什么统一缩放可能产生排序差异
-
-在 fixed-router L2 下，用 `f_e` 表示未缩放 routed contribution，
-共同残差是 `r = -0.05 * sum_j f_j`。一阶导数取决于 `r` 与 `f_e` 的内积，
-Hessian 对角元取决于 `f_e` 自身的能量。因此不同 expert 的梯度不必与自身能量
-成固定比例；其他 expert contribution 的交叉项会影响梯度。
-
-如果这些贡献恰好近似正交或交叉项结构相似，一阶与敏感度仍可能高度相关。
-统一缩放不保证出现反例，也不保证每个 expert 的梯度都显著非零。
-上述关系只用于解释和数值验收，不用于生成任何实测值。
-
-## 采集流程
-
-每个 batch：
-
-1. 所有缩放参数为 1，真实 forward 保存 `y_teacher` 与参考 router indices/weights。
-2. 所有参数设为 0.95，真实 forward 保存 `L_work`，真实求导得到全部活跃 experts
-   的 `g_e`、`H_ee`。沿用现有分块二阶自动微分和 OOM 降块机制。
-3. 对每个活跃 expert 独立设 `b_e=0`，真实 forward 得到 `L_remove_e`。
-   每次结束都恢复到工作点。
-4. 累积 loss、梯度和 Hessian 的 token-sum，最后除以总 score-token 数。
-   不对不同 token 数的 batch 直接等权平均。
-5. 验证 teacher、工作点、删除和扫描的 router indices/weights 一致。
-
-第一遍完成全部 expert 分数后，按下节固定规则选择扫描对象；第二遍复用相同样本，
-采集每个扫描点的真实 loss 和真实局部梯度。
-
-建议绝对 beta 网格：
+**在 beta=1，一阶梯度理论上为零；在 beta=0.95，一阶项通常非零。**
+后者不是纯 Hessian 就能完整预测删除 loss 的工作点：
 
 ```text
-0, 0.25, 0.5, 0.75, 0.9, 0.95, 1.0, 1.05, 1.25, 1.5
+delta = -0.95
+T2_at_work = -0.95 * g_e(0.95) + 0.5 * 0.95**2 * H_ee(0.95)
 ```
 
-每个扫描点记录 `L(b_e=t, others=0.95)`、相对 `L_work` 的差值和该点 autograd 梯度。
-注意：单个 `b_e=1` 时其他 experts 仍为 0.95，loss 不应被强制为零。
+`T2_at_work` 包含一阶项，不能称为纯二阶。fixed-router L2 下该完整表达式仍然
+精确，但这不是本实验想展示的比较；KL 下它通常只是近似。
+本实验不重算 beta=0.95 Hessian，不用它替换已有 beta=1 Hessian。
 
-## 总体统计、9个展示对象及反例
-
-对全部活跃 experts，分别评估四种分数与 `D_e` 的 Spearman、Kendall、
-pairwise inversion rate，以及预测值的 MAE / RMSE。
-相对误差仅作为补充，接近零的删除代价会放大相对误差。
-报告实际参与比较的 expert 数、负删除代价数和梯度数值范围。
-
-Pairwise inversion 使用真实 `D_e` 的高低顺序；预测打平单独统计，不算正确排序。
-真实差异在预先记录的数值容差内的 expert 对不参与反转率分母。
-容差应通过重复 forward / FP64 loss 累积等数值检查确定并记录，不能按反例数量调节。
-
-按 `D_e` 升序划分低、中、高三个等人数区间（余数用固定 array_split 规则分配），
-每组取组内 25%、50%、75% 分位附近的三个不同 expert，平局按 expert ID 排序。
-分别对 L2、KL 选择，保存 ID 和选择规则。这9个用于代表性曲线展示。
-
-另外导出全部稳健反例对：
+主图打分为：
 
 ```text
-D_i > D_j + truth_tolerance
-first_order_i < first_order_j - score_tolerance
-second_order_i > second_order_j + score_tolerance
+first_order_signed       = -0.95 * g_e(0.95)
+first_order_abs          = abs(0.95 * g_e(0.95))
+hessian_half_at_identity = H_ee(1) / 2
+ground_truth             = L(b_e=0, others=1) - L(ones)
 ```
 
-分别为 signed / abs 一阶分数导出，不混用。额外标注 Hessian-only 是否也排对。
-按真实删除代价差降序列出，明确是反例展示，不能替代全体统计。
-没有反例时输出空表和计数0。若反例对象不在9个代表 expert 中，额外采集其扫描，
-不要悄悄替换代表性对象。
+一阶分数在这里是跨工作点的排序代理，不是对 `D_e(1)` 的一阶 Taylor 预测。
+保留0.95这个共同正因子不会影响排序；不以一阶值的 MAE 宣称预测精度优劣。
+只有 beta=1 的 Hessian 分数报告对删除 loss 的 MAE/RMSE/相对误差。
+L2 是固定路由与仿射 expert 缩放下的精确二次情形；KL 必须报告实测误差，
+不能称为数学上的精确恒等式。
 
-## 输出目录与字段
+## 数据与采集
 
-所有本实验文件统一放到：
+模型 `Qwen/Qwen3-VL-30B-A3B-Instruct`，第0层，原 frozen GQA manifest
+前32个样本、4096个 score tokens、batch size 16、FP32 copied block。
+manifest SHA256 为 `24c3a5e250c33ca53df6addb82ee78de2efe94f1bff2487ee754e6f6b347d6d5`。
+旧 Hessian 对应 `data/` 与 `data_kl/` CSV，原始 PT 在
+`artifacts/method_validation_b_gqa_layer0{,_kl}/method_validation_b.pt`。
+
+新采集器 `src/calibration/collect_beta095_counterexamples.py`：
+
+1. 加载旧 Hessian PT，验证模型、loss、FP32、manifest 哈希和评分 token 总数。
+2. 每个 batch 捕获原模型 block 输入，在 copied block 全1处测得并固定 teacher。
+3. 在全1处实测梯度；在全0.95处做两次真实 forward/backward，记录梯度及重复误差。
+4. 对全部128个 expert，在背景1和0.95下分别独立删除 forward。
+   背景1重复测量，用于估计数值重复误差；L2 不使用 energy/Gram 捷径。
+5. 对梯度绝对值最大的3个 expert，使用0.005、0.01中心差分步长核验一阶梯度。
+6. 按 score-token sum 累积后统一归一化，不等权平均不同 token 数的 batch。
+7. 对全部活跃 expert 做统计，再复用相同样本采集选定对象的真实 loss/局部梯度曲线。
+
+所有 teacher、工作点、删除、中心差分和扫描 forward 都检查 router
+indices/weights 完全一致。loss 使用 FP64 算术，block 保持 FP32。
+L2 为 hidden 维 MSE；KL 为 block hidden softmax 分布的 KL，
+不是最终词表 KL 或 GQA 答案交叉熵。FP64 仅改善 loss 数值运算，不合成测量值。
+
+## 全体统计、代表与反例
+
+分别计算 signed、abs 一阶与 Hessian 对 `D_e(1)` 的 Spearman、Kendall、
+pairwise inversion rate。真实并列排除，预测并列单列，不算正确排序。
+记录梯度范围、负删除数与参与比较的 expert 数；常数分数相关性输出 null。
+
+数值容差固定为 `max(8 * 重复测量最大差, 32 * FP32 epsilon * 全体最大绝对值)`。
+梯度的重复差同步乘0.95。该规则在采集前固定，不根据反例数量调节。
+
+低、中、高各3个代表：按真实删除 loss 升序、expert ID 打破平局，使用
+`array_split` 划分三组，各取组内 P25/P50/P75 最近的三个不同对象。
+
+分别为 signed、abs 导出所有满足以下条件的 expert 对：
 
 ```text
-draw/hessian-3d-landscape/beta095/
-  l2/       # 原始 pt、CSV、metadata、统计 JSON、日志和后续图
-  kl_div/   # 相同结构，与 L2 分开
+D_i(1) > D_j(1) + truth_tolerance
+first_i < first_j - first_tolerance
+H_ii(1)/2 > H_jj(1)/2 + hessian_tolerance
+两个 expert 的 Hessian 删除预测相对误差均 <= hessian_match_rtol
 ```
 
-`scores.csv` 至少包含：
+L2 默认 `hessian_match_rtol=1e-4`；KL 使用0.05，并明确这是5%内的近似匹配。
+按真实删除差降序排列，expert ID 打破平局。
+展示额外取前三个不同 expert 对；采集其端点扫描，不替换9个代表。
+其余反例全部保留在 CSV，但不强制为每一个候选对象补扫曲线。
+没有反例时保留空表和计数0。
 
-```text
-layer, expert, beta_work, loss_fn, num_score_tokens, active_batch_count,
-base_loss, removal_loss, true_removal_delta, gradient_at_work,
-hessian_diag_at_work, first_order_signed, first_order_abs,
-second_order, hessian_only
+曲线分别使用背景1和背景0.95，teacher 均为原始输出。绝对 beta 网格：
+`0, 0.25, 0.5, 0.75, 0.9, 0.95, 1, 1.05, 1.25, 1.5`。
+背景0.95时单个 expert 的 beta=1不是恒等点，不强制 loss 为零。
+扫描 beta=0 必须与独立删除 forward 一致，beta=背景值时 delta loss 必须接近0。
+
+## 运行与输出
+
+在仓库根目录，用已安装模型依赖的 Python 运行：
+
+```bash
+python -m src.calibration.collect_beta095_counterexamples \
+  --scores /home/data/dyf/MARS-results/storage/scores/qwen3-vl-30b-a3b_mixed-gqa-256-seed42-rel_l2-0913-132047/scores.pt \
+  --identity-input artifacts/method_validation_b_gqa_layer0/method_validation_b.pt \
+  --output-dir draw/hessian-3d-landscape/beta095/l2 --loss-fn l2
 ```
 
-`beta_curves.csv` 至少包含：
+KL 改用 `_kl` reference 目录、`--loss-fn kl_div --hessian-match-rtol 0.05`，
+输出目录改为 `beta095/kl_div`。
+可先指定 `--smoke` 和独立输出目录，仅采1个样本；smoke 不把单样本新数据
+与32样本旧 Hessian 拼接，不输出排序结论。已有 `raw.pt` 的目录拒绝覆盖。
 
-```text
-layer, expert, selection_group, selection_reason, beta_work, beta,
-measured_loss, measured_delta_loss, local_gradient_at_beta
+输出含 `raw.pt`（真实 batch 张量）、`scores.csv`、`counterexamples.csv`、
+`statistics.json`、`beta_curves.csv`、`metadata.json` 和中途保存的 `progress.pt`。
+metadata 记录两种背景、归一化、参考 PT 哈希、代码版本/采集器哈希、
+模型、manifest、样本数、token 数、路由检查及扫描对象。
+
+```bash
+python draw/hessian-3d-landscape/plot_beta095_counterexamples.py \
+  --data-dir draw/hessian-3d-landscape/beta095/l2
+python -m scripts.check_beta095_counterexamples \
+  --data-dir draw/hessian-3d-landscape/beta095/l2
+python -m scripts.select_beta095_plot_candidates \
+  --data-dir draw/hessian-3d-landscape/beta095/l2
 ```
 
-metadata 保存模型路径、代码 commit、manifest 路径及 SHA256、样本选择规则、样本数、
-batch size、层号、dtype、loss 定义及归一化、`beta_work=0.95`、
-`parameterization=absolute_expert_scale`、`background=all_experts_scaled`、
-teacher 未缩放、fixed-router 检查、扫描网格、数值容差及选择规则。
-保存 batch 级汇总，便于定位数值不稳定，但两个 batch 不能当成充分的统计置信度。
-
-## 服务器端需要修改的代码
-
-这不是目前旧命令加 `--betas 0.95` 就能运行的实验：旧参数只控制展示扫描，
-不会改变求导工作点，也不会改变其他 expert 的背景缩放。
-
-建议新增独立采集器，复用 `src/calibration/collect_method_validation_b.py` 的模型加载、
-manifest、alpha patch、HVP 和 router 检查逻辑，避免改变已有实验的语义。
-新接口需支持 `--beta-work 0.95`、`--loss-fn`，以及上述全体评分与二次扫描流程。
-该接口尚未实现，本文不提供伪装成可直接执行的新命令。
-
-移植时重点检查：
-
-- `_identity_point_gradient_and_hessian_diag`：改为在传入工作向量处求导。
-- `_true_ablation_via_forward`：所有恢复操作改为 `fill_(beta_work)`；L2/KL 均使用它。
-- `collect_layer`：分离完整 teacher target 和缩放 student 基线。
-- beta sweep：背景保持工作向量，禁止重新定义 teacher 或恢复为全1。
-- 导出器：使用新字段和独立 schema；不复用 `identity_gradient` 等旧字段名。
-- 旧绘图器假设恒等基线为零，不能直接用于新数据，需要后续新增对应绘图逻辑。
-
-## 验收与结论边界
-
-先用少量样本 smoke test，再完整采集32个样本：
-
-- teacher target 在所有探针间固定；工作点 loss、梯度由实测报告，不强制其非零。
-- beta=0 扫描值与对应真实删除 forward 一致，beta=0.95 差值接近0。
-- 抽查若干 expert，在0.95附近用多个小步长中心差分验证梯度/Hessian；
-  KL 的小 loss 注意 FP32 消减误差，必要时采用 FP64 loss 运算核验。
-- fixed-router L2 下，完整二阶删除打分应与实测删除代价在数值精度内一致。
-  KL 不要求精确一致，记录真实误差。不得以理论值替换异常测量点。
-- 所有比较使用同一工作点、teacher、样本和归一化；两种 loss 数据不混合。
-- 若预期排序反例没有出现，保留结果，不通过换 beta 或挑 expert 隐瞒失败。
-
-首轮结果回答的是“完整模型在统一0.95缩放工作点下的 block 重构敏感度排序”。
-不能直接扩大为未缩放原模型的排序优势或最终任务性能优势。
-如需确认反例稳定性，可在后续独立 GQA 样本上验证已选 expert 对，
-不把用于筛选的同32个样本称为独立验证。
+本实验支持的结论限于这批样本、这个 block 重构 loss 下的跨工作点排序反例。
+筛选使用的32个样本不属于独立验证集，反例展示不替代全体统计。

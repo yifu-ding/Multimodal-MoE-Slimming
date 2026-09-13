@@ -1,0 +1,149 @@
+{
+  "target": "single removal from all-ones background; gradient is a ranking proxy from all-0.95 background",
+  "num_experts": 128,
+  "negative_removal_count": 0,
+  "gradient_range": [
+    -6.929102980279822e-08,
+    -9.536290090927935e-10
+  ],
+  "truth_tolerance": 1.787559694051316e-12,
+  "score_tolerances": {
+    "first_order_signed": 2.51108086825021e-13,
+    "first_order_abs": 2.51108086825021e-13,
+    "hessian_half_at_identity": 1.762233046119499e-12
+  },
+  "tolerance_rule": "max(8 * measured repeat discrepancy, 32 * float32 epsilon * maximum absolute score)",
+  "hessian_match_rtol": 0.05,
+  "metrics": {
+    "first_order_signed": {
+      "spearman": 0.9720804339864494,
+      "kendall": 0.8646653543307088,
+      "correct_pairs": 7578,
+      "inverted_pairs": 550,
+      "predicted_ties": 0,
+      "truth_ties_excluded": 0,
+      "eligible_pairs": 8128,
+      "inversion_rate": 0.06766732283464567
+    },
+    "first_order_abs": {
+      "spearman": 0.9720804339864494,
+      "kendall": 0.8646653543307088,
+      "correct_pairs": 7578,
+      "inverted_pairs": 550,
+      "predicted_ties": 0,
+      "truth_ties_excluded": 0,
+      "eligible_pairs": 8128,
+      "inversion_rate": 0.06766732283464567
+    },
+    "hessian_half_at_identity": {
+      "spearman": 0.9999942776048343,
+      "kendall": 0.9997539370078742,
+      "correct_pairs": 8127,
+      "inverted_pairs": 1,
+      "predicted_ties": 0,
+      "truth_ties_excluded": 0,
+      "eligible_pairs": 8128,
+      "inversion_rate": 0.00012303149606299212,
+      "mae": 1.2699845403873348e-10,
+      "rmse": 6.64522403514679e-10,
+      "median_relative_error": 7.498255874993867e-05,
+      "max_relative_error": 0.014168280934113472
+    }
+  },
+  "counterexample_counts": {
+    "first_order_signed": 550,
+    "first_order_abs": 550
+  },
+  "representatives": [
+    {
+      "expert": 25,
+      "group": "low",
+      "quantile": 0.25
+    },
+    {
+      "expert": 88,
+      "group": "low",
+      "quantile": 0.5
+    },
+    {
+      "expert": 5,
+      "group": "low",
+      "quantile": 0.75
+    },
+    {
+      "expert": 109,
+      "group": "medium",
+      "quantile": 0.25
+    },
+    {
+      "expert": 51,
+      "group": "medium",
+      "quantile": 0.5
+    },
+    {
+      "expert": 101,
+      "group": "medium",
+      "quantile": 0.75
+    },
+    {
+      "expert": 57,
+      "group": "high",
+      "quantile": 0.25
+    },
+    {
+      "expert": 75,
+      "group": "high",
+      "quantile": 0.5
+    },
+    {
+      "expert": 84,
+      "group": "high",
+      "quantile": 0.75
+    }
+  ],
+  "display_pairs": [
+    {
+      "baseline": "first_order_abs",
+      "expert_high": 13,
+      "expert_low": 57,
+      "truth_high": 1.8799617258767294e-07,
+      "truth_low": 1.0492276568045554e-07,
+      "truth_gap": 8.30734069072174e-08,
+      "first_high": 2.273276020758885e-08,
+      "first_low": 2.2827513834755563e-08,
+      "hessian_high": 1.8807284618560516e-07,
+      "hessian_low": 1.0467472577602166e-07,
+      "hessian_relative_error_high": 0.0004078465900493794,
+      "hessian_relative_error_low": 0.0023640236971001296
+    },
+    {
+      "baseline": "first_order_abs",
+      "expert_high": 13,
+      "expert_low": 98,
+      "truth_high": 1.8799617258767294e-07,
+      "truth_low": 1.0692258987152722e-07,
+      "truth_gap": 8.107358271614572e-08,
+      "first_high": 2.273276020758885e-08,
+      "first_low": 2.6404627373466383e-08,
+      "hessian_high": 1.8807284618560516e-07,
+      "hessian_low": 1.0676933470676886e-07,
+      "hessian_relative_error_high": 0.0004078465900493794,
+      "hessian_relative_error_low": 0.0014333282138274752
+    },
+    {
+      "baseline": "first_order_abs",
+      "expert_high": 19,
+      "expert_low": 57,
+      "truth_high": 1.854147713277629e-07,
+      "truth_low": 1.0492276568045554e-07,
+      "truth_gap": 8.049200564730736e-08,
+      "first_high": 2.1798215454893466e-08,
+      "first_low": 2.2827513834755563e-08,
+      "hessian_high": 1.8540910673436883e-07,
+      "hessian_low": 1.0467472577602166e-07,
+      "hessian_relative_error_high": 3.0550928351109904e-05,
+      "hessian_relative_error_low": 0.0023640236971001296
+    }
+  ],
+  "selection_rule": "truth ascending, expert-ID ties, array_split thirds, distinct nearest within-group P25/P50/P75; extra top three unique counterexample pairs by truth gap"
+}

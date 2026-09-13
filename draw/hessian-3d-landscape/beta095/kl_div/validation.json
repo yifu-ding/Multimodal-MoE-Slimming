@@ -1,0 +1,14 @@
+{
+  "passed": true,
+  "num_experts": 128,
+  "num_score_tokens": 4096,
+  "num_curve_points": 240,
+  "num_counterexample_rows": 1100,
+  "max_identity_gradient": 2.492577433743273e-22,
+  "max_work_gradient": 6.929102980279822e-08,
+  "repeat_loss_error_per_token": 0.0,
+  "repeat_score_error_per_token": 0.0,
+  "max_gradient_finite_difference_relative_error": 7.852892353471225e-06,
+  "max_curve_endpoint_error": 0.0,
+  "max_curve_baseline_gradient_error": 0.0
+}
