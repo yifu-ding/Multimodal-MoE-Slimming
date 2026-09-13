@@ -6,9 +6,27 @@
 新增真实实验：[beta=0.95 一阶与 beta=1 Hessian 的排序反例](README_beta095_experiment.md)。
 已完成 L2/KL 第0层32样本采集，结果和新图见 [beta095/RESULTS.md](beta095/RESULTS.md)。
 
-## 待补采：所有 expert 同步 beta sweep 的真实梯度（2026-09-13）
+## 已补采：所有 expert 同步 beta sweep 的真实梯度（2026-09-13）
 
-**状态：待采集；本节是服务器运行规格，不是已经完成的实验结果。**
+**状态：已完成真实采集与数值验收。** 第0层全部128个expert、同一批32个GQA
+样本、2批各16样本、4096个score tokens；每个点使用独立128维向量
+`alpha.fill_(beta)`，一次 `autograd.grad(loss, alpha)` 同时得到全部偏导。
+L2/KL各保存640行主采样数据和128行beta=1检查数据。
+
+结果与运行方法见 [global_beta_sweep/RESULTS.md](global_beta_sweep/RESULTS.md)，
+主图见 [真实梯度百分比](global_beta_sweep/gradient_ratios.png)，
+原始表见 [L2 gradients.csv](global_beta_sweep/l2/gradients.csv) 和
+[KL gradients.csv](global_beta_sweep/kl_div/gradients.csv)。
+
+**实测结论：L2所有expert共同按100%、75%、50%、25%、5%变化，最大偏差
+2.071e-5个百分点，在线性数值误差内；KL存在轻微但可分辨的跨expert差异，
+最大偏差1.844843个百分点。** 例如全局beta=0.5时，KL百分比范围是
+48.155157%至50.080895%，beta=0.95时是4.697263%至5.015503%。
+没有筛掉任何expert，全部128个beta=0分母均有效；beta=0.95新梯度与旧数据
+逐项差异为0。各beta均为本轮独立真实forward/backward，未按理论填值。
+
+下文保留采集规格；原先的理论预期已由上面的实测结果检验。
+
 目标是实测验证：同一层所有 expert 的缩放系数一起变化时，每个 expert 的
 一阶梯度是否随 beta 线性变化，以及相对于全体 beta=0 的梯度绝对值，
 不同 expert 的变化百分比是否一致。不要预设或筛选“存在非线性”的结果。
@@ -75,7 +93,7 @@ for batch in calibration_batches:
 - 原采集器 `src/calibration/collect_beta095_counterexamples.py` 中
   `set_scale(alpha, beta)` 与 `measure_batch` 的全体求导方式可复用；
   但其入口限制beta_work=0.95，且后续beta_curves是逐expert扫描。
-  **服务器端需要新增全体同步sweep入口/模式，不能直接把旧beta_curves当作本数据。**
+  **已新增 `src/calibration/collect_global_beta_sweep.py` 同步入口；旧beta_curves不是本数据。**
 
 ### 需要保存什么
 
@@ -163,7 +181,7 @@ block/loss/累积dtype、随机种子、代码commit、采集脚本hash及comple
   但必须标清放大尺度和重复测量噪声，不能把噪声渲染成显著现象。
 - L2固定路由且输出对alpha仿射时，理论为
   `g_e(beta*ones)=(beta-1)*(H*ones)_e`，故有效比例为 `100*(1-beta)%`。
-  对指定5点预期分别是100%、75%、50%、25%、5%。这是理论预期，不是已采到的结果。
+  对指定5点理论预期分别是100%、75%、50%、25%、5%；本轮实测符合，具体误差见结果表。
   若实测一致，应如实报告各expert共同缩放，而不是寻求不存在的差异。
 - KL不保证上述严格比例，由本轮实测决定是否有跨expert差异以及差异是否超过数值噪声。
 - 本次只需真实梯度和loss，**无需补采Hessian、逐expert独立删除、联合删除或其他层**。
