@@ -184,6 +184,87 @@ P10/P50/P90 三个 expert 已经采过 `beta=0.75`、`0.5`、`0.25` 等中间点
 现有 beta sweep 基础上分别新增"每点重新求导"和"每点额外测一次小扰动
 loss"这两类记录。
 
+### 方案③：换成 KL 散度重新验证 HVP vs. 真实移除代价（尚未采集数据）
+
+图 (b)"HVP vs. single removal"目前完全贴合 `y=x`，但这**不是一个需要真实
+数据才能知道答案的问题**——只要 loss 用的是 L2/MSE，且模型输出对 `beta_e`
+是线性的，`H_ee/2` 就必然精确等于真实移除代价，这是代数恒等式（见上面
+"为什么图 (a)-(b) 是正确性检查"一节），不需要再采一遍数据去验证。真正
+没有先验答案、需要真实实验才知道结果的，是**换一个不是精确二次的 loss**
+之后，这个"贴合 `y=x`"的结论还成不成立。
+
+**先说清楚为什么不是随便换个 loss 都算数**。仓库里 `compute_block_loss`
+（`src/calibration/helpers/helpers.py:18`）已经支持四种 `loss_fn`：`l2`、
+`rel_l2`、`cosine`、`kl_div`。这四种里，`rel_l2` **不值得采**，原因可以
+直接从公式看出来：
+
+```text
+rel_l2 = diff2 / (base2 + eps)，
+diff2 = (pred - target)^2 之和,     # 和 l2 一样，对 beta_e 严格二次
+base2 = target^2 之和。              # target 是 beta_e=1 时的输出，不依赖 beta_e
+```
+
+`base2` 是一个和 `beta_e` 完全无关的常数，所以 `rel_l2` 只是把 `diff2`
+（跟 l2 一样严格二次）除以一个常数——**整条曲线还是严格二次的，只是被
+重新缩放了**，不需要跑实验就能预判：采出来的结果还是会精确落在 `y=x`
+上，跟现在的图一样，看不出新东西。
+
+`kl_div` 则真的不一样，原因是 `pred` 在算 KL 之前先过了一遍 `softmax`：
+
+```text
+pred_logprob = log_softmax(pred)
+teacher_prob = softmax(target)
+kl = kl_div(pred_logprob, teacher_prob)
+```
+
+`softmax` 是非线性的。正文第 348 行附近已经证明：L2 情形下"the model-
+nonlinearity term in the Hessian vanishes identically"，前提正好是"输出
+对 `beta_e` 是仿射的、loss 是二次的"这两条同时成立；一旦中间插入
+`softmax` 这个非线性环节，这个论证就不再适用了——**`H_ee/2` 在 KL 散度
+下只是真实移除代价的一个近似，不再是精确恒等式，近似得有多好、在哪些
+expert 上近似得差，这些都是需要真实数据才能回答的问题**，这正是这一版
+图的空白，值得单独采一份数据填上。
+
+有两件事在换 loss 之后仍然成立，不需要重新证明：
+
+1. `identity_gradient`（`beta_e=1` 处的一阶导数）在 KL 下应该仍然精确为
+   零。理由和 loss 类型无关：只要 `beta_e=1` 时 `pred=target`，KL 散度和
+   L2 一样，在两个分布完全相同的地方取到全局最小值 0，极值点的一阶必要
+   条件同样适用。如果实际采出来发现不是 0，说明实现有 bug，而不是说明
+   这个结论只对 L2 成立。
+2. "Gram/energy 闭式解"（图 (a) 里的 `expert_output_energy`）**在 KL 下
+   没有对应版本，不需要为它采数据**。现在的闭式解能成立，是因为 L2 loss
+   下 Hessian 恰好等于 routed contribution 的 Gram 矩阵；KL 散度的 Hessian
+   是 softmax 之后的 Fisher 信息量，不再是一个简单的向量内积，没有理由
+   假设它还等于 `||f_e(x)||^2`。图 (a) 这一对比换 loss 之后没有意义，只
+   需要重新验证图 (b) 这一对。
+
+**需要采集的数据**：`collect_method_validation_b.py` 里目前有两处硬编码
+了 `loss_fn="l2"`（`_identity_point_gradient_and_hessian_diag` 的调用点，
+以及 beta sweep 内层循环），需要改成一个可配置参数（比如环境变量
+`VALIDATION_LOSS_FN`，默认仍为 `l2` 保持向后兼容），跑一遍
+`VALIDATION_LOSS_FN=kl_div` 采集完整流程（第 0 层全部 128 个 expert 的
+`hvp_hessian_half`/`single_expert_ablation`/`identity_gradient`，加上
+P10/P50/P90 三个 expert 的完整 beta sweep，包括 `local_gradient_at_beta`
+——方案①的逐点局部一阶在 KL 下同样是一个开放问题，可以顺带一起验证）。
+
+**输出目录和 metadata 要求**：
+
+- KL 数据必须导出到一个新目录（比如
+  `artifacts/method_validation_b_gqa_layer0_kl/data/`），不能和现有 L2
+  数据混在同一批 CSV 里——两者的数值量纲完全不同（KL 散度和 per-token
+  MSE 不是同一个单位），混在一起会被误读成同一批可比较的数字。
+- `method_validation_B_metadata.json` 里目前没有记录用了哪种
+  `loss_fn`，需要补一个 `loss_fn` 字段（现有 L2 数据可以事后补写
+  `"loss_fn": "l2"`），否则以后区分不了哪份数据对应哪种 loss。
+
+**画法建议**：复用现成的 `plot_method_validation_b.py`，用
+`--data-dir` 指向新目录即可画出对应的 (a)-(f)；如果要把 L2 和 KL 的
+"HVP vs. single removal"结果放到同一张图里直接对比，需要新写一个小脚本，
+把两份 `method_validation_B_scores.csv` 的 `hvp_hessian_half` /
+`single_expert_ablation` 放到同一个 log-log 散点图里，用颜色区分
+loss 类型，而不是像现在这样跨两个独立的图分别看 Pearson/Spearman。
+
 ## 每个数据点是什么意思
 
 图 (a) 和 (b) 中的每个散点对应一个 `(layer, expert)`，结果在同一批 32 个

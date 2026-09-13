@@ -25,6 +25,7 @@ GRID = "#DCE1E5"
 TEAL = "#168681"
 RED = "#C4473A"
 GRAY = "#858A8E"
+VIOLET = "#6E5AA0"
 
 plt.rcParams.update(
     {
@@ -59,22 +60,31 @@ def load(data_dir: Path) -> tuple[dict, dict[str, np.ndarray], list[dict]]:
 
     with (data_dir / "method_validation_B_beta_curves.csv").open(encoding="utf-8") as handle:
         beta_rows = list(csv.DictReader(handle))
+    # `local_gradient_at_beta` (README plan (1): re-differentiate at each swept
+    # beta_0 instead of extrapolating identity_gradient from beta=1) is only
+    # present in data collected after that column was added. Older data
+    # directories (e.g. the published draw/hessian-3d-landscape/data/) do not
+    # have it, so this stays optional rather than a hard schema requirement.
+    has_local_gradient = bool(beta_rows) and "local_gradient_at_beta" in beta_rows[0]
     curves = []
     for label in ("low", "medium", "high"):
         rows = [row for row in beta_rows if row["sensitivity"] == label]
         if not rows:
             raise ValueError(f"Missing {label!r} beta curve.")
-        curves.append(
-            {
-                "label": label,
-                "quantile": float(rows[0]["quantile"]),
-                "expert_idx": int(rows[0]["expert"]),
-                "betas": np.asarray([float(row["beta"]) for row in rows]),
-                "measured": np.asarray([float(row["measured_delta_mse"]) for row in rows]),
-                "gradient": float(rows[0]["identity_gradient"]),
-                "hessian_score": float(rows[0]["hvp_hessian_half"]),
-            }
-        )
+        curve = {
+            "label": label,
+            "quantile": float(rows[0]["quantile"]),
+            "expert_idx": int(rows[0]["expert"]),
+            "betas": np.asarray([float(row["beta"]) for row in rows]),
+            "measured": np.asarray([float(row["measured_delta_mse"]) for row in rows]),
+            "gradient": float(rows[0]["identity_gradient"]),
+            "hessian_score": float(rows[0]["hvp_hessian_half"]),
+        }
+        if has_local_gradient:
+            curve["local_gradient"] = np.asarray(
+                [float(row["local_gradient_at_beta"]) for row in rows]
+            )
+        curves.append(curve)
     return metadata, score_columns, curves
 
 
@@ -118,16 +128,36 @@ def main() -> None:
         "energy_vs_hvp": metric_summary(hvp, energy),
         "ablation_vs_hvp": metric_summary(hvp, ablation),
     }
-    fig, axes = plt.subplots(2, 3, figsize=(11.8, 7.2))
-    fig.subplots_adjust(left=0.075, right=0.985, top=0.86, bottom=0.09, hspace=0.92, wspace=0.30)
+    # Panel (c) ("cost of the same exact score") was dropped: it compared a
+    # brute-force-ablation forward count against the Gram/energy shortcut's
+    # forward count, but that shortcut isn't the HVP path this repo actually
+    # uses for scoring, so the comparison didn't represent the production
+    # method's cost. Top row is now 2 wider panels instead of 3, bottom row
+    # keeps its 3 -- built on a 6-column grid so the two rows can have a
+    # different panel count without mismatched column widths.
+    fig = plt.figure(figsize=(9.6, 7.2))
+    grid = fig.add_gridspec(2, 6)
+    fig.subplots_adjust(left=0.085, right=0.935, top=0.86, bottom=0.09, hspace=0.92, wspace=1.5)
+    top_axes = (fig.add_subplot(grid[0, 0:3]), fig.add_subplot(grid[0, 3:6]))
     positive_values = np.concatenate((hvp, energy[energy > 0], ablation[ablation > 0]))
     limits = (float(positive_values.min()) * 0.85, float(positive_values.max()) * 1.18)
-    for panel_idx, (ax, values, title, ylabel, summary) in enumerate((
-        (axes[0, 0], energy, "(a) Sanity check: HVP vs. Gram energy", r"$s_e^{\rm energy}$", summaries["energy_vs_hvp"]),
-        (axes[0, 1], ablation, "(b) Sanity check: HVP vs. single removal", r"$s_e^{\rm ablate}$", summaries["ablation_vs_hvp"]),
+    for panel_idx, (ax, values, title, ylabel, summary) in enumerate(zip(
+        top_axes,
+        (energy, ablation),
+        ("(a) Sanity check: HVP vs. Gram energy", "(b) Sanity check: HVP vs. single removal"),
+        (r"$s_e^{\rm energy}$", r"$s_e^{\rm ablate}$"),
+        (summaries["energy_vs_hvp"], summaries["ablation_vs_hvp"]),
     )):
-        scatter = ax.scatter(hvp, values, c=layer_ids, cmap="viridis", s=8, alpha=0.48, linewidths=0)
-        ax.plot(limits, limits, color=RED, linestyle="--", linewidth=1.3, label=r"$y=x$")
+        # y=x drawn thin, light, and behind the scatter (zorder=0): for the
+        # exact-quadratic l2/rel_l2 case the points sit exactly on this line,
+        # so a bold line on top of them mostly just redraws the data. Kept as
+        # a faint guide rather than removed outright, since a future
+        # non-exact loss variant (e.g. kl_div) would show real, visible
+        # deviation from it worth comparing against.
+        scatter = ax.scatter(hvp, values, c=layer_ids, cmap="viridis", s=8, alpha=0.48,
+                             linewidths=0, zorder=2)
+        ax.plot(limits, limits, color=GRAY, linestyle="--", linewidth=0.8, alpha=0.7,
+                zorder=0, label=r"$y=x$")
         ax.set(xscale="log", yscale="log", xlim=limits, ylim=limits)
         ax.set_aspect("equal", adjustable="box")
         ax.set_xlabel(r"$s_e^{\rm HVP}=H_{ee}/2$")
@@ -150,37 +180,19 @@ def main() -> None:
     gradient_max_abs = float(np.max(np.abs(gradient_values)))
     if gradient_max_abs > 1e-12:
         raise ValueError(f"Expected first-order degeneracy, got max |g|={gradient_max_abs:.3e}.")
+    # Kept as a correctness check even without panel (c): every plotted layer
+    # should still have the same number of active experts. num_experts still
+    # feeds the forward_evaluations_per_layer JSON stat below.
     experts_per_layer = [int(np.sum(layer_ids == layer)) for layer in np.unique(layer_ids)]
     if len(set(experts_per_layer)) != 1:
         raise ValueError("Expected the same number of active experts in every plotted layer.")
     num_experts = experts_per_layer[0]
-    cost_values = (num_experts, 1)
-    bars = axes[0, 2].bar(
-        (0, 1),
-        cost_values,
-        width=0.58,
-        color=(RED, TEAL),
-        alpha=0.9,
-        zorder=2,
-    )
-    axes[0, 2].set_yscale("log")
-    axes[0, 2].set_ylim(0.7, num_experts * 2.2)
-    axes[0, 2].set_xticks((0, 1), ("Brute-force\nablation", "Gram / energy\n(this work)"))
-    axes[0, 2].set_ylabel("Forward evaluations per layer")
-    axes[0, 2].set_title("(c) Cost of the same exact score")
-    axes[0, 2].bar_label(bars, labels=(str(num_experts), "1"), padding=4, fontsize=9)
-    axes[0, 2].text(
-        0.72,
-        0.68,
-        rf"${num_experts}\times$ fewer evaluations",
-        transform=axes[0, 2].transAxes,
-        ha="center",
-        va="center",
-        fontsize=9,
-        color=TEXT,
-    )
-    finish_axes(axes[0, 2])
 
+    bottom_axes = (
+        fig.add_subplot(grid[1, 0:2]),
+        fig.add_subplot(grid[1, 2:4]),
+        fig.add_subplot(grid[1, 4:6]),
+    )
     sweep_layer = int(metadata["sweep_layer"])
     if not bool(metadata["route_consistency_verified"]):
         raise ValueError("Beta sweep did not verify fixed router indices and weights.")
@@ -188,7 +200,7 @@ def main() -> None:
     dense_beta = np.linspace(float(betas.min()), float(betas.max()), 300)
     sensitivity_titles = ("Low sensitivity", "Medium sensitivity", "High sensitivity")
     sweep_summaries = []
-    for panel_idx, (ax, curve, title) in enumerate(zip(axes[1], curves, sensitivity_titles)):
+    for panel_idx, (ax, curve, title) in enumerate(zip(bottom_axes, curves, sensitivity_titles)):
         expert_idx = int(curve["expert_idx"])
         dense_delta = dense_beta - 1.0
         gradient = float(curve["gradient"])
@@ -200,17 +212,37 @@ def main() -> None:
         absolute_error = np.abs(measured - predicted_points)
         relative_error = absolute_error / np.maximum(np.abs(predicted_points), 1e-30)
         nonbaseline = np.abs(betas - 1.0) > 1e-12
-        sweep_summaries.append(
-            {
-                "label": curve["label"],
-                "expert_idx": expert_idx,
-                "max_abs_error": float(absolute_error.max()),
-                "median_relative_error_nonbaseline": float(np.median(relative_error[nonbaseline])),
-                "max_relative_error_nonbaseline": float(np.max(relative_error[nonbaseline])),
+        summary_entry = {
+            "label": curve["label"],
+            "expert_idx": expert_idx,
+            "max_abs_error": float(absolute_error.max()),
+            "median_relative_error_nonbaseline": float(np.median(relative_error[nonbaseline])),
+            "max_relative_error_nonbaseline": float(np.max(relative_error[nonbaseline])),
+        }
+        if "local_gradient" in curve:
+            # hessian_score is H_ee/2 (the hvp_hessian_half field); the local
+            # gradient identity is g_e(beta_0) = H_ee * (beta_0 - 1), so the
+            # expected value needs the factor of 2 back.
+            local_gradient = curve["local_gradient"]
+            expected_local_gradient = 2.0 * hessian_score * (betas - 1.0)
+            local_gradient_abs_error = np.abs(local_gradient - expected_local_gradient)
+            local_relative_error = local_gradient_abs_error / np.maximum(
+                np.abs(expected_local_gradient), 1e-30
+            )
+            summary_entry["local_gradient_vs_hee_delta"] = {
+                "max_abs_error": float(local_gradient_abs_error.max()),
+                "max_relative_error_nonbaseline": float(
+                    np.max(local_relative_error[nonbaseline])
+                ),
             }
-        )
+        sweep_summaries.append(summary_entry)
         ax.plot(dense_beta, second, color=TEAL, linewidth=2.3)
-        ax.plot(dense_beta, first, color=GRAY, linestyle=(0, (5, 3)), linewidth=1.4)
+        # The flat "extrapolate from beta=1" line is just one member of the
+        # local-tangent family below, evaluated at beta_0=1 (where its slope
+        # happens to be 0) -- draw it separately only when there is no
+        # per-point local-gradient data to already cover that case.
+        if "local_gradient" not in curve:
+            ax.plot(dense_beta, first, color=GRAY, linestyle=(0, (5, 3)), linewidth=1.4)
         ax.scatter(betas, measured, facecolor="white", edgecolor=TEXT, linewidth=1.0, s=26, zorder=3)
         removal_idx = int(np.argmin(np.abs(betas)))
         ax.scatter([betas[removal_idx]], [measured[removal_idx]], color=RED, marker="D", s=28, zorder=4)
@@ -223,7 +255,7 @@ def main() -> None:
             color=RED,
             fontsize=8,
         )
-        letter = chr(ord("d") + panel_idx)
+        letter = chr(ord("c") + panel_idx)
         ax.set_title(
             f"({letter}) {title}\nP{int(round(100 * float(curve['quantile'])))}, Expert {expert_idx}"
         )
@@ -238,15 +270,54 @@ def main() -> None:
             va="top",
             fontsize=8,
         )
+        # README plan (1): at each swept beta_0, evaluate the local slope
+        # directly (real forward+backward at that beta_0) instead of
+        # extrapolating identity_gradient from beta=1. Drawn on its own right
+        # axis (slope magnitude), not overlaid on the left axis's loss curve
+        # -- a slope and a loss value are different units, and tangent
+        # segments drawn on top of the parabola made the panel read as one
+        # cluttered curve instead of two separate, comparable quantities.
+        if "local_gradient" in curve:
+            local_gradient = curve["local_gradient"]
+            dense_local_slope = 2.0 * hessian_score * dense_delta
+            right_ax = ax.twinx()
+            right_ax.plot(dense_beta, dense_local_slope, color=VIOLET, linewidth=1.8, zorder=2)
+            right_ax.scatter(betas, local_gradient, facecolor="white", edgecolor=VIOLET,
+                             marker="^", linewidth=1.0, s=30, zorder=3)
+            right_ax.set_ylabel(r"local slope $dL/d\beta_e$", color=VIOLET, fontsize=9)
+            right_ax.tick_params(axis="y", labelcolor=VIOLET, labelsize=8)
+            right_ax.spines["top"].set_visible(False)
         finish_axes(ax)
 
+    has_local_gradient_any = any("local_gradient" in curve for curve in curves)
     handles = [
         Line2D([0], [0], color=TEAL, linewidth=2.3, label="diagonal Hessian prediction"),
-        Line2D([0], [0], color=GRAY, linestyle="--", linewidth=1.4, label=r"first order: $g_e(\beta_e-1)=0$"),
-        Line2D([0], [0], marker="o", linestyle="none", markerfacecolor="white", markeredgecolor=TEXT, label="measured forward"),
+        Line2D(
+            [0], [0],
+            marker="o", linestyle="none", markerfacecolor="white", markeredgecolor=TEXT,
+            label="measured forward (ground truth, not a prediction)",
+        ),
         Line2D([0], [0], marker="D", linestyle="none", color=RED, label=r"single removal ($\beta_e=0$)"),
     ]
-    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.465), ncol=4, frameon=False, fontsize=9)
+    if has_local_gradient_any:
+        # Combined line+marker handle: the line is the exact H_ee*(beta-1)
+        # slope prediction, the triangle is the real re-derived measurement
+        # at each beta_0 -- both live on the right axis of panels (d)-(f),
+        # separate from the loss curve on the left axis.
+        handles.insert(
+            1,
+            Line2D([0], [0], color=VIOLET, linewidth=1.8, marker="^", markersize=6,
+                   markerfacecolor="white", markeredgecolor=VIOLET,
+                   label=r"local slope $dL/d\beta_e$ (right axis)"),
+        )
+    else:
+        handles.insert(
+            1,
+            Line2D([0], [0], color=GRAY, linestyle="--", linewidth=1.4,
+                   label=r"first order: $g_e(\beta_e-1)=0$"),
+        )
+    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.465),
+               ncol=4, frameon=False, fontsize=9)
     fig.text(
         0.5,
         0.495,
