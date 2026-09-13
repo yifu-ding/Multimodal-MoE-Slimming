@@ -1,7 +1,20 @@
 {
+  "loss_fn": "l2",
+  "kl": {
+    "loss_fn": "kl_div",
+    "data_dir": "data_kl",
+    "ablation_vs_hvp": {
+      "pearson": 0.9999253037423035,
+      "spearman": 0.9993476469511079,
+      "max_abs_error": 6.339661240417627e-09,
+      "median_relative_error": 0.010488692301305919,
+      "max_relative_error": 0.061589384266960576
+    },
+    "max_abs_identity_gradient": 3.04959291326512e-13
+  },
   "data_dir": "data",
-  "num_layer_expert_points": 3968,
-  "num_layers": 31,
+  "num_layer_expert_points": 128,
+  "num_layers": 1,
   "num_samples": 32,
   "sweep_layer": 0,
   "first_order_vs_ablation": {
@@ -15,40 +28,91 @@
     "reduction_factor": 128
   },
   "energy_vs_hvp": {
-    "pearson": 0.9999999999999992,
+    "pearson": 0.999999999999998,
     "spearman": 1.0,
-    "max_abs_error": 2.9802322387695312e-08,
+    "max_abs_error": 5.684341886080802e-14,
     "median_relative_error": 0.0,
-    "max_relative_error": 2.107718983308025e-07
+    "max_relative_error": 1.5886829849828152e-07
   },
   "ablation_vs_hvp": {
-    "pearson": 0.9999999999999974,
+    "pearson": 0.9999999999999973,
     "spearman": 1.0,
-    "max_abs_error": 2.9802322387695312e-08,
+    "max_abs_error": 1.1368683772161603e-13,
     "median_relative_error": 0.0,
-    "max_relative_error": 1.9870456545596637e-07
+    "max_relative_error": 2.0293731469286452e-07
   },
   "beta_sweeps": [
     {
+      "loss_fn": "l2",
       "label": "low",
-      "expert_idx": 118,
+      "expert_idx": 38,
       "max_abs_error": 3.552713678800501e-15,
-      "median_relative_error_nonbaseline": 0.0,
-      "max_relative_error_nonbaseline": 9.757310323253836e-08
+      "median_relative_error_nonbaseline": 7.182781608315305e-08,
+      "max_relative_error_nonbaseline": 2.1548344824945915e-07,
+      "local_gradient_vs_hee_delta": {
+        "max_abs_error": 8.881784197001252e-15,
+        "max_relative_error_nonbaseline": 1.1971302680525508e-07
+      }
     },
     {
+      "loss_fn": "l2",
       "label": "medium",
-      "expert_idx": 17,
-      "max_abs_error": 1.4210854715202004e-14,
-      "median_relative_error_nonbaseline": 8.869842774053971e-08,
-      "max_relative_error_nonbaseline": 6.20888994183778e-07
+      "expert_idx": 86,
+      "max_abs_error": 3.197442310920451e-14,
+      "median_relative_error_nonbaseline": 1.1451124254202592e-07,
+      "max_relative_error_nonbaseline": 2.2902248508405183e-07,
+      "local_gradient_vs_hee_delta": {
+        "max_abs_error": 1.4210854715202004e-14,
+        "max_relative_error_nonbaseline": 1.1451124254202592e-07
+      }
     },
     {
+      "loss_fn": "l2",
       "label": "high",
-      "expert_idx": 105,
-      "max_abs_error": 2.842170943040401e-14,
-      "median_relative_error_nonbaseline": 8.36993232717205e-09,
-      "max_relative_error_nonbaseline": 7.532939094454846e-08
+      "expert_idx": 60,
+      "max_abs_error": 8.526512829121202e-14,
+      "median_relative_error_nonbaseline": 2.0398617544891747e-07,
+      "max_relative_error_nonbaseline": 3.3997695908152913e-07,
+      "local_gradient_vs_hee_delta": {
+        "max_abs_error": 7.105427357601002e-14,
+        "max_relative_error_nonbaseline": 2.0398617544891747e-07
+      }
+    },
+    {
+      "loss_fn": "kl_div",
+      "label": "low",
+      "expert_idx": 71,
+      "max_abs_error": 1.4320971472280545e-09,
+      "median_relative_error_nonbaseline": 0.06134720190162857,
+      "max_relative_error_nonbaseline": 0.9748576624564443,
+      "local_gradient_vs_hee_delta": {
+        "max_abs_error": 3.083044930463075e-11,
+        "max_relative_error_nonbaseline": 0.00043722738786714654
+      }
+    },
+    {
+      "loss_fn": "kl_div",
+      "label": "medium",
+      "expert_idx": 51,
+      "max_abs_error": 1.7348885470603047e-09,
+      "median_relative_error_nonbaseline": 0.03102349309866161,
+      "max_relative_error_nonbaseline": 0.12082097161711836,
+      "local_gradient_vs_hee_delta": {
+        "max_abs_error": 1.4317436125566019e-11,
+        "max_relative_error_nonbaseline": 8.309103944993485e-05
+      }
+    },
+    {
+      "loss_fn": "kl_div",
+      "label": "high",
+      "expert_idx": 13,
+      "max_abs_error": 2.18704737264524e-09,
+      "median_relative_error_nonbaseline": 0.012565224167148658,
+      "max_relative_error_nonbaseline": 0.046514905891335,
+      "local_gradient_vs_hee_delta": {
+        "max_abs_error": 5.15029796588351e-10,
+        "max_relative_error_nonbaseline": 0.0009128196990934015
+      }
     }
   ]
 }

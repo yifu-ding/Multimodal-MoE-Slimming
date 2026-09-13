@@ -3,7 +3,39 @@
 本目录包含论文用图，以及复现该图所需的精简真实数据。观察实验 A 和此前的
 双 expert 三维 landscape 均标记为 **LEGACY / NOT USED**，不属于本图。
 
-## 这张图说明什么
+## 当前图：第 0 层 L2 / KL 对照
+
+当前 `method_validation_B.{png,pdf,json}` 使用同一份 GQA manifest 的前 32 个
+样本、第 0 层 128 个 experts。所有绘图输入、图片和统计结果统一保存在本目录：
+L2 CSV 在 `data/`，KL CSV 在 `data_kl/`，不再使用 artifacts 下的旧数据目录。
+
+- 第一行 (a)-(c)：L2 HVP vs. Gram energy、L2 HVP vs. 真实删除代价、
+  KL HVP vs. 真实删除代价。KL 不具有 Gram/energy 等价性，因此不画该检查。
+- 第二行 (d)-(f)：L2 的 P10/P50/P90 beta 扫描。
+- 第三行 (g)-(i)：KL 的 P10/P50/P90 beta 扫描。
+
+扫描图左轴为对应 loss 的实测变化及 Hessian 二次预测，右轴只画每个 beta
+处真实测得的一阶梯度。同一行共用左右轴范围，L2/KL 分别设置尺度。
+分位数按各自 loss 选择，因此两行的 expert ID 不同。
+
+KL 删除代价与 HVP 的 Pearson 为 0.999925、Spearman 为 0.999348，
+相对 HVP 的中位误差为 1.05%、最大误差为 6.16%。逐点梯度相对
+`H_ee * (beta - 1)` 的最大非基线偏差为约 0.0913%。
+KL loss 扫描在接近零处的相对误差可能较大；这些数值直接来自 CSV，未平滑。
+原始 KL metadata 的 `normalization` 和 CSV 的 `measured_delta_mse` 名称
+沿用了 L2 字样；绘图依据 `loss_fn=kl_div` 标注为 KL，原始数据保留不改。
+
+重新生成：
+
+```bash
+python draw/hessian-3d-landscape/plot_method_validation_b.py
+```
+
+可用 `--data-dir` 和 `--kl-data-dir` 分别指定 L2、KL 输入；默认输出就在本目录。
+
+## 历史说明（下文的 31 层覆盖、旧面板编号及未采集状态不代表当前图）
+
+### 原始图说明
 
 - 图 (a)-(b)：在 3,968 个 layer-expert 方向上，autograd HVP 分数
   `H_ee/2` 与 routed expert 输出能量、单 expert 删除误差一致。
@@ -251,7 +283,7 @@ P10/P50/P90 三个 expert 的完整 beta sweep，包括 `local_gradient_at_beta`
 **输出目录和 metadata 要求**：
 
 - KL 数据必须导出到一个新目录（比如
-  `artifacts/method_validation_b_gqa_layer0_kl/data/`），不能和现有 L2
+  `draw/hessian-3d-landscape/data_kl/`），不能和现有 L2
   数据混在同一批 CSV 里——两者的数值量纲完全不同（KL 散度和 per-token
   MSE 不是同一个单位），混在一起会被误读成同一批可比较的数字。
 - `method_validation_B_metadata.json` 里目前没有记录用了哪种

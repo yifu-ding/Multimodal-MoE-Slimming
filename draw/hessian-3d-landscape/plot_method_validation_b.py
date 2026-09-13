@@ -107,11 +107,25 @@ def finish_axes(ax: plt.Axes) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", default=str(HERE / "data"))
+    parser.add_argument("--kl-data-dir", default=str(HERE / "data_kl"))
     parser.add_argument("--output-dir", default=str(HERE))
     parser.add_argument("--basename", default="method_validation_B")
     args = parser.parse_args()
     data_dir = Path(args.data_dir).expanduser().resolve()
     metadata, scores, curves = load(data_dir)
+    kl_data_dir = Path(args.kl_data_dir).expanduser().resolve()
+    kl_metadata, kl_scores, kl_curves = load(kl_data_dir)
+    if metadata.get("loss_fn", "l2") != "l2" or kl_metadata.get("loss_fn") != "kl_div":
+        raise ValueError("Use --data-dir for L2 and --kl-data-dir for KL data.")
+    for key in ("selection_manifest_sha256", "num_samples", "layers", "model_name_or_path"):
+        if metadata[key] != kl_metadata[key]:
+            raise ValueError(f"L2/KL calibration mismatch: {key}")
+    kl_valid = np.isfinite(kl_scores["hvp"]) & np.isfinite(kl_scores["ablation"]) & (kl_scores["hvp"] > 0)
+    kl_hvp = kl_scores["hvp"][kl_valid]
+    kl_ablation = kl_scores["ablation"][kl_valid]
+    kl_summary = metric_summary(kl_hvp, kl_ablation)
+    if not kl_metadata["route_consistency_verified"]:
+        raise ValueError("KL beta sweep did not verify fixed routing.")
     layer_ids = scores["layer"]
     hvp = scores["hvp"]
     energy = scores["energy"]
@@ -128,37 +142,33 @@ def main() -> None:
         "energy_vs_hvp": metric_summary(hvp, energy),
         "ablation_vs_hvp": metric_summary(hvp, ablation),
     }
-    # Panel (c) ("cost of the same exact score") was dropped: it compared a
-    # brute-force-ablation forward count against the Gram/energy shortcut's
-    # forward count, but that shortcut isn't the HVP path this repo actually
-    # uses for scoring, so the comparison didn't represent the production
-    # method's cost. Top row is now 2 wider panels instead of 3, bottom row
-    # keeps its 3 -- built on a 6-column grid so the two rows can have a
-    # different panel count without mismatched column widths.
-    fig = plt.figure(figsize=(9.6, 7.2))
-    grid = fig.add_gridspec(2, 6)
-    fig.subplots_adjust(left=0.085, right=0.935, top=0.86, bottom=0.09, hspace=0.92, wspace=1.5)
-    top_axes = (fig.add_subplot(grid[0, 0:3]), fig.add_subplot(grid[0, 3:6]))
-    positive_values = np.concatenate((hvp, energy[energy > 0], ablation[ablation > 0]))
-    limits = (float(positive_values.min()) * 0.85, float(positive_values.max()) * 1.18)
+    # Three score comparisons, followed by separate L2 and KL sweep rows.
+    fig = plt.figure(figsize=(12.6, 11.2))
+    grid = fig.add_gridspec(3, 6)
+    fig.subplots_adjust(left=0.07, right=0.93, top=0.87, bottom=0.065, hspace=0.85, wspace=1.65)
+    top_axes = tuple(fig.add_subplot(grid[0, col:col + 2]) for col in (0, 2, 4))
     for panel_idx, (ax, values, title, ylabel, summary) in enumerate(zip(
         top_axes,
-        (energy, ablation),
-        ("(a) Sanity check: HVP vs. Gram energy", "(b) Sanity check: HVP vs. single removal"),
-        (r"$s_e^{\rm energy}$", r"$s_e^{\rm ablate}$"),
-        (summaries["energy_vs_hvp"], summaries["ablation_vs_hvp"]),
+        (energy, ablation, kl_ablation),
+        ("(a) L2: HVP vs. Gram energy", "(b) L2: HVP vs. single removal", "(c) KL: HVP vs. single removal"),
+        (r"$s_e^{\rm energy}$", r"$s_e^{\rm ablate}$", r"$s_e^{\rm ablate}$ (KL)"),
+        (summaries["energy_vs_hvp"], summaries["ablation_vs_hvp"], kl_summary),
     )):
+        xvalues = kl_hvp if panel_idx == 2 else hvp
+        panel_layers = kl_scores["layer"][kl_valid] if panel_idx == 2 else layer_ids
+        panel_positive = np.concatenate((xvalues, values[values > 0]))
+        panel_limits = (float(panel_positive.min()) * 0.85, float(panel_positive.max()) * 1.18)
         # y=x drawn thin, light, and behind the scatter (zorder=0): for the
         # exact-quadratic l2/rel_l2 case the points sit exactly on this line,
         # so a bold line on top of them mostly just redraws the data. Kept as
         # a faint guide rather than removed outright, since a future
         # non-exact loss variant (e.g. kl_div) would show real, visible
         # deviation from it worth comparing against.
-        scatter = ax.scatter(hvp, values, c=layer_ids, cmap="viridis", s=8, alpha=0.48,
+        scatter = ax.scatter(xvalues, values, c=panel_layers, cmap="viridis", s=12, alpha=0.6,
                              linewidths=0, zorder=2)
-        ax.plot(limits, limits, color=GRAY, linestyle="--", linewidth=0.8, alpha=0.7,
+        ax.plot(panel_limits, panel_limits, color=GRAY, linestyle="--", linewidth=0.8, alpha=0.7,
                 zorder=0, label=r"$y=x$")
-        ax.set(xscale="log", yscale="log", xlim=limits, ylim=limits)
+        ax.set(xscale="log", yscale="log", xlim=panel_limits, ylim=panel_limits)
         ax.set_aspect("equal", adjustable="box")
         ax.set_xlabel(r"$s_e^{\rm HVP}=H_{ee}/2$")
         ax.set_ylabel(ylabel)
@@ -167,18 +177,18 @@ def main() -> None:
         ax.text(
             0.04,
             0.95,
-            f"Pearson = {summary['pearson']:.6f}\nSpearman = {summary['spearman']:.6f}",
+            f"Pearson = {summary['pearson']:.6f}\nSpearman = {summary['spearman']:.6f}\nMedian rel. error = {summary['median_relative_error']:.2%}",
             transform=ax.transAxes,
             va="top",
             fontsize=8,
         )
-        colorbar = fig.colorbar(scatter, ax=ax, fraction=0.046, pad=0.025)
-        if panel_idx == 0:
+        if len(np.unique(panel_layers)) > 1:
+            colorbar = fig.colorbar(scatter, ax=ax, fraction=0.046, pad=0.025)
             colorbar.set_label("Layer", fontsize=8, labelpad=2)
         finish_axes(ax)
 
     gradient_max_abs = float(np.max(np.abs(gradient_values)))
-    if gradient_max_abs > 1e-12:
+    if max(gradient_max_abs, float(np.max(np.abs(kl_scores["gradient"])))) > 1e-12:
         raise ValueError(f"Expected first-order degeneracy, got max |g|={gradient_max_abs:.3e}.")
     # Kept as a correctness check even without panel (c): every plotted layer
     # should still have the same number of active experts. num_experts still
@@ -192,32 +202,30 @@ def main() -> None:
         fig.add_subplot(grid[1, 0:2]),
         fig.add_subplot(grid[1, 2:4]),
         fig.add_subplot(grid[1, 4:6]),
+        fig.add_subplot(grid[2, 0:2]),
+        fig.add_subplot(grid[2, 2:4]),
+        fig.add_subplot(grid[2, 4:6]),
     )
     sweep_layer = int(metadata["sweep_layer"])
     if not bool(metadata["route_consistency_verified"]):
         raise ValueError("Beta sweep did not verify fixed router indices and weights.")
-    betas = curves[0]["betas"]
-    dense_beta = np.linspace(float(betas.min()), float(betas.max()), 300)
     sensitivity_titles = ("Low sensitivity", "Medium sensitivity", "High sensitivity")
-    # Shared y-ranges across panels (c)-(e) so the three experts' curves are
-    # directly comparable by height, not just by differing tick labels --
-    # H_ee/2 spans about 8x between the low- and high-sensitivity expert.
-    left_max = max(float(curve["measured"].max()) for curve in curves)
-    left_min = min(float(curve["measured"].min()) for curve in curves)
-    left_pad = 0.06 * (left_max - left_min)
-    shared_left_ylim = (left_min - left_pad, left_max + left_pad)
-    has_local_gradient_data = any("local_gradient" in curve for curve in curves)
-    if has_local_gradient_data:
-        right_max = max(
-            float(curve["local_gradient"].max()) for curve in curves if "local_gradient" in curve
-        )
-        right_min = min(
-            float(curve["local_gradient"].min()) for curve in curves if "local_gradient" in curve
-        )
-        right_pad = 0.06 * (right_max - right_min)
-        shared_right_ylim = (right_min - right_pad, right_max + right_pad)
+    # Share both y-ranges within each loss; L2 and KL have different units.
     sweep_summaries = []
-    for panel_idx, (ax, curve, title) in enumerate(zip(bottom_axes, curves, sensitivity_titles)):
+    for panel_idx, (ax, curve, title) in enumerate(zip(bottom_axes, curves + kl_curves, sensitivity_titles * 2)):
+        row_curves = curves if panel_idx < 3 else kl_curves
+        loss_label = "L2" if panel_idx < 3 else "KL"
+        betas = curve["betas"]
+        dense_beta = np.linspace(float(betas.min()), float(betas.max()), 300)
+        left_min = min(float(c["measured"].min()) for c in row_curves)
+        left_max = max(float(c["measured"].max()) for c in row_curves)
+        left_pad = 0.06 * (left_max - left_min)
+        shared_left_ylim = (left_min - left_pad, left_max + left_pad)
+        if "local_gradient" in curve:
+            right_min = min(float(c["local_gradient"].min()) for c in row_curves)
+            right_max = max(float(c["local_gradient"].max()) for c in row_curves)
+            right_pad = 0.06 * (right_max - right_min)
+            shared_right_ylim = (right_min - right_pad, right_max + right_pad)
         expert_idx = int(curve["expert_idx"])
         dense_delta = dense_beta - 1.0
         gradient = float(curve["gradient"])
@@ -230,6 +238,7 @@ def main() -> None:
         relative_error = absolute_error / np.maximum(np.abs(predicted_points), 1e-30)
         nonbaseline = np.abs(betas - 1.0) > 1e-12
         summary_entry = {
+            "loss_fn": "l2" if panel_idx < 3 else "kl_div",
             "label": curve["label"],
             "expert_idx": expert_idx,
             "max_abs_error": float(absolute_error.max()),
@@ -272,12 +281,12 @@ def main() -> None:
             color=RED,
             fontsize=8,
         )
-        letter = chr(ord("c") + panel_idx)
+        letter = chr(ord("d") + panel_idx)
         ax.set_title(
-            f"({letter}) {title}\nP{int(round(100 * float(curve['quantile'])))}, Expert {expert_idx}"
+            f"({letter}) {loss_label}: {title}\nP{int(round(100 * float(curve['quantile'])))}, Expert {expert_idx}"
         )
         ax.set_xlabel(r"Expert scale $\beta_e$")
-        ax.set_ylabel(r"per-token $\Delta\mathcal{L}_{\rm MSE}$")
+        ax.set_ylabel(r"per-token $\Delta\mathcal{L}_{\rm " + ("MSE" if panel_idx < 3 else "KL") + "}$")
         ax.set_ylim(shared_left_ylim)
         ax.text(
             0.96,
@@ -310,7 +319,7 @@ def main() -> None:
             right_ax.spines["top"].set_visible(False)
         finish_axes(ax)
 
-    has_local_gradient_any = any("local_gradient" in curve for curve in curves)
+    has_local_gradient_any = any("local_gradient" in curve for curve in curves + kl_curves)
     handles = [
         Line2D([0], [0], color=TEAL, linewidth=2.3, label="diagonal Hessian prediction"),
         Line2D(
@@ -336,13 +345,14 @@ def main() -> None:
             Line2D([0], [0], color=GRAY, linestyle="--", linewidth=1.4,
                    label=r"first order: $g_e(\beta_e-1)=0$"),
         )
-    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.465),
-               ncol=4, frameon=False, fontsize=9)
+    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.935),
+               ncol=2, frameon=False, fontsize=9)
     fig.text(
         0.5,
-        0.495,
+        0.635,
         "Ranking vs. true removal: first order Spearman = undefined "
-        r"(all $g_e=0$); second order Spearman = 1.000000.",
+        r"(all $g_e\approx0$); second order: "
+        f"L2 = {summaries['ablation_vs_hvp']['spearman']:.6f}, KL = {kl_summary['spearman']:.6f}.",
         ha="center",
         va="bottom",
         fontsize=9,
@@ -350,7 +360,7 @@ def main() -> None:
     num_samples = int(metadata["num_samples"])
     num_layers = len(metadata["layers"])
     fig.suptitle(
-        "Observation B: implementation sanity check and first-order degeneracy\n"
+        "Observation B: L2 and KL Hessian validation\n"
         f"{num_layers} MoE layers; {num_samples} frozen calibration samples",
         y=0.975,
         fontsize=13,
@@ -366,6 +376,13 @@ def main() -> None:
     except ValueError:
         data_label = str(data_dir)
     summary = {
+        "loss_fn": "l2",
+        "kl": {
+            "loss_fn": "kl_div",
+            "data_dir": os.path.relpath(kl_data_dir, HERE),
+            "ablation_vs_hvp": kl_summary,
+            "max_abs_identity_gradient": float(np.max(np.abs(kl_scores["gradient"]))),
+        },
         "data_dir": data_label,
         "num_layer_expert_points": int(hvp.size),
         "num_layers": num_layers,
