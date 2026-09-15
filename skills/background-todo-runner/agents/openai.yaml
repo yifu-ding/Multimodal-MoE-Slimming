@@ -1,0 +1,4 @@
+interface:
+  display_name: "Background TODO Runner"
+  short_description: "Run resumable TODO pipelines in monitored tmux sessions"
+  default_prompt: "Use $background-todo-runner to execute this TODO in the background and report progress to Markdown."

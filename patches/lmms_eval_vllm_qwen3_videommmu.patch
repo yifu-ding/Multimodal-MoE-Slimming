@@ -1,0 +1,25 @@
+--- a/lmms-eval/lmms_eval/models/simple/vllm.py
++++ b/lmms-eval/lmms_eval/models/simple/vllm.py
+@@ -21,6 +21,7 @@
+ from lmms_eval.models.model_utils.media_encoder import encode_image_to_base64
+ from lmms_eval.models.model_utils.progress import make_progress
+ from eval.vllm_qwen3_videomme import prepare_qwen3_videomme_input
++from eval.vllm_qwen3_videommmu import prepare_qwen3_videommmu_input
+ 
+ NUM_SECONDS_TO_SLEEP = int(os.getenv("NUM_SECONDS_TO_SLEEP", "5"))
+ WORKERS = int(os.getenv("WORKERS", "32"))
+@@ -495,6 +496,14 @@
+                         contexts,
+                         visuals,
+                     )
++                    if native_input is None:
++                        native_input = prepare_qwen3_videommmu_input(
++                            self.client,
++                            self.model,
++                            task,
++                            contexts,
++                            visuals,
++                        )
+                     request_uses_native_video = native_input is not None
+                     if use_native_video is None:
+                         use_native_video = request_uses_native_video

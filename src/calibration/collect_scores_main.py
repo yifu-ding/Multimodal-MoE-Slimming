@@ -88,6 +88,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["l2", "rel_l2", "cosine", "kl_div"],
         help="Block reconstruction loss used during score collection (saved in scores.pt metadata).",
     )
+    p.add_argument(
+        "--layerwise_beta",
+        type=float,
+        default=0.95,
+        help=(
+            "Uniform expert-output scale used only for layerwise_loss. "
+            "Hessian and score collection remain at beta=1."
+        ),
+    )
+    p.add_argument(
+        "--hessian_probe_layer",
+        type=int,
+        default=None,
+        help="Optionally dump the full expert Hessian for this layer during score collection.",
+    )
+    p.add_argument(
+        "--hessian_probe_out",
+        type=str,
+        default=None,
+        help="Hessian probe output path (defaults to OUTPUT_DIR/hessian_probe_L<layer>.pt).",
+    )
+    p.add_argument(
+        "--hessian_probe_pair",
+        type=int,
+        nargs=2,
+        metavar=("E", "F"),
+        default=None,
+        help="Expert pair to record and optionally validate with direct removal forwards.",
+    )
+    p.add_argument(
+        "--hessian_probe_validate",
+        action="store_true",
+        help="Measure direct single/joint removal losses for --hessian_probe_pair.",
+    )
     p.add_argument("--modality_aware", action="store_true")
     p.add_argument(
         "--device_map",
@@ -122,18 +156,28 @@ def _load_selection_manifest(path: str) -> tuple[dict, str]:
     payload = json.loads(raw.decode("utf-8"))
     if not isinstance(payload, dict) or not isinstance(payload.get("samples"), list):
         raise ValueError("Selection manifest must be a JSON object containing a `samples` list.")
-    if int(payload.get("schema_version", -1)) != 1:
+    schema_version = int(payload.get("schema_version", -1))
+    if schema_version not in {1, 2}:
         raise ValueError(
-            f"Unsupported selection manifest schema_version={payload.get('schema_version')!r}; expected 1."
+            f"Unsupported selection manifest schema_version={payload.get('schema_version')!r}; expected 1 or 2."
         )
     samples = payload["samples"]
     if not samples:
         raise ValueError("Selection manifest contains no samples.")
-    score_tokens_per_sample = int(payload.get("score_tokens_per_sample", 0))
-    if score_tokens_per_sample <= 0:
-        raise ValueError(
-            "Selection manifest must define a positive score_tokens_per_sample."
-        )
+    if schema_version == 1:
+        score_tokens_per_sample = int(payload.get("score_tokens_per_sample", 0))
+        if score_tokens_per_sample <= 0:
+            raise ValueError(
+                "Schema-v1 selection manifest must define a positive score_tokens_per_sample."
+            )
+    else:
+        score_token_budget = int(payload.get("score_token_budget", 0))
+        if score_token_budget <= 0:
+            raise ValueError(
+                "Schema-v2 selection manifest must define a positive score_token_budget."
+            )
+        variable_quotas = bool(payload.get("score_token_counts_variable", False))
+        fixed_quota = payload.get("score_tokens_per_sample")
     required_sample_fields = {"dataset_name", "dataset_index", "sample_id"}
     for sample_idx, sample in enumerate(samples):
         missing = sorted(required_sample_fields - set(sample))
@@ -141,10 +185,47 @@ def _load_selection_manifest(path: str) -> tuple[dict, str]:
             raise ValueError(
                 f"Manifest sample {sample_idx} is missing required fields: {missing}."
             )
+        if schema_version == 2:
+            score_token_count = int(sample.get("score_token_count", 0))
+            if score_token_count <= 0:
+                raise ValueError(
+                    f"Manifest sample {sample_idx} must define a positive score_token_count."
+                )
+            model_token_count = int(sample.get("model_token_count", 0))
+            if model_token_count > 0 and score_token_count > model_token_count:
+                raise ValueError(
+                    f"Manifest sample {sample_idx} score_token_count={score_token_count} "
+                    f"exceeds model_token_count={model_token_count}."
+                )
     ranks = [int(item.get("selection_rank", idx)) for idx, item in enumerate(samples)]
     if sorted(ranks) != list(range(len(samples))):
         raise ValueError("Manifest selection_rank values must be exactly 0..num_samples-1.")
     payload["samples"] = [item for _, item in sorted(zip(ranks, samples))]
+    if schema_version == 2:
+        quotas = [int(item["score_token_count"]) for item in payload["samples"]]
+        actual_budget = sum(quotas)
+        if actual_budget != int(payload["score_token_budget"]):
+            raise ValueError(
+                f"Manifest score_token_count values sum to {actual_budget}, but "
+                f"score_token_budget={payload['score_token_budget']}."
+            )
+        if variable_quotas:
+            if fixed_quota is not None:
+                raise ValueError(
+                    "Variable-quota schema-v2 manifest must set "
+                    "score_tokens_per_sample to null."
+                )
+        else:
+            if fixed_quota is None or int(fixed_quota) <= 0:
+                raise ValueError(
+                    "Fixed-quota schema-v2 manifest must define a positive "
+                    "score_tokens_per_sample."
+                )
+            if any(value != int(fixed_quota) for value in quotas):
+                raise ValueError(
+                    "Fixed-quota schema-v2 manifest contains inconsistent "
+                    "per-sample score_token_count values."
+                )
     return payload, hashlib.sha256(raw).hexdigest()
 
 
@@ -276,8 +357,19 @@ def run_collection(args) -> None:
         args.dataset = "mixed"
         args.selection_manifest_sha256 = manifest_sha256
         args.selection_source_summary = selection_manifest.get("source_summary", {})
-        args.score_tokens_per_sample = int(
-            selection_manifest["score_tokens_per_sample"]
+        args.score_tokens_per_sample = selection_manifest.get(
+            "score_tokens_per_sample"
+        )
+        if args.score_tokens_per_sample is not None:
+            args.score_tokens_per_sample = int(args.score_tokens_per_sample)
+        score_token_budget = selection_manifest.get("score_token_budget")
+        if score_token_budget is None:
+            score_token_budget = (
+                len(selection_manifest["samples"]) * args.score_tokens_per_sample
+            )
+        args.score_token_budget = int(score_token_budget)
+        args.score_token_counts_variable = bool(
+            selection_manifest.get("score_token_counts_variable", False)
         )
         args.score_token_sampling = selection_manifest.get(
             "score_token_sampling",
@@ -286,6 +378,8 @@ def run_collection(args) -> None:
     else:
         args.dataset = normalize_dataset_name(args.dataset)
         args.score_tokens_per_sample = None
+        args.score_token_budget = None
+        args.score_token_counts_variable = False
         args.score_token_sampling = None
     supported_datasets = {"gqa", "coco", "video_mmmu", "m4_instruct", "star"}
     if selection_manifest is None and args.dataset not in supported_datasets:
@@ -295,6 +389,24 @@ def run_collection(args) -> None:
         )
 
     ensure_dir(args.output_dir)
+    if args.hessian_probe_layer is None:
+        if args.hessian_probe_out is not None or args.hessian_probe_pair is not None or args.hessian_probe_validate:
+            raise ValueError(
+                "--hessian_probe_out/pair/validate require --hessian_probe_layer."
+            )
+    else:
+        if args.loss_fn not in {"l2", "rel_l2"}:
+            raise ValueError(
+                "Exact Hessian landscape probing requires --loss_fn l2 or rel_l2."
+            )
+        if args.hessian_probe_validate and args.hessian_probe_pair is None:
+            raise ValueError(
+                "--hessian_probe_validate requires --hessian_probe_pair E F."
+            )
+        if args.hessian_probe_out is None:
+            args.hessian_probe_out = os.path.join(
+                args.output_dir, f"hessian_probe_L{args.hessian_probe_layer}.pt"
+            )
     out_path = os.path.join(args.output_dir, "scores.pt")
     if os.path.exists(out_path) and not args.force:
         print(
@@ -381,10 +493,48 @@ def run_collection(args) -> None:
             f"[calibration] Restricting block calibration to {len(target_layers)} "
             f"specified layer(s): {target_layers}"
         )
+    if (
+        args.hessian_probe_layer is not None
+        and args.hessian_probe_layer not in target_layers
+    ):
+        raise ValueError(
+            f"Hessian probe layer {args.hessian_probe_layer} is not in the selected "
+            f"MoE layers {target_layers}."
+        )
     for layer_idx in target_layers:
         current_teacher_block = teacher_block(bundle, layer_idx)
         copied_block = copy.deepcopy(current_teacher_block)
         block_dtype = next(current_teacher_block.parameters()).dtype
+        hessian_probe_config = None
+        if layer_idx == args.hessian_probe_layer:
+            hessian_probe_config = {
+                "out_path": args.hessian_probe_out,
+                "pair": None
+                if args.hessian_probe_pair is None
+                else tuple(args.hessian_probe_pair),
+                "validate": bool(args.hessian_probe_validate),
+                "metadata": {
+                    "model_name_or_path": args.model_name_or_path,
+                    "model_family": bundle.family,
+                    "attn_implementation": args.attn_implementation,
+                    "dataset": args.dataset,
+                    "num_samples": args.num_samples,
+                    "selected_num_samples": args.selected_num_samples,
+                    "batch_size": args.batch_size,
+                    "selection_manifest": args.selection_manifest,
+                    "selection_manifest_sha256": getattr(
+                        args, "selection_manifest_sha256", None
+                    ),
+                    "score_tokens_per_sample": args.score_tokens_per_sample,
+                    "score_token_budget": args.score_token_budget,
+                    "score_token_counts_variable": args.score_token_counts_variable,
+                    "score_token_sampling": args.score_token_sampling,
+                    "subset_seed": args.subset_seed,
+                    "num_experts": layer_to_num_experts[layer_idx],
+                    "block_dtype": str(block_dtype),
+                    "layerwise_beta": args.layerwise_beta,
+                },
+            }
         layer_loss, layer_second_order_sum = block_forward(
             bundle=bundle,
             cnt_block=copied_block,
@@ -399,6 +549,8 @@ def run_collection(args) -> None:
             verbose=True,
             raw_samples=selection_manifest is not None,
             score_tokens_per_sample=args.score_tokens_per_sample,
+            hessian_probe_config=hessian_probe_config,
+            layerwise_beta=args.layerwise_beta,
         )
         accumulator.layerwise_loss[layer_idx] = float(layer_loss)
         accumulator.layerwise_second_order_sum[layer_idx] = float(layer_second_order_sum)

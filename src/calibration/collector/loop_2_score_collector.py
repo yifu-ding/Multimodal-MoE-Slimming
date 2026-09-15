@@ -33,6 +33,11 @@ def loop_2_score_collector(
 ):
     profile_second_order = os.getenv("SECOND_ORDER_PROFILE", "0") == "1"
     second_order_impl = os.getenv("SECOND_ORDER_IMPL", "vectorized").strip().lower()
+    if (
+        bool((_kwargs or {}).get("hessian_probe_enabled", False))
+        and second_order_impl != "vectorized"
+    ):
+        raise ValueError("Hessian probing requires SECOND_ORDER_IMPL=vectorized.")
     second_exact_attr_all = None
     second_attr_compute_ms = 0.0
 

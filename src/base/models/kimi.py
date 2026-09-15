@@ -96,7 +96,9 @@ def _ensure_writable_hf_modules_cache(model_path: str) -> None:
 
 
 def _resolve_partial_load_device(device_map: str) -> str:
-    if device_map == "auto":
+    # Partial loading places only the prefix required for calibration, so the
+    # Accelerate placement strategies used by full-model loading do not apply.
+    if device_map in {"auto", "balanced", "balanced_low_0", "sequential"}:
         return "cuda:0" if torch.cuda.is_available() else "cpu"
     return device_map
 

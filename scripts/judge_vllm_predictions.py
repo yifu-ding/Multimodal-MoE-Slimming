@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Score saved lmms-eval MMVet/MMBench predictions with a local judge."""
+"""Score saved lmms-eval predictions with a local OpenAI-compatible judge."""
 
 from __future__ import annotations
 
@@ -39,6 +39,28 @@ Model answer:
 
 Your output:"""
 
+VIDEOMMMU_PROMPT = """You are evaluating a model response for VideoMMMU.
+Decide whether the response is correct using the reference answer as authoritative.
+
+Rules:
+- Judge semantic correctness, not exact wording.
+- For multiple-choice questions, a response is correct when its final answer either names the reference option letter or clearly states the content of that option.
+- Ignore exploratory or intermediate reasoning when the response gives an unambiguous final answer.
+- For open-ended questions, accept equivalent wording and numerically equivalent values, but reject answers that are incomplete, contradictory, or materially less specific than the reference.
+- Return exactly {{"score": 1}} for correct or {{"score": 0}} for incorrect. Do not explain.
+
+Question type: {question_type}
+Question and choices:
+{question}
+
+Reference answer:
+{target}
+
+Model response:
+{prediction}
+
+Your output:"""
+
 _thread_local = threading.local()
 _MMVET_INPUT_PREFIX = "First please perform reasoning, and think step by step to provide best answer to the following question:"
 
@@ -47,13 +69,23 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--predictions-dir", type=Path, required=True, help="Baseline RUN_DIR containing lmms-eval sample JSONL files.")
     parser.add_argument("--output-dir", type=Path, default=None, help="Defaults to PREDICTIONS_DIR/local_judge.")
-    parser.add_argument("--tasks", default="mmvet,mmbench", help="Comma-separated subset of: mmvet,mmbench.")
+    parser.add_argument(
+        "--tasks",
+        default="mmvet,mmbench",
+        help="Comma-separated subset of: mmvet,mmbench,video_mmmu.",
+    )
     parser.add_argument("--api-base", default=os.getenv("JUDGE_API_BASE", "http://127.0.0.1:8000/v1"))
     parser.add_argument("--api-key", default=os.getenv("OPENAI_API_KEY", "dummy"))
     parser.add_argument("--model", default=os.getenv("MODEL_VERSION", "local-mm-judge"))
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument(
+        "--judge-prediction-max-chars",
+        type=int,
+        default=10000,
+        help="Send at most this many trailing prediction characters to VideoMMMU judge (0 keeps all).",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Discard an existing per-sample judge file instead of resuming it.")
     return parser.parse_args()
 
@@ -190,10 +222,67 @@ def mmbench_record(sample: dict[str, Any], args: argparse.Namespace, source: Pat
     }
 
 
+def parse_binary_judgment(raw_judgment: str) -> float:
+    match = re.search(r'["\']score["\']\s*:\s*([01])(?:\.0+)?', raw_judgment, flags=re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    cleaned = raw_judgment.strip().strip("`").strip()
+    if re.fullmatch(r"[01](?:\.0+)?", cleaned):
+        return float(cleaned)
+    raise ValueError(f"invalid binary judge response: {raw_judgment!r}")
+
+
+def videommmu_split(source: Path) -> str:
+    match = re.search(r"video_mmmu_(adaptation|comprehension|perception)_local", source.name)
+    return match.group(1) if match else "unknown"
+
+
+def videommmu_record(sample: dict[str, Any], args: argparse.Namespace, source: Path) -> dict[str, Any]:
+    metric = unwrap_metric(sample, "mmmu_acc")
+    question = str(sample.get("input") or "").strip()
+    prediction = prediction_text(sample)
+    target_value = metric.get("answer", sample.get("target"))
+    question_type = str(metric.get("question_type") or "open")
+    if not question or target_value is None or not prediction:
+        raise ValueError("VideoMMMU sample is missing its question, target, or prediction")
+    target = target_value if isinstance(target_value, str) else json.dumps(target_value, ensure_ascii=False)
+    judge_prediction = prediction
+    max_chars = args.judge_prediction_max_chars
+    if max_chars < 0:
+        raise ValueError("--judge-prediction-max-chars cannot be negative")
+    if max_chars and len(judge_prediction) > max_chars:
+        judge_prediction = "[Earlier reasoning omitted]\n" + judge_prediction[-max_chars:]
+    raw_judgment = request_judge(
+        VIDEOMMMU_PROMPT.format(
+            question_type=question_type,
+            question=question,
+            target=target,
+            prediction=judge_prediction,
+        ),
+        args,
+    )
+    return {
+        "task": "video_mmmu",
+        "split": videommmu_split(source),
+        "doc_id": sample.get("doc_id"),
+        "benchmark_id": metric.get("id"),
+        "question_type": question_type,
+        "question": question,
+        "target": target_value,
+        "prediction": prediction,
+        "rule_prediction": metric.get("parsed_pred"),
+        "score": parse_binary_judgment(raw_judgment),
+        "raw_judgment": raw_judgment,
+        "judge_model": args.model,
+        "source_file": str(source),
+    }
+
+
 def find_sources(root: Path, task: str) -> list[Path]:
     patterns = {
         "mmvet": "*_samples_mmvet.jsonl",
         "mmbench": "*_samples_mmbench_en_dev*.jsonl",
+        "video_mmmu": "*_samples_video_mmmu_*_local.jsonl",
     }
     return sorted(path for path in root.rglob(patterns[task]) if "local_judge" not in path.parts)
 
@@ -246,7 +335,12 @@ def score_task(task: str, sources: list[Path], output_dir: Path, args: argparse.
         if key not in completed:
             pending.append((source, sample))
 
-    scorer = mmvet_record if task == "mmvet" else mmbench_record
+    scorers = {
+        "mmvet": mmvet_record,
+        "mmbench": mmbench_record,
+        "video_mmmu": videommmu_record,
+    }
+    scorer = scorers[task]
     failures = 0
     with output_path.open("a", encoding="utf-8") as output:
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
@@ -307,6 +401,36 @@ def score_task(task: str, sources: list[Path], output_dir: Path, args: argparse.
         summary["num_static"] = sum(record.get("method") == "static" for record in valid)
         summary["num_judged"] = sum(record.get("method") == "judge" for record in valid)
         summary["num_question_groups"] = num_groups
+    elif task == "video_mmmu":
+        summary["num_judged"] = len(valid)
+        summary["score_by_split"] = {
+            split: {
+                "score": sum(record["score"] for record in split_records) / len(split_records) * 100.0,
+                "num_scored": len(split_records),
+            }
+            for split in sorted({record["split"] for record in valid})
+            if (split_records := [record for record in valid if record["split"] == split])
+        }
+        summary["score_by_question_type"] = {
+            question_type: {
+                "score": sum(record["score"] for record in type_records) / len(type_records) * 100.0,
+                "num_scored": len(type_records),
+            }
+            for question_type in sorted({record["question_type"] for record in valid})
+            if (type_records := [record for record in valid if record["question_type"] == question_type])
+        }
+        mcq_records = [record for record in valid if record["question_type"] == "multiple-choice"]
+        summary["rule_mcq_score"] = (
+            sum(float(record["rule_prediction"] == record["target"]) for record in mcq_records)
+            / len(mcq_records)
+            * 100.0
+            if mcq_records
+            else None
+        )
+        summary["judge_rule_mcq_disagreements"] = sum(
+            record["score"] != float(record["rule_prediction"] == record["target"])
+            for record in mcq_records
+        )
     summary_path = output_dir / f"{task}_summary.json"
     temporary_path = summary_path.with_suffix(".json.tmp")
     temporary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -329,12 +453,17 @@ def check_server(args: argparse.Namespace) -> None:
 
 def main() -> int:
     args = parse_args()
+    if args.judge_prediction_max_chars < 0:
+        print("error: --judge-prediction-max-chars cannot be negative", file=sys.stderr)
+        return 2
     root = args.predictions_dir.resolve()
     if not root.is_dir():
         print(f"error: predictions directory does not exist: {root}", file=sys.stderr)
         return 2
-    selected = [item.strip().lower() for item in args.tasks.split(",") if item.strip()]
-    unknown = sorted(set(selected) - {"mmvet", "mmbench"})
+    aliases = {"videommmu": "video_mmmu"}
+    selected = [aliases.get(item, item) for item in (part.strip().lower() for part in args.tasks.split(",")) if item]
+    selected = list(dict.fromkeys(selected))
+    unknown = sorted(set(selected) - {"mmvet", "mmbench", "video_mmmu"})
     if unknown:
         print(f"error: unknown tasks: {', '.join(unknown)}", file=sys.stderr)
         return 2

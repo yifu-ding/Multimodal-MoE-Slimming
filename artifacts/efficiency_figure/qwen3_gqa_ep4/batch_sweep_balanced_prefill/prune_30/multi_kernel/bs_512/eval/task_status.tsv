@@ -1,0 +1,2 @@
+task	status	exit_code	batch_size	wall_time_seconds	output_dir
+gqa_prefill	complete	0	512	138	artifacts/efficiency_figure/qwen3_gqa_ep4/batch_sweep_balanced_prefill/prune_30/multi_kernel/bs_512/eval/tasks/gqa_prefill

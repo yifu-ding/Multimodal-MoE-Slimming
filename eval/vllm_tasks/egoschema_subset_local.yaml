@@ -1,0 +1,31 @@
+dataset_path: parquet
+dataset_kwargs:
+  data_files:
+    test: /home/data/dyf/hf_cache/datasets/egoschema/Subset/test-00000-of-00001.parquet
+task: egoschema_subset_local
+task_alias: egoschema_subset
+test_split: test
+output_type: generate_until
+doc_to_visual: !function egoschema_subset_local_utils.egoschema_local_doc_to_visual
+doc_to_text: !function egoschema_subset_local_utils.egoschema_doc_to_text
+doc_to_target: !function egoschema_subset_local_utils.egoschema_doc_to_answer
+generation_kwargs:
+  max_new_tokens: 16
+  temperature: 0
+  top_p: 1.0
+  num_beams: 1
+  do_sample: false
+process_results: !function egoschema_subset_local_utils.egoschema_process_results_generation
+metric_list:
+  - metric: submission
+    aggregation: !function egoschema_subset_local_utils.egoschema_aggregate_mc
+    higher_is_better: true
+  - metric: score
+    aggregation: !function egoschema_subset_local_utils.egoschema_aggregate_score
+    higher_is_better: true
+lmms_eval_specific_kwargs:
+  default:
+    pre_prompt: ""
+    post_prompt: "\nAnswer with the option's letter from the given choices directly."
+metadata:
+  - version: 0.0

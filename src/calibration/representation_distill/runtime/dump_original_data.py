@@ -297,7 +297,13 @@ class ManifestRawDataset:
         for dataset_name, max_index in max_index_by_dataset.items():
             rows = self._rows_by_dataset.get(dataset_name)
             if rows is None:
-                rows = load_dataset_rows(dataset_name, minimum_rows=max_index + 1)
+                if dataset_name == "m4_instruct":
+                    # The frozen manifest stores exact indices. The generic
+                    # candidate loader expands M4 pools by 2x, which can demand
+                    # more offline rows than the manifest actually references.
+                    rows = load_m4_instruct_rows(max_rows=max_index + 1)
+                else:
+                    rows = load_dataset_rows(dataset_name, minimum_rows=max_index + 1)
             if max_index >= len(rows):
                 raise IndexError(
                     f"Manifest references {dataset_name}[{max_index}], but dataset has {len(rows)} rows."
@@ -325,6 +331,8 @@ class ManifestRawDataset:
                 f"{dataset_name}[{dataset_index}]: expected {expected_id!r}, "
                 f"loaded {sample['sample_id']!r}."
             )
+        if "score_token_count" in entry:
+            sample["score_token_count"] = int(entry["score_token_count"])
         return sample
 
 

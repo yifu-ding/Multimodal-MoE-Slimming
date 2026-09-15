@@ -161,6 +161,10 @@ class ScoreAccumulator:
                 "score_tokens_per_sample": getattr(
                     args, "score_tokens_per_sample", None
                 ),
+                "score_token_budget": getattr(args, "score_token_budget", None),
+                "score_token_counts_variable": getattr(
+                    args, "score_token_counts_variable", False
+                ),
                 "score_token_sampling": getattr(
                     args, "score_token_sampling", None
                 ),
@@ -171,13 +175,19 @@ class ScoreAccumulator:
                 "ema": args.ema,
                 "score_aggregation": getattr(args, "aggregation", "mean"),
                 "fill_zero_for_unrouted": getattr(args, "fill_zero_for_unrouted", False),
+                "layerwise_beta": getattr(args, "layerwise_beta", 0.95),
+                "layerwise_loss_definition": (
+                    "mean over calibration batches of the selected block loss after "
+                    "uniformly scaling every routed expert output by layerwise_beta; "
+                    "teacher target and all other scores use beta=1"
+                ),
                 "layers": self.layers,
                 "layer_to_num_experts": self.layer_to_num_experts,
                 "layer_to_num_channels": self.layer_to_num_channels,
                 "available_channel_metrics": list(CHANNEL_METRICS),
                 "available_expert_metrics": list(EXPERT_METRICS),
                 "affinity_token_scope": "full valid sequence; independent of score_tokens_per_sample",
-                "score_token_scope": "fixed per-sample quota, sampled uniformly within each modality in proportion to full-sequence modality counts",
+                "score_token_scope": "manifest-defined per-sample quota (fixed or variable), sampled uniformly within each modality in proportion to full-sequence modality counts",
                 "ema_matrix_definition": "per-layer exposure-normalized modality affinity: let r_m[e] = routed_m[e] / sum_e routed_m[e], then (r_visual[e] - r_text[e]) / (r_visual[e] + r_text[e] + 1e-8)",
                 "ema_matrix_prior_corrected_definition": "compatibility alias of ema_matrix; modality exposure correction is now applied per layer",
                 "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),

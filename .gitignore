@@ -13,6 +13,7 @@ storage/
 outputs/
 transformers/
 *.png
+*.pdf
 *.json
 *.pt
 results/

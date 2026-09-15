@@ -1,0 +1,6 @@
+task=gqa_prefill
+signature=71cc7a2f83c1733408587354b9896c6c0875ce6a80dbfe08ef9e4d9116c9e089
+completed_at=2026-09-11T16:11:31+08:00
+batch_size=128
+wall_time_seconds=88
+output_dir=artifacts/efficiency_figure/qwen3_gqa_ep4/batch_sweep_balanced_prefill/prune_50/multi_kernel/bs_128/eval/tasks/gqa_prefill

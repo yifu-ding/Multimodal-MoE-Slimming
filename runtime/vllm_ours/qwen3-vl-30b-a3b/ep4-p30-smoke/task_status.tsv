@@ -1,0 +1,2 @@
+task	status	exit_code	batch_size	wall_time_seconds	output_dir
+gqa	complete	0	32	76	runtime/vllm_ours/qwen3-vl-30b-a3b/ep4-p30-smoke/tasks/gqa

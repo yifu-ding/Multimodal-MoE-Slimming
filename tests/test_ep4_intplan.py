@@ -2,6 +2,8 @@ import torch
 
 from src.generate_mask.ep4_intplan import (
     DEFAULT_WIDTHS,
+    _build_layer_placement_groups,
+    _merge_sparse_width_tiers,
     _quantize_balanced_widths_to_budget,
     plan_ep4_from_masks,
     plan_ep4_intplan,
@@ -26,6 +28,7 @@ def test_ep4_plan_preserves_discrete_budget_and_mapping_invariants():
         scores,
         prune_ratio=0.30,
         placement_tolerance=0.20,
+        sparse_tier_max_experts=0,
     )
 
     widths = result["expert_widths"]
@@ -80,6 +83,7 @@ def test_prune_ratio_is_not_interpreted_as_keep_ratio():
         expert_sensitivity,
         scores,
         prune_ratio=0.30,
+        sparse_tier_max_experts=0,
     )
     expected_units = round(0.70 * scores.numel() / 128)
     assert result["target_keep_channels"] == expected_units * 128
@@ -147,6 +151,7 @@ def test_strict_placement_tolerance_rejects_unbalanced_single_layer():
             prune_ratio=0.25,
             placement_tolerance=0.0,
             strict_placement_tolerance=True,
+            sparse_tier_max_experts=0,
         )
     except RuntimeError as error:
         assert "exceeds tolerance" in str(error)
@@ -166,6 +171,7 @@ def test_plan_from_masks_preserves_mask_priority_and_mapping_invariants():
         scores,
         prune_ratio=0.30,
         placement_tolerance=0.20,
+        sparse_tier_max_experts=0,
     )
 
     assert result["plan_source"] == "maes_intermediate_masks"
@@ -180,3 +186,61 @@ def test_plan_from_masks_preserves_mask_priority_and_mapping_invariants():
     shrunk = result["expert_widths"] <= 512
     selected_outside_base = result["intermediate_masks"][..., 538:].any(dim=-1)
     assert not bool((shrunk & selected_outside_base).any())
+
+
+def test_sparse_tier_merge_and_heaviest_group_split():
+    expert_widths = torch.tensor(
+        [[384] * 20 + [512] * 20 + [640] * 4 + [768] * 20], dtype=torch.int64
+    )
+    raw_counts = expert_widths.clone()
+    raw_counts[0, 40:42] = 520
+    raw_counts[0, 42:44] = 750
+
+    merged, diagnostics = _merge_sparse_width_tiers(
+        expert_widths,
+        raw_counts,
+        active_widths=(768, 640, 512, 384),
+        max_experts=5,
+    )
+
+    assert int((merged == 640).sum()) == 0
+    assert int((merged == 512).sum()) == 22
+    assert int((merged == 768).sum()) == 22
+    assert diagnostics == [
+        {
+            "layer": 0,
+            "removed_width": 640,
+            "removed_count": 4,
+            "destinations": {512: 2, 768: 2},
+        }
+    ]
+
+    groups = _build_layer_placement_groups(
+        merged,
+        active_widths=(768, 640, 512, 384),
+        ep_size=4,
+    )
+    group_widths = groups["placement_group_widths"][0].tolist()
+    group_counts = groups["placement_group_counts"][0].tolist()
+    assert group_widths == [768, 768, 512, 384]
+    assert group_counts == [11, 11, 22, 20]
+    assert all(count > 0 for count in group_counts)
+
+
+def test_default_plan_allows_duplicate_rank_widths_without_idle_ranks():
+    layer_sensitivity, expert_sensitivity, scores = _synthetic_inputs()
+    result = plan_ep4_intplan(
+        layer_sensitivity,
+        expert_sensitivity,
+        scores,
+        prune_ratio=0.30,
+        placement_tolerance=1.0,
+    )
+
+    assert result["sparse_tier_max_experts"] == 5
+    assert result["post_merge_budget_delta"] == (
+        result["actual_keep_channels"] - result["target_keep_channels"]
+    )
+    for layer_groups in result["local_to_global"]:
+        assert len(layer_groups) == 4
+        assert all(layer_group for layer_group in layer_groups)

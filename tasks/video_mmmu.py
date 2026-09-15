@@ -3,6 +3,7 @@ from PIL import Image
 import decord
 import os
 from pathlib import Path
+import warnings
 import numpy as np
 import pyarrow.parquet as pq
 
@@ -156,6 +157,33 @@ def _build_placeholder_frame() -> Image.Image:
     return Image.new("RGB", (224, 224), color=(240, 240, 240))
 
 
+def _decode_video_batch_with_tail_fallback(
+    vr,
+    *,
+    file_path: Path,
+    num_frames: int,
+    max_frames: int,
+):
+    sample_count = min(num_frames, max_frames)
+    last_error = None
+    for end_ratio in (1.0, 0.98, 0.95, 0.90, 0.80):
+        end_index = int((num_frames - 1) * end_ratio)
+        indices = np.linspace(0, end_index, sample_count, dtype=int).tolist()
+        try:
+            frames = vr.get_batch(indices).asnumpy()
+        except decord.DECORDError as exc:
+            last_error = exc
+            continue
+        if end_ratio < 1.0:
+            warnings.warn(
+                f"Decord could not read the tail of {file_path}; sampled "
+                f"{sample_count} frames through {end_ratio:.0%} of the video instead.",
+                RuntimeWarning,
+            )
+        return frames
+    raise last_error
+
+
 def process_media(
     file_path: Union[str, Path], max_frames: int = 64, max_long_side: int = 480
 ) -> tuple:
@@ -181,14 +209,12 @@ def process_media(
     if file_ext in VIDEO_EXTENSIONS:
         vr = decord.VideoReader(str(file_path), ctx=decord.cpu(0))
         num_frames = len(vr)
-        if num_frames <= max_frames:
-            indices = list(range(num_frames))
-        else:
-            indices = np.linspace(0, num_frames - 1, max_frames, dtype=int).tolist()
-            if (num_frames - 1) not in indices:
-                indices.pop()
-                indices.append(num_frames - 1)
-        frames_np = vr.get_batch(indices).asnumpy()
+        frames_np = _decode_video_batch_with_tail_fallback(
+            vr,
+            file_path=file_path,
+            num_frames=num_frames,
+            max_frames=max_frames,
+        )
         for frame_np in frames_np:
             pil_frame = Image.fromarray(frame_np)
             resized_frame = _resize_frame(pil_frame, max_long_side)

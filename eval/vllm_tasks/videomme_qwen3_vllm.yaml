@@ -1,0 +1,31 @@
+dataset_path: lmms-lab/Video-MME
+dataset_kwargs:
+  token: true
+  cache_dir: videomme
+  video: true
+task: videomme_qwen3_vllm
+task_alias: videomme_qwen3_vllm
+test_split: test
+output_type: generate_until
+cluster_key: videoID
+doc_to_visual: !function lmms_eval.tasks.videomme.utils.videomme_doc_to_visual
+doc_to_text: !function lmms_eval.tasks.videomme.utils.videomme_doc_to_text
+doc_to_target: answer
+generation_kwargs:
+  max_new_tokens: 16
+  temperature: 0
+  top_p: 1.0
+  num_beams: 1
+  do_sample: false
+process_results: !function lmms_eval.tasks.videomme.utils.videomme_process_results
+metric_list:
+  - metric: videomme_perception_score
+    aggregation: !function lmms_eval.tasks.videomme.utils.videomme_aggregate_results
+    higher_is_better: true
+lmms_eval_specific_kwargs:
+  vllm:
+    format: qwen3_vl
+    pre_prompt: "Question: "
+    post_prompt: "Answer with the option letter only."
+metadata:
+  - version: 0.0

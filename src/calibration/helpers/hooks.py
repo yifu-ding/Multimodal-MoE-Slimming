@@ -52,7 +52,9 @@ def register_teacher_block_hook(block: nn.Module, state: Dict[str, Any]):
     def _hook(module, args, kwargs, output):
         state["in_args"] = args
         state["in_kwargs"] = kwargs
-        state["output"] = output
+        # Qwen3-VL DeepStack adds visual features to the first decoder outputs
+        # in place. Snapshot the block target before that post-block mutation.
+        state["output"] = unwrap_output(output).detach().clone()
 
     return block.register_forward_hook(_hook, with_kwargs=True)
 

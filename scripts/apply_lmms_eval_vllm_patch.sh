@@ -4,20 +4,29 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TARGET="${REPO_ROOT}/lmms-eval/lmms_eval/models/simple/vllm.py"
+CHAT_TARGET="${REPO_ROOT}/lmms-eval/lmms_eval/models/chat/vllm.py"
 PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_vllm_disable_inner_tqdm.patch"
 CALLABLE_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_vllm_silent_tqdm_callable.patch"
 PARITY_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_vllm_modes_parity.patch"
+VIDEOMME_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_vllm_qwen3_videomme.patch"
+VIDEOMMMU_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_vllm_qwen3_videommmu.patch"
+SHORT_VIDEO_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_vllm_chat_short_video.patch"
+PREFILL_METRICS_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_vllm_prefill_metrics.patch"
 
 if [[ ! -f "${TARGET}" ]]; then
     echo "error: local lmms-eval checkout is missing: ${TARGET}" >&2
     exit 2
 fi
+if [[ ! -f "${CHAT_TARGET}" ]]; then
+    echo "error: local lmms-eval chat vLLM backend is missing: ${CHAT_TARGET}" >&2
+    exit 2
+fi
 
 silent_marker_count="$(grep -c '^[[:space:]]*use_tqdm=SILENT_VLLM_TQDM,$' "${TARGET}" || true)"
-if [[ "${silent_marker_count}" == "2" ]]; then
+if [[ "${silent_marker_count}" == "2" || "${silent_marker_count}" == "3" ]]; then
     :
 elif [[ "${silent_marker_count}" != "0" ]]; then
-    echo "error: lmms-eval vLLM callable progress patch is only partially applied (${silent_marker_count}/2 markers)." >&2
+    echo "error: lmms-eval vLLM callable progress patch has an unexpected marker count (${silent_marker_count})." >&2
     exit 2
 else
     legacy_marker_count="$(grep -c '^[[:space:]]*use_tqdm=False,$' "${TARGET}" || true)"
@@ -51,4 +60,67 @@ else
         exit 2
     fi
     patch --silent --forward -d "${REPO_ROOT}" -p1 < "${PARITY_PATCH_FILE}"
+fi
+
+videomme_marker_count="$(grep -c '^from eval\.vllm_qwen3_videomme import prepare_qwen3_videomme_input$' "${TARGET}" || true)"
+if [[ "${videomme_marker_count}" == "1" ]]; then
+    :
+elif [[ "${videomme_marker_count}" != "0" ]]; then
+    echo "error: lmms-eval Qwen3 VideoMME patch has duplicate markers (${videomme_marker_count})." >&2
+    exit 2
+else
+    if ! patch --dry-run --silent --forward -d "${REPO_ROOT}" -p1 < "${VIDEOMME_PATCH_FILE}"; then
+        echo "error: ${VIDEOMME_PATCH_FILE} does not apply to the current lmms-eval checkout." >&2
+        exit 2
+    fi
+    patch --silent --forward -d "${REPO_ROOT}" -p1 < "${VIDEOMME_PATCH_FILE}"
+fi
+
+silent_marker_count="$(grep -c '^[[:space:]]*use_tqdm=SILENT_VLLM_TQDM,$' "${TARGET}" || true)"
+native_no_tqdm_count="$(grep -c '^[[:space:]]*use_tqdm=False,$' "${TARGET}" || true)"
+if [[ "${silent_marker_count}" != "2" || "${native_no_tqdm_count}" != "1" ]]; then
+    echo "error: lmms-eval vLLM progress configuration is inconsistent (chat callable=${silent_marker_count}/2, native disabled=${native_no_tqdm_count}/1)." >&2
+    exit 2
+fi
+
+videommmu_marker_count="$(grep -c '^from eval\.vllm_qwen3_videommmu import prepare_qwen3_videommmu_input$' "${TARGET}" || true)"
+if [[ "${videommmu_marker_count}" == "1" ]]; then
+    :
+elif [[ "${videommmu_marker_count}" != "0" ]]; then
+    echo "error: lmms-eval Qwen3 VideoMMMU patch has duplicate markers (${videommmu_marker_count})." >&2
+    exit 2
+else
+    if ! patch --dry-run --silent --forward -d "${REPO_ROOT}" -p1 < "${VIDEOMMMU_PATCH_FILE}"; then
+        echo "error: ${VIDEOMMMU_PATCH_FILE} does not apply to the current lmms-eval checkout." >&2
+        exit 2
+    fi
+    patch --silent --forward -d "${REPO_ROOT}" -p1 < "${VIDEOMMMU_PATCH_FILE}"
+fi
+
+short_video_marker_count="$(grep -c '^from eval\.vllm_short_video import to_openai_messages_with_nframe_fallback$' "${CHAT_TARGET}" || true)"
+if [[ "${short_video_marker_count}" == "1" ]]; then
+    :
+elif [[ "${short_video_marker_count}" != "0" ]]; then
+    echo "error: lmms-eval short-video patch has duplicate markers (${short_video_marker_count})." >&2
+    exit 2
+else
+    if ! patch --dry-run --silent --forward -d "${REPO_ROOT}" -p1 < "${SHORT_VIDEO_PATCH_FILE}"; then
+        echo "error: ${SHORT_VIDEO_PATCH_FILE} does not apply to the current lmms-eval checkout." >&2
+        exit 2
+    fi
+    patch --silent --forward -d "${REPO_ROOT}" -p1 < "${SHORT_VIDEO_PATCH_FILE}"
+fi
+
+prefill_metrics_marker_count="$(grep -Ec '^[[:space:]]*if "time_(to_first_token|per_output_token_seconds)" in name and metric\.count:$' "${CHAT_TARGET}" || true)"
+if [[ "${prefill_metrics_marker_count}" == "2" ]]; then
+    :
+elif [[ "${prefill_metrics_marker_count}" != "0" ]]; then
+    echo "error: lmms-eval prefill metric patch is only partially applied (${prefill_metrics_marker_count}/2 markers)." >&2
+    exit 2
+else
+    if ! patch --dry-run --silent --forward -d "${REPO_ROOT}" -p1 < "${PREFILL_METRICS_PATCH_FILE}"; then
+        echo "error: ${PREFILL_METRICS_PATCH_FILE} does not apply to the current lmms-eval checkout." >&2
+        exit 2
+    fi
+    patch --silent --forward -d "${REPO_ROOT}" -p1 < "${PREFILL_METRICS_PATCH_FILE}"
 fi

@@ -1,0 +1,22 @@
+diff --git a/lmms-eval/lmms_eval/models/chat/vllm.py b/lmms-eval/lmms_eval/models/chat/vllm.py
+--- a/lmms-eval/lmms_eval/models/chat/vllm.py
++++ b/lmms-eval/lmms_eval/models/chat/vllm.py
+@@ -12,6 +12,7 @@ from lmms_eval.imports import optional_import
+ from lmms_eval.models.model_utils.gen_metrics import log_metrics
+ from lmms_eval.models.simple.vllm import VLLM as VLLMSimple
+ from lmms_eval.protocol import ChatMessages
++from eval.vllm_short_video import to_openai_messages_with_nframe_fallback
+ 
+ LLM, _ = optional_import("vllm", "LLM")
+ SamplingParams, _ = optional_import("vllm", "SamplingParams")
+@@ -80,7 +81,10 @@ class VLLM(VLLMSimple):
+         if self.fps is not None:
+             video_kwargs["fps"] = self.fps
+         else:
+             video_kwargs["nframes"] = self.nframes
+-        messages = chat_messages.to_openai_messages(video_kwargs=video_kwargs)
++        messages = to_openai_messages_with_nframe_fallback(
++            chat_messages,
++            video_kwargs,
++        )
+         return messages, params

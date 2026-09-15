@@ -1,0 +1,6 @@
+task=gqa
+signature=032bce5a29accfc906fc1810f053ec2fc102d001d13b55f0da6034b1c781347b
+completed_at=2026-09-11T21:32:19+08:00
+batch_size=32
+wall_time_seconds=76
+output_dir=runtime/vllm_ours/qwen3-vl-30b-a3b/ep4-p30-smoke/tasks/gqa

@@ -34,6 +34,10 @@ fi
 
 PREFIX="${PREFIX:-$(pwd)}"
 export PYTHONPATH="${PREFIX}"
+export HF_HOME="${MAES_HF_HOME:-/home/data/dyf/hf_cache}"
+export HF_HUB_CACHE="${MAES_HF_HUB_CACHE:-${HF_HOME}/hub}"
+export HF_DATASETS_CACHE="${MAES_HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+unset TRANSFORMERS_CACHE
 
 MODEL_PATH="${MODEL_PATH:-moonshotai/Kimi-VL-A3B-Instruct}"
 # MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-VL-30B-A3B-Instruct}"
@@ -62,10 +66,16 @@ BATCH_SIZE="${BATCH_SIZE:-8}"
 START_IDX="${START_IDX:-0}"
 SUBSET_SEED="${SUBSET_SEED:-42}"
 LOSS_FN="${LOSS_FN:-rel_l2}"
+LAYERWISE_BETA="${LAYERWISE_BETA:-0.95}"
 SECOND_ORDER_IMPL="${SECOND_ORDER_IMPL:-vectorized}"
 SECOND_ORDER_CHUNK_SIZE="${SECOND_ORDER_CHUNK_SIZE:-auto}"
 SECOND_ORDER_MAX_CHUNK_SIZE="${SECOND_ORDER_MAX_CHUNK_SIZE:-0}"
 SECOND_ORDER_PROFILE="${SECOND_ORDER_PROFILE:-0}"
+HESSIAN_PROBE_LAYER="${HESSIAN_PROBE_LAYER:-}"
+HESSIAN_PROBE_E="${HESSIAN_PROBE_E:-}"
+HESSIAN_PROBE_F="${HESSIAN_PROBE_F:-}"
+HESSIAN_PROBE_VALIDATE="${HESSIAN_PROBE_VALIDATE:-0}"
+HESSIAN_PROBE_OUT="${HESSIAN_PROBE_OUT:-}"
 LAYERS="${LAYERS:-}"  # 默认不传值，全部层calibration
 # LAYERS="${LAYERS:-1-6}"
 # LAYERS="${LAYERS:-7-13}"
@@ -144,6 +154,22 @@ else
 fi
 OUTPUT_DIR="${OUTPUT_DIR:-${DEFAULT_OUTPUT_DIR}}"
 
+if [[ -n "${HESSIAN_PROBE_LAYER}" ]]; then
+    HESSIAN_PROBE_OUT="${HESSIAN_PROBE_OUT:-${OUTPUT_DIR}/hessian_probe_L${HESSIAN_PROBE_LAYER}.pt}"
+    if [[ -n "${HESSIAN_PROBE_E}" || -n "${HESSIAN_PROBE_F}" ]]; then
+        if [[ -z "${HESSIAN_PROBE_E}" || -z "${HESSIAN_PROBE_F}" ]]; then
+            echo "HESSIAN_PROBE_E and HESSIAN_PROBE_F must be set together." >&2
+            exit 1
+        fi
+    elif [[ "${HESSIAN_PROBE_VALIDATE}" == "1" ]]; then
+        echo "HESSIAN_PROBE_VALIDATE=1 requires HESSIAN_PROBE_E and HESSIAN_PROBE_F." >&2
+        exit 1
+    fi
+elif [[ -n "${HESSIAN_PROBE_OUT}" || -n "${HESSIAN_PROBE_E}" || -n "${HESSIAN_PROBE_F}" || "${HESSIAN_PROBE_VALIDATE}" == "1" ]]; then
+    echo "Hessian probe options require HESSIAN_PROBE_LAYER." >&2
+    exit 1
+fi
+
 EXTRA_ARGS=("$@")
 
 CMD=(
@@ -157,9 +183,23 @@ CMD=(
     --start_idx          "${START_IDX}"
     --subset_seed        "${SUBSET_SEED}"
     --loss_fn            "${LOSS_FN}"
+    --layerwise_beta     "${LAYERWISE_BETA}"
     --ema                "${EMA}"
     --aggregation        "${AGGREGATION}"
 )
+
+if [[ -n "${HESSIAN_PROBE_LAYER}" ]]; then
+    CMD+=(
+        --hessian_probe_layer "${HESSIAN_PROBE_LAYER}"
+        --hessian_probe_out "${HESSIAN_PROBE_OUT}"
+    )
+    if [[ -n "${HESSIAN_PROBE_E}" ]]; then
+        CMD+=(--hessian_probe_pair "${HESSIAN_PROBE_E}" "${HESSIAN_PROBE_F}")
+    fi
+    if [[ "${HESSIAN_PROBE_VALIDATE}" == "1" ]]; then
+        CMD+=(--hessian_probe_validate)
+    fi
+fi
 
 if [[ -n "${SELECTION_MANIFEST}" ]]; then
     CMD+=(--selection_manifest "${SELECTION_MANIFEST}")
@@ -215,7 +255,12 @@ fi
 echo "Layers     : ${LAYERS:-<all MoE layers>}"
 echo "Output     : ${OUTPUT_DIR}"
 echo "Aggregation: ${AGGREGATION}"
+echo "Layer loss  : uniform expert beta=${LAYERWISE_BETA}"
 echo "2nd order  : ${SECOND_ORDER_IMPL}, expert group=${SECOND_ORDER_CHUNK_SIZE}, max=${SECOND_ORDER_MAX_CHUNK_SIZE}"
+if [[ -n "${HESSIAN_PROBE_LAYER}" ]]; then
+    echo "Hessian probe: layer=${HESSIAN_PROBE_LAYER}, pair=${HESSIAN_PROBE_E:-auto}/${HESSIAN_PROBE_F:-auto}, validate=${HESSIAN_PROBE_VALIDATE}"
+    echo "Probe output : ${HESSIAN_PROBE_OUT}"
+fi
 echo "Fill zero for unrouted: ${FILL_ZERO_FOR_UNROUTED}"
 echo "GPU        : ${CUDA_VISIBLE_DEVICES}"
 echo ""

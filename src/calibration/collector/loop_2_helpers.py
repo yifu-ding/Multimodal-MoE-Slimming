@@ -496,6 +496,11 @@ def _compute_expert_second_order_batched_once(
     if context is None:
         return None
 
+    probe_enabled = bool(_kwargs.get("hessian_probe_enabled", False))
+    probe_validate = bool(_kwargs.get("hessian_probe_validate", False))
+    probe_pair = _kwargs.get("hessian_probe_pair", None)
+    _kwargs.pop("_hessian_probe_batch", None)
+
     device = context["teacher_target"].device
     has_activation = torch.as_tensor(has_activation_mask, device=device, dtype=torch.bool)
     num_experts = int(has_activation.numel())
@@ -504,6 +509,14 @@ def _compute_expert_second_order_batched_once(
         raise ValueError(f"SECOND_ORDER_CHUNK_SIZE must be positive, got {chunk_size}")
     alpha = torch.ones(num_experts, device=device, dtype=torch.float32, requires_grad=True)
     state = patch_expert_output_alpha_vector(experts, alpha=alpha)
+    hessian_rows_cpu = (
+        torch.zeros((num_experts, num_experts), dtype=torch.float32)
+        if probe_enabled
+        else None
+    )
+    hessian_complete = False
+    probe_gradient_cpu = None
+    probe_ablation_losses = None
 
     try:
         cnt_block.zero_grad(set_to_none=True)
@@ -525,10 +538,14 @@ def _compute_expert_second_order_batched_once(
                 d1 = torch.autograd.grad(loss, alpha, create_graph=True, allow_unused=True)[0]
                 if d1 is None:
                     second_value = torch.zeros(num_experts, dtype=torch.float32, device=device)
+                    hessian_complete = True
                 elif d1.requires_grad:
+                    if probe_enabled:
+                        probe_gradient_cpu = d1.detach().float().cpu()
                     active_count = int(active_indices.numel())
                     if active_count == 0:
                         second_value = torch.zeros(num_experts, dtype=torch.float32, device=device)
+                        hessian_complete = True
                     else:
                         d2_diag = torch.zeros(active_count, dtype=torch.float32, device=device)
                         missing_hessian = False
@@ -548,18 +565,85 @@ def _compute_expert_second_order_batched_once(
                             if d2_rows is None:
                                 missing_hessian = True
                                 break
+                            if hessian_rows_cpu is not None:
+                                hessian_rows_cpu[chunk_indices.detach().cpu()] = (
+                                    d2_rows.detach().float().cpu()
+                                )
                             local_positions = torch.arange(end - start, device=device)
                             d2_diag[start:end] = d2_rows[local_positions, chunk_indices].detach().float()
 
                         if missing_hessian:
                             second_value = (-d1).detach().float().clamp_min(0.0)
                         else:
+                            hessian_complete = True
                             second_value = torch.zeros(num_experts, dtype=torch.float32, device=device)
                             second_value[active_indices] = (
                                 -d1[active_indices].detach().float() + 0.5 * d2_diag
                             ).clamp_min(0.0)
                 else:
                     second_value = (-d1).detach().float().clamp_min(0.0)
+                    if probe_enabled:
+                        probe_gradient_cpu = d1.detach().float().cpu()
+                        hessian_complete = True
+
+                if probe_enabled:
+                    if probe_gradient_cpu is None:
+                        probe_gradient_cpu = torch.zeros(num_experts, dtype=torch.float32)
+                    if not hessian_complete:
+                        raise RuntimeError(
+                            "Hessian probe requested, but the full Hessian rows were unavailable."
+                        )
+
+                    if probe_validate:
+                        if probe_pair is None or len(probe_pair) != 2:
+                            raise ValueError(
+                                "Hessian probe validation requires exactly two expert IDs."
+                            )
+                        pair = tuple(int(value) for value in probe_pair)
+                        if pair[0] == pair[1] or any(
+                            value < 0 or value >= num_experts for value in pair
+                        ):
+                            raise ValueError(
+                                f"Invalid Hessian probe pair {pair} for {num_experts} experts."
+                            )
+
+                        probe_ablation_losses = {}
+                        with torch.no_grad():
+                            for name, removed in (
+                                ("remove_e", (pair[0],)),
+                                ("remove_f", (pair[1],)),
+                                ("remove_ef", pair),
+                            ):
+                                alpha.fill_(1.0)
+                                alpha[list(removed)] = 0.0
+                                with torch.autocast(
+                                    device_type=context["autocast_device_type"],
+                                    dtype=context["autocast_dtype"],
+                                    enabled=context["autocast_enabled"],
+                                ):
+                                    masked_pred = unwrap_output(
+                                        cnt_block(*context["in_args"], **context["in_kwargs"])
+                                    )
+                                    masked_loss = compute_block_loss(
+                                        pred=masked_pred,
+                                        teacher_target=context["teacher_target"],
+                                        attn_mask=context["attn_mask"],
+                                        loss_fn=context["loss_fn"],
+                                        eps=context["loss_eps"],
+                                    )
+                                probe_ablation_losses[name] = float(
+                                    masked_loss.detach().float().item()
+                                )
+                            alpha.fill_(1.0)
+
+                    _kwargs["_hessian_probe_batch"] = {
+                        "gradient": probe_gradient_cpu,
+                        "hessian": hessian_rows_cpu,
+                        "base_loss": float(loss.detach().float().item()),
+                        "score_tokens": int(context["attn_mask"].sum().item()),
+                        "active_mask": has_activation.detach().cpu(),
+                        "ablation_losses": probe_ablation_losses,
+                    }
     finally:
         _restore_patched_expert(state)
         cnt_block.zero_grad(set_to_none=True)

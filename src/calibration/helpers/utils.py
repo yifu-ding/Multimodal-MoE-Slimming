@@ -70,6 +70,7 @@ def clear_fused_saved_tensors(experts: nn.Module) -> None:
         "saved_visual_mask",
         "saved_score_mask",
         "saved_router_weights",
+        "saved_token_indices",
     ):
         if hasattr(experts, name):
             setattr(experts, name, None)

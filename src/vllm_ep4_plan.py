@@ -62,6 +62,8 @@ def validate_ep4_plan(plan: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"rank_widths must have shape {(num_layers, 4)}")
     if len(active_widths) != 4 or any(value <= 0 for value in active_widths):
         raise ValueError("EP4 plan must contain exactly four positive active widths")
+    if not torch.isin(rank_widths, torch.tensor(active_widths, dtype=torch.int64)).all():
+        raise ValueError("rank_widths contains a width outside active_widths")
 
     removed = widths == 0
     if bool((expert_to_rank[removed] != -1).any()) or bool(
@@ -78,8 +80,10 @@ def validate_ep4_plan(plan: dict[str, Any]) -> dict[str, Any]:
     if len(local_to_global) != num_layers:
         raise ValueError("local_to_global must contain one entry per planned layer")
     for layer in range(num_layers):
-        if sorted(rank_widths[layer].tolist()) != sorted(active_widths):
-            raise ValueError(f"layer {layer} rank_widths do not contain all active tiers")
+        present_widths = set(int(value) for value in widths[layer].unique().tolist() if value > 0)
+        placed_widths = set(int(value) for value in rank_widths[layer].tolist())
+        if not present_widths.issubset(placed_widths):
+            raise ValueError(f"layer {layer} has an active tier without an EP rank")
         if len(local_to_global[layer]) != 4:
             raise ValueError(f"layer {layer} must contain four rank mappings")
         seen: set[int] = set()

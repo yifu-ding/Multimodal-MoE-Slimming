@@ -22,6 +22,14 @@ def _to_int_keyed_map(maybe_nested: Dict[Any, Any]) -> Dict[int, Any]:
 
 
 def _extract_layers(payload: dict) -> List[int]:
+    observed_layers = set()
+    for key in ("layerwise_loss", "layerwise_second_order_sum"):
+        layer_map = payload.get(key, {})
+        if isinstance(layer_map, dict):
+            observed_layers.update(int(layer) for layer in layer_map)
+    if observed_layers:
+        return sorted(observed_layers)
+
     meta = payload.get("metadata", {})
     layers = meta.get("layers")
     if isinstance(layers, list) and layers:
@@ -153,6 +161,7 @@ def _merge_payloads(loaded: List[LoadedScores]) -> Tuple[dict, List[str]]:
         "ema_matrix": {},
         "ema_matrix_prior_corrected": {},
         "layerwise_loss": {},
+        "layerwise_second_order_sum": {},
         "metadata": copy.deepcopy(newest.payload.get("metadata", {})),
     }
 
@@ -222,13 +231,20 @@ def _merge_payloads(loaded: List[LoadedScores]) -> Tuple[dict, List[str]]:
                 f"[merge warning] ema_matrix_prior_corrected.{layer} all candidates are zero; skipped"
             )
 
-        val, has_any_value = _merge_latest_nonzero_value(
+        val = _pick_latest_value(
             loaded, lambda payload, l=layer: _get_layer_value(payload.get("layerwise_loss", {}), l)
         )
         if val is not None:
             merged["layerwise_loss"][layer] = val
-        elif has_any_value:
-            warnings.append(f"[merge warning] layerwise_loss.{layer} all candidates are zero; skipped")
+
+        val = _pick_latest_value(
+            loaded,
+            lambda payload, l=layer: _get_layer_value(
+                payload.get("layerwise_second_order_sum", {}), l
+            ),
+        )
+        if val is not None:
+            merged["layerwise_second_order_sum"][layer] = val
 
     merged_layers = sorted(
         {
@@ -237,6 +253,7 @@ def _merge_payloads(loaded: List[LoadedScores]) -> Tuple[dict, List[str]]:
             *{int(k) for k in merged["ema_matrix"].keys()},
             *{int(k) for k in merged["ema_matrix_prior_corrected"].keys()},
             *{int(k) for k in merged["layerwise_loss"].keys()},
+            *{int(k) for k in merged["layerwise_second_order_sum"].keys()},
         }
     )
     if not isinstance(merged["metadata"], dict):
@@ -275,10 +292,62 @@ def _merge_payloads(loaded: List[LoadedScores]) -> Tuple[dict, List[str]]:
     return merged, warnings
 
 
+def _validate_strict_metadata(loaded: List[LoadedScores]) -> None:
+    if not loaded:
+        return
+    keys = (
+        "model_name_or_path",
+        "resolved_model_name_or_path",
+        "loss_fn",
+        "dataset",
+        "selection_manifest_sha256",
+        "selected_num_samples",
+        "batch_size",
+        "score_tokens_per_sample",
+        "score_token_budget",
+        "score_token_counts_variable",
+        "score_token_sampling",
+        "score_aggregation",
+        "fill_zero_for_unrouted",
+        "layerwise_beta",
+    )
+    reference = loaded[0]
+    reference_metadata = reference.payload.get("metadata", {})
+    if not isinstance(reference_metadata, dict):
+        raise ValueError(f"Invalid metadata dictionary in {reference.path}.")
+    for item in loaded[1:]:
+        metadata = item.payload.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise ValueError(f"Invalid metadata dictionary in {item.path}.")
+        for key in keys:
+            if metadata.get(key) != reference_metadata.get(key):
+                raise ValueError(
+                    f"Cannot strictly merge {item.path}: metadata[{key!r}]="
+                    f"{metadata.get(key)!r} differs from {reference.path} value "
+                    f"{reference_metadata.get(key)!r}."
+                )
+
+    owners: Dict[int, str] = {}
+    for item in loaded:
+        for layer in item.layers:
+            previous = owners.get(layer)
+            if previous is not None:
+                raise ValueError(
+                    f"Layer {layer} appears in both {previous} and {item.path}; "
+                    "strict layer-shard merge requires disjoint layer sets."
+                )
+            owners[layer] = item.path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Merge multiple calibration scores.pt by layer index.")
     parser.add_argument("scores", nargs="+", help="Input scores.pt files or directories containing scores.pt")
     parser.add_argument("--output", "-o", type=str, required=True, help="Output merged scores.pt path")
+    parser.add_argument(
+        "--strict-metadata",
+        action="store_true",
+        help="Require identical calibration metadata and disjoint observed layer sets.",
+    )
     args = parser.parse_args()
 
     loaded: List[LoadedScores] = []
@@ -292,6 +361,8 @@ def main() -> None:
         loaded.append(LoadedScores(path=path, payload=payload, layers=layers, ts=ts))
         print(f"[merge] loaded {path} layers={layers} ts={ts:.3f}")
 
+    if args.strict_metadata:
+        _validate_strict_metadata(loaded)
     merged, warnings = _merge_payloads(loaded)
     for w in warnings:
         print(w)

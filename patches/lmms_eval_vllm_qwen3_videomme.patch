@@ -1,0 +1,81 @@
+--- a/lmms-eval/lmms_eval/models/simple/vllm.py
++++ b/lmms-eval/lmms_eval/models/simple/vllm.py
+@@ -20,6 +20,7 @@
+ from lmms_eval.imports import optional_import
+ from lmms_eval.models.model_utils.media_encoder import encode_image_to_base64
+ from lmms_eval.models.model_utils.progress import make_progress
++from eval.vllm_qwen3_videomme import prepare_qwen3_videomme_input
+ 
+ NUM_SECONDS_TO_SLEEP = int(os.getenv("NUM_SECONDS_TO_SLEEP", "5"))
+ WORKERS = int(os.getenv("WORKERS", "32"))
+@@ -473,6 +474,8 @@
+             self._write_watchdog_heartbeat("encode_start", batch_idx=batch_idx, batch_requests=batch_requests)
+             try:
+                 batched_messages = []
++                batched_native_inputs = []
++                use_native_video = None
+                 params = None
+                 for idx in range(len(batch_requests)):
+                     contexts, gen_kwargs, doc_to_visual, doc_id, task, split = batch_requests[idx].arguments
+@@ -487,12 +490,27 @@
+                     elif request_params != params:
+                         raise ValueError("All requests in a vLLM batch must use identical generation parameters.")
+ 
+-                    visuals = [doc_to_visual(self.task_dict[task][split][doc_id])]
++                    visuals = self.flatten([doc_to_visual(self.task_dict[task][split][doc_id])])
++                    native_input = prepare_qwen3_videomme_input(
++                        self.client,
++                        self.model,
++                        task,
++                        contexts,
++                        visuals,
++                    )
++                    request_uses_native_video = native_input is not None
++                    if use_native_video is None:
++                        use_native_video = request_uses_native_video
++                    elif use_native_video != request_uses_native_video:
++                        raise ValueError("Cannot mix native-video and regular requests in one vLLM batch.")
++                    if native_input is not None:
++                        batched_native_inputs.append(native_input)
++                        continue
++
+                     if None in visuals:
+                         visuals = []
+                         imgs = []
+                     else:
+-                        visuals = self.flatten(visuals)
+                         imgs = []  # multiple images or frames for video
+                         all_tasks = []
+                         with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+@@ -529,13 +547,14 @@
+                 sampling_params = SamplingParams(**params)
+                 self._write_watchdog_heartbeat("chat_start", batch_idx=batch_idx, batch_requests=batch_requests)
+ 
+-                # NOTE:
+-                # The chat method automatically applies the model's chat template to format the prompt
+-                # - vllm chat method: https://docs.vllm.ai/en/stable/models/generative_models.html#llmchat
+-                # The logic here is similar to the vllm implementation as shown here (https://docs.vllm.ai/en/stable/models/generative_models.html#llmchat)
+-                # - vllm implementation: https://github.com/vllm-project/vllm/blob/d97841078b6e0dde8da36d5a2b8e8857a2c37944/vllm/entrypoints/chat_utils.py#L829
+-                def _run_chat(inputs: list[Any]) -> list[str]:
+-                    if self.chat_template is not None:
++                def _run_model(inputs: list[Any]) -> list[str]:
++                    if use_native_video:
++                        response = self.client.generate(
++                            inputs,
++                            sampling_params=sampling_params,
++                            use_tqdm=False,
++                        )
++                    elif self.chat_template is not None:
+                         response = self.client.chat(
+                             sampling_params=sampling_params,
+                             messages=inputs,
+@@ -551,7 +571,8 @@
+                         )
+                     return [o.outputs[0].text for o in response]
+ 
+-                response_text = self._run_tp_synced(batched_messages, _run_chat)
++                model_inputs = batched_native_inputs if use_native_video else batched_messages
++                response_text = self._run_tp_synced(model_inputs, _run_model)
+                 self._write_watchdog_heartbeat("chat_done", batch_idx=batch_idx, batch_requests=batch_requests)
+ 
+                 assert len(response_text) == len(batch_requests)

@@ -532,51 +532,188 @@ def _quantize_widths_to_budget(
     return widths, final_keep
 
 
-def _solve_cross_layer_placement_milp(
-    width_counts: torch.Tensor,
+def _merge_sparse_width_tiers(
+    expert_widths: torch.Tensor,
+    raw_counts: torch.Tensor,
     active_widths: Sequence[int],
+    *,
+    max_experts: int = 5,
+) -> tuple[torch.Tensor, list[dict[str, Any]]]:
+    """Remove per-layer width tiers that contain at most ``max_experts``.
+
+    Sparse tiers are merged into the nearest surviving adjacent tier according
+    to each expert's pre-quantization channel count.  Zero is a valid lower
+    destination.  The exact discrete budget is intentionally allowed to drift:
+    avoiding tiny kernels is more important than preserving a handful of width
+    units after quantization.
+    """
+    if max_experts < 0:
+        raise ValueError(f"max_experts must be non-negative, got {max_experts}")
+    widths = expert_widths.detach().cpu().to(torch.int64).clone()
+    raw = raw_counts.detach().cpu().to(torch.int64)
+    if widths.shape != raw.shape:
+        raise ValueError("expert_widths and raw_counts must have the same shape")
+    if max_experts == 0:
+        return widths, []
+
+    tiers = tuple(sorted(int(width) for width in active_widths))
+    diagnostics: list[dict[str, Any]] = []
+    for layer in range(widths.shape[0]):
+        counts = {width: int((widths[layer] == width).sum()) for width in tiers}
+        present = [width for width in tiers if counts[width] > 0]
+        surviving = [width for width in present if counts[width] > max_experts]
+        if not present or len(surviving) == len(present):
+            continue
+        if not surviving:
+            # Degenerate synthetic/small-model fallback: retain the tier with
+            # the most work so the layer still has active experts to place.
+            surviving = [max(present, key=lambda width: (counts[width] * width, width))]
+
+        destinations = (0, *surviving)
+        for width in present:
+            if width in surviving:
+                continue
+            expert_ids = torch.where(widths[layer] == width)[0].tolist()
+            moved: dict[int, int] = {}
+            lower = max((candidate for candidate in destinations if candidate < width), default=None)
+            higher = min((candidate for candidate in destinations if candidate > width), default=None)
+            for expert in expert_ids:
+                raw_width = int(raw[layer, expert])
+                if lower is None:
+                    destination = int(higher)
+                elif higher is None:
+                    destination = int(lower)
+                else:
+                    lower_distance = abs(raw_width - lower)
+                    higher_distance = abs(raw_width - higher)
+                    if lower_distance == higher_distance:
+                        destination = higher if raw_width >= width else lower
+                    else:
+                        destination = lower if lower_distance < higher_distance else higher
+                widths[layer, expert] = destination
+                moved[destination] = moved.get(destination, 0) + 1
+            diagnostics.append(
+                {
+                    "layer": layer,
+                    "removed_width": width,
+                    "removed_count": len(expert_ids),
+                    "destinations": moved,
+                }
+            )
+
+    return widths, diagnostics
+
+
+def _build_layer_placement_groups(
+    expert_widths: torch.Tensor,
+    active_widths: Sequence[int],
+    *,
+    ep_size: int,
+) -> Dict[str, Any]:
+    """Create exactly ``ep_size`` non-empty groups per layer.
+
+    Each present width starts as one group.  When a layer has fewer width tiers
+    than EP ranks, the group with the largest ``count * width`` is split as
+    evenly as possible by expert count.  This lets multiple ranks execute the
+    same width without leaving a rank idle.
+    """
+    widths = expert_widths.detach().cpu().to(torch.int64)
+    allowed = {int(width) for width in active_widths}
+    num_layers, num_experts = widths.shape
+    group_widths = torch.empty((num_layers, ep_size), dtype=torch.int64)
+    group_counts = torch.empty((num_layers, ep_size), dtype=torch.int64)
+    expert_to_group = torch.full((num_layers, num_experts), -1, dtype=torch.int64)
+    layer_groups: list[list[list[int]]] = []
+
+    for layer in range(num_layers):
+        groups = [
+            {
+                "width": width,
+                "experts": torch.where(widths[layer] == width)[0].tolist(),
+            }
+            for width in sorted(allowed, reverse=True)
+            if bool((widths[layer] == width).any())
+        ]
+        while len(groups) < ep_size:
+            splittable = [index for index, group in enumerate(groups) if len(group["experts"]) >= 2]
+            if not splittable:
+                raise ValueError(
+                    f"layer {layer} has only {sum(len(group['experts']) for group in groups)} "
+                    f"active experts and cannot populate {ep_size} EP ranks"
+                )
+            split_index = max(
+                splittable,
+                key=lambda index: (
+                    len(groups[index]["experts"]) * int(groups[index]["width"]),
+                    len(groups[index]["experts"]),
+                    int(groups[index]["width"]),
+                    -index,
+                ),
+            )
+            group = groups.pop(split_index)
+            expert_ids = list(group["experts"])
+            midpoint = (len(expert_ids) + 1) // 2
+            groups.insert(split_index, {"width": group["width"], "experts": expert_ids[:midpoint]})
+            groups.insert(split_index + 1, {"width": group["width"], "experts": expert_ids[midpoint:]})
+
+        if len(groups) != ep_size:
+            raise ValueError(
+                f"layer {layer} has {len(groups)} active width tiers, exceeding EP size {ep_size}"
+            )
+        layer_group_ids: list[list[int]] = []
+        for group_index, group in enumerate(groups):
+            expert_ids = list(group["experts"])
+            group_widths[layer, group_index] = int(group["width"])
+            group_counts[layer, group_index] = len(expert_ids)
+            expert_to_group[layer, expert_ids] = group_index
+            layer_group_ids.append(expert_ids)
+        layer_groups.append(layer_group_ids)
+
+    return {
+        "placement_group_widths": group_widths,
+        "placement_group_counts": group_counts,
+        "expert_to_placement_group": expert_to_group,
+        "placement_groups": layer_groups,
+    }
+
+
+def _solve_placement_groups_milp(
+    group_counts: torch.Tensor,
+    group_widths: torch.Tensor,
     *,
     tolerance: float = 0.01,
     fix_first_layer: bool = True,
 ) -> Dict[str, Any]:
-    """Assign active width groups to EP ranks with an exact placement MILP."""
-    if not isinstance(width_counts, torch.Tensor) or width_counts.ndim != 2:
-        raise ValueError("width_counts must be a [L, num_active_widths] tensor")
-    counts = width_counts.detach().cpu().to(torch.int64)
-    widths = tuple(int(width) for width in active_widths)
-    num_layers, num_widths = counts.shape
-    if num_widths != len(widths):
-        raise ValueError(
-            f"width_counts has {num_widths} columns but active_widths has {len(widths)}"
-        )
-    if num_widths <= 0 or num_widths > 7:
-        raise ValueError(f"unsupported number of active widths: {num_widths}")
+    """Assign arbitrary per-layer placement groups using an exact MILP."""
+    counts = group_counts.detach().cpu().to(torch.int64)
+    widths = group_widths.detach().cpu().to(torch.int64)
+    if counts.ndim != 2 or widths.shape != counts.shape:
+        raise ValueError("group_counts and group_widths must have the same 2D shape")
+    num_layers, ep_size = counts.shape
+    if ep_size <= 0 or ep_size > 7:
+        raise ValueError(f"unsupported EP size: {ep_size}")
     if tolerance < 0.0:
         raise ValueError(f"tolerance must be non-negative, got {tolerance}")
-    if bool((counts <= 0).any()):
-        raise ValueError("every active width tier must contain at least one expert per layer")
+    if bool((counts <= 0).any()) or bool((widths <= 0).any()):
+        raise ValueError("every placement group must have positive count and width")
 
-    permutations = tuple(itertools.permutations(range(num_widths)))
+    permutations = tuple(itertools.permutations(range(ep_size)))
     num_permutations = len(permutations)
     num_binary = num_layers * num_permutations
     deviation_index = num_binary
     num_variables = num_binary + 1
 
-    layer_rank_load = np.zeros(
-        (num_layers, num_permutations, num_widths), dtype=np.float64
-    )
-    counts_np = counts.numpy()
+    group_loads = (counts * widths).numpy()
+    layer_rank_load = np.zeros((num_layers, num_permutations, ep_size), dtype=np.float64)
     for layer in range(num_layers):
         for permutation_id, permutation in enumerate(permutations):
-            for rank, width_index in enumerate(permutation):
-                layer_rank_load[layer, permutation_id, rank] = (
-                    widths[width_index] * counts_np[layer, width_index]
-                )
+            for rank, group_index in enumerate(permutation):
+                layer_rank_load[layer, permutation_id, rank] = group_loads[layer, group_index]
 
-    total_load = float(sum(widths[index] * int(counts[:, index].sum()) for index in range(num_widths)))
-    mean_load = total_load / float(num_widths)
+    total_load = float(group_loads.sum())
+    mean_load = total_load / float(ep_size)
 
-    constraint_rows = num_layers + 2 * num_widths
+    constraint_rows = num_layers + 2 * ep_size
     matrix = lil_matrix((constraint_rows, num_variables), dtype=np.float64)
     lower = np.full(constraint_rows, -np.inf, dtype=np.float64)
     upper = np.full(constraint_rows, np.inf, dtype=np.float64)
@@ -589,7 +726,7 @@ def _solve_cross_layer_placement_milp(
         upper[row] = 1.0
         row += 1
 
-    for rank in range(num_widths):
+    for rank in range(ep_size):
         for layer in range(num_layers):
             start = layer * num_permutations
             matrix[row, start : start + num_permutations] = layer_rank_load[layer, :, rank]
@@ -608,7 +745,7 @@ def _solve_cross_layer_placement_milp(
     bounds_upper = np.ones(num_variables, dtype=np.float64)
     bounds_upper[deviation_index] = np.inf
     if fix_first_layer and num_layers > 0:
-        identity_id = permutations.index(tuple(range(num_widths)))
+        identity_id = permutations.index(tuple(range(ep_size)))
         bounds_lower[:num_permutations] = 0.0
         bounds_upper[:num_permutations] = 0.0
         bounds_lower[identity_id] = 1.0
@@ -632,8 +769,9 @@ def _solve_cross_layer_placement_milp(
         )
 
     permutation_ids = []
-    rank_widths = torch.empty((num_layers, num_widths), dtype=torch.int64)
-    tier_to_rank = torch.empty((num_layers, num_widths), dtype=torch.int64)
+    rank_widths = torch.empty_like(widths)
+    group_to_rank = torch.empty_like(counts)
+    rank_group_indices = torch.empty_like(counts)
     for layer in range(num_layers):
         start = layer * num_permutations
         values = result.x[start : start + num_permutations]
@@ -642,23 +780,24 @@ def _solve_cross_layer_placement_milp(
             raise RuntimeError(f"layer {layer} has no integral placement permutation")
         permutation_ids.append(permutation_id)
         permutation = permutations[permutation_id]
-        for rank, width_index in enumerate(permutation):
-            rank_widths[layer, rank] = widths[width_index]
-            tier_to_rank[layer, width_index] = rank
+        for rank, group_index in enumerate(permutation):
+            rank_group_indices[layer, rank] = group_index
+            rank_widths[layer, rank] = widths[layer, group_index]
+            group_to_rank[layer, group_index] = rank
 
-    rank_loads = torch.zeros(num_widths, dtype=torch.int64)
+    rank_loads = torch.zeros(ep_size, dtype=torch.int64)
     for layer in range(num_layers):
-        for rank in range(num_widths):
-            width = int(rank_widths[layer, rank].item())
-            width_index = widths.index(width)
-            rank_loads[rank] += width * counts[layer, width_index]
+        for rank in range(ep_size):
+            group_index = int(rank_group_indices[layer, rank])
+            rank_loads[rank] += counts[layer, group_index] * widths[layer, group_index]
 
     mean = float(rank_loads.double().mean().item())
     max_deviation = float((rank_loads.double() - mean).abs().max().item())
     relative_deviation = max_deviation / mean if mean > 0.0 else 0.0
     return {
         "rank_widths": rank_widths,
-        "tier_to_rank": tier_to_rank,
+        "group_to_rank": group_to_rank,
+        "rank_group_indices": rank_group_indices,
         "rank_weight_loads": rank_loads,
         "mean_rank_weight_load": mean,
         "max_rank_weight_deviation": max_deviation,
@@ -672,9 +811,148 @@ def _solve_cross_layer_placement_milp(
     }
 
 
+def _solve_cross_layer_placement_milp(
+    width_counts: torch.Tensor,
+    active_widths: Sequence[int],
+    *,
+    tolerance: float = 0.01,
+    fix_first_layer: bool = True,
+) -> Dict[str, Any]:
+    """Assign active width groups to EP ranks with an exact placement MILP."""
+    if not isinstance(width_counts, torch.Tensor) or width_counts.ndim != 2:
+        raise ValueError("width_counts must be a [L, num_active_widths] tensor")
+    counts = width_counts.detach().cpu().to(torch.int64)
+    widths = tuple(int(width) for width in active_widths)
+    num_layers, num_widths = counts.shape
+    if num_widths != len(widths):
+        raise ValueError(
+            f"width_counts has {num_widths} columns but active_widths has {len(widths)}"
+        )
+    if bool((counts <= 0).any()):
+        raise ValueError("every active width tier must contain at least one expert per layer")
+    result = _solve_placement_groups_milp(
+        counts,
+        torch.tensor(widths, dtype=torch.int64).expand(num_layers, -1),
+        tolerance=tolerance,
+        fix_first_layer=fix_first_layer,
+    )
+    result["tier_to_rank"] = result["group_to_rank"]
+    return result
+
+
 def _placement_objective(rank_loads: np.ndarray) -> tuple[float, float]:
     centered = rank_loads - rank_loads.mean()
     return float(np.abs(centered).max()), float(np.dot(centered, centered))
+
+
+def _solve_placement_groups_greedy(
+    group_counts: torch.Tensor,
+    group_widths: torch.Tensor,
+    *,
+    tolerance: float = 0.01,
+    fix_first_layer: bool = True,
+    max_local_search_passes: int = 100,
+) -> Dict[str, Any]:
+    """Balance per-layer placement groups across a fixed number of EP ranks."""
+    counts = group_counts.detach().cpu().to(torch.int64)
+    widths = group_widths.detach().cpu().to(torch.int64)
+    if counts.ndim != 2 or widths.shape != counts.shape:
+        raise ValueError("group_counts and group_widths must have the same 2D shape")
+    if bool((counts <= 0).any()) or bool((widths <= 0).any()):
+        raise ValueError("every placement group must have positive count and width")
+    if tolerance < 0.0:
+        raise ValueError(f"tolerance must be non-negative, got {tolerance}")
+    if max_local_search_passes < 0:
+        raise ValueError(
+            "max_local_search_passes must be non-negative, got "
+            f"{max_local_search_passes}"
+        )
+
+    num_layers, ep_size = counts.shape
+    permutations = tuple(itertools.permutations(range(ep_size)))
+    identity_id = permutations.index(tuple(range(ep_size)))
+    group_loads = (counts * widths).numpy()
+    layer_rank_load = np.stack(
+        [group_loads[:, permutation] for permutation in permutations], axis=1
+    )
+
+    permutation_ids = np.full(num_layers, -1, dtype=np.int64)
+    rank_loads = np.zeros(ep_size, dtype=np.int64)
+    first_unfixed_layer = 0
+    if fix_first_layer and num_layers > 0:
+        permutation_ids[0] = identity_id
+        rank_loads += layer_rank_load[0, identity_id]
+        first_unfixed_layer = 1
+
+    layer_order = sorted(
+        range(first_unfixed_layer, num_layers),
+        key=lambda layer: (-int(np.ptp(group_loads[layer])), layer),
+    )
+    for layer in layer_order:
+        best_id = min(
+            range(len(permutations)),
+            key=lambda permutation_id: (
+                *_placement_objective(rank_loads + layer_rank_load[layer, permutation_id]),
+                permutation_id,
+            ),
+        )
+        permutation_ids[layer] = best_id
+        rank_loads += layer_rank_load[layer, best_id]
+
+    local_search_passes = 0
+    for _ in range(max_local_search_passes):
+        improved = False
+        for layer in range(first_unfixed_layer, num_layers):
+            current_id = int(permutation_ids[layer])
+            base_loads = rank_loads - layer_rank_load[layer, current_id]
+            best_id = current_id
+            best_objective = _placement_objective(rank_loads)
+            for candidate_id in range(len(permutations)):
+                candidate_objective = _placement_objective(
+                    base_loads + layer_rank_load[layer, candidate_id]
+                )
+                if candidate_objective < best_objective:
+                    best_id = candidate_id
+                    best_objective = candidate_objective
+            if best_id != current_id:
+                rank_loads = base_loads + layer_rank_load[layer, best_id]
+                permutation_ids[layer] = best_id
+                improved = True
+        local_search_passes += 1
+        if not improved:
+            break
+
+    rank_widths = torch.empty_like(widths)
+    group_to_rank = torch.empty_like(counts)
+    rank_group_indices = torch.empty_like(counts)
+    for layer, permutation_id in enumerate(permutation_ids.tolist()):
+        permutation = permutations[permutation_id]
+        for rank, group_index in enumerate(permutation):
+            rank_group_indices[layer, rank] = group_index
+            rank_widths[layer, rank] = widths[layer, group_index]
+            group_to_rank[layer, group_index] = rank
+
+    rank_loads_tensor = torch.from_numpy(rank_loads.copy())
+    mean = float(rank_loads_tensor.double().mean().item())
+    max_deviation = float((rank_loads_tensor.double() - mean).abs().max().item())
+    relative_deviation = max_deviation / mean if mean > 0.0 else 0.0
+    return {
+        "rank_widths": rank_widths,
+        "group_to_rank": group_to_rank,
+        "rank_group_indices": rank_group_indices,
+        "rank_weight_loads": rank_loads_tensor,
+        "mean_rank_weight_load": mean,
+        "max_rank_weight_deviation": max_deviation,
+        "relative_max_rank_weight_deviation": relative_deviation,
+        "tolerance": float(tolerance),
+        "tolerance_satisfied": relative_deviation <= float(tolerance) + 1e-12,
+        "permutation_ids": torch.from_numpy(permutation_ids.copy()),
+        "solver_status": 0,
+        "solver_message": "greedy placement-group assignment with coordinate-descent local search",
+        "solver_objective": max_deviation,
+        "placement_method": "greedy",
+        "local_search_passes": local_search_passes,
+    }
 
 
 def _solve_cross_layer_placement_greedy(
@@ -707,99 +985,16 @@ def _solve_cross_layer_placement_greedy(
     if bool((counts <= 0).any()):
         raise ValueError("every active width tier must contain at least one expert per layer")
 
-    permutations = tuple(itertools.permutations(range(num_widths)))
-    identity_id = permutations.index(tuple(range(num_widths)))
-    counts_np = counts.numpy()
-    widths_np = np.asarray(widths, dtype=np.int64)
-    tier_loads = counts_np * widths_np[None, :]
-    layer_rank_load = np.stack(
-        [tier_loads[:, permutation] for permutation in permutations], axis=1
+    result = _solve_placement_groups_greedy(
+        counts,
+        torch.tensor(widths, dtype=torch.int64).expand(num_layers, -1),
+        tolerance=tolerance,
+        fix_first_layer=fix_first_layer,
+        max_local_search_passes=max_local_search_passes,
     )
-
-    permutation_ids = np.full(num_layers, -1, dtype=np.int64)
-    rank_loads = np.zeros(num_widths, dtype=np.int64)
-    first_unfixed_layer = 0
-    if fix_first_layer and num_layers > 0:
-        permutation_ids[0] = identity_id
-        rank_loads += layer_rank_load[0, identity_id]
-        first_unfixed_layer = 1
-
-    # Place the layers with the largest within-layer load spread first.  At
-    # each step, balance the partial cumulative load; objective ties use the
-    # squared deviation and then permutation ID for deterministic output.
-    layer_order = sorted(
-        range(first_unfixed_layer, num_layers),
-        key=lambda layer: (-int(np.ptp(tier_loads[layer])), layer),
-    )
-    for layer in layer_order:
-        best_id = min(
-            range(len(permutations)),
-            key=lambda permutation_id: (
-                *_placement_objective(
-                    rank_loads + layer_rank_load[layer, permutation_id]
-                ),
-                permutation_id,
-            ),
-        )
-        permutation_ids[layer] = best_id
-        rank_loads += layer_rank_load[layer, best_id]
-
-    # Coordinate descent fixes choices that were locally good during the
-    # partial-load pass but are suboptimal after all layers have been placed.
-    local_search_passes = 0
-    for _ in range(max_local_search_passes):
-        improved = False
-        for layer in range(first_unfixed_layer, num_layers):
-            current_id = int(permutation_ids[layer])
-            base_loads = rank_loads - layer_rank_load[layer, current_id]
-            current_objective = _placement_objective(rank_loads)
-            best_id = current_id
-            best_objective = current_objective
-            for candidate_id in range(len(permutations)):
-                candidate_objective = _placement_objective(
-                    base_loads + layer_rank_load[layer, candidate_id]
-                )
-                if candidate_objective < best_objective:
-                    best_id = candidate_id
-                    best_objective = candidate_objective
-            if best_id != current_id:
-                rank_loads = base_loads + layer_rank_load[layer, best_id]
-                permutation_ids[layer] = best_id
-                improved = True
-        local_search_passes += 1
-        if not improved:
-            break
-
-    rank_widths = torch.empty((num_layers, num_widths), dtype=torch.int64)
-    tier_to_rank = torch.empty((num_layers, num_widths), dtype=torch.int64)
-    for layer, permutation_id in enumerate(permutation_ids.tolist()):
-        permutation = permutations[permutation_id]
-        for rank, width_index in enumerate(permutation):
-            rank_widths[layer, rank] = widths[width_index]
-            tier_to_rank[layer, width_index] = rank
-
-    rank_loads_tensor = torch.from_numpy(rank_loads.copy())
-    mean = float(rank_loads_tensor.double().mean().item())
-    max_deviation = float(
-        (rank_loads_tensor.double() - mean).abs().max().item()
-    )
-    relative_deviation = max_deviation / mean if mean > 0.0 else 0.0
-    return {
-        "rank_widths": rank_widths,
-        "tier_to_rank": tier_to_rank,
-        "rank_weight_loads": rank_loads_tensor,
-        "mean_rank_weight_load": mean,
-        "max_rank_weight_deviation": max_deviation,
-        "relative_max_rank_weight_deviation": relative_deviation,
-        "tolerance": float(tolerance),
-        "tolerance_satisfied": relative_deviation <= float(tolerance) + 1e-12,
-        "permutation_ids": torch.from_numpy(permutation_ids.copy()),
-        "solver_status": 0,
-        "solver_message": "greedy placement with coordinate-descent local search",
-        "solver_objective": max_deviation,
-        "placement_method": "greedy",
-        "local_search_passes": local_search_passes,
-    }
+    result["tier_to_rank"] = result["group_to_rank"]
+    result["solver_message"] = "greedy placement with coordinate-descent local search"
+    return result
 
 
 def solve_cross_layer_placement(
@@ -842,8 +1037,9 @@ def solve_cross_layer_placement(
 def _build_masks_and_mappings(
     expert_widths: torch.Tensor,
     sorted_indices: torch.Tensor,
-    active_widths: tuple[int, ...],
-    tier_to_rank: torch.Tensor,
+    expert_to_group: torch.Tensor,
+    group_to_rank: torch.Tensor,
+    ep_size: int,
 ) -> Dict[str, Any]:
     num_layers, num_experts = expert_widths.shape
     intermediate_size = sorted_indices.shape[-1]
@@ -855,18 +1051,17 @@ def _build_masks_and_mappings(
     local_to_global: list[list[list[int]]] = []
 
     for layer in range(num_layers):
-        width_to_rank = {
-            width: int(tier_to_rank[layer, width_index].item())
-            for width_index, width in enumerate(active_widths)
-        }
-        layer_local_to_global: list[list[int]] = [list() for _ in active_widths]
+        layer_local_to_global: list[list[int]] = [list() for _ in range(ep_size)]
         for expert in range(num_experts):
             width = int(expert_widths[layer, expert].item())
             if width <= 0:
                 continue
             chosen = sorted_indices[layer, expert, :width]
             masks[layer, expert].index_fill_(0, chosen, True)
-            rank = width_to_rank[width]
+            group = int(expert_to_group[layer, expert].item())
+            if group < 0:
+                raise RuntimeError(f"active expert {expert} in layer {layer} has no placement group")
+            rank = int(group_to_rank[layer, group].item())
             local_id = len(layer_local_to_global[rank])
             expert_to_rank[layer, expert] = rank
             expert_to_local_id[layer, expert] = local_id
@@ -879,6 +1074,80 @@ def _build_masks_and_mappings(
         "expert_to_local_id": expert_to_local_id,
         "local_to_global": local_to_global,
     }
+
+
+def _finalize_ep4_structure(
+    expert_widths: torch.Tensor,
+    raw_counts: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    active_widths: tuple[int, ...],
+    *,
+    ep_size: int,
+    sparse_tier_max_experts: int,
+    placement_tolerance: float,
+    fix_first_layer_placement: bool,
+    placement_method: str,
+    placement_local_search_passes: int,
+) -> tuple[torch.Tensor, int, list[dict[str, Any]], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    expert_widths, tier_merges = _merge_sparse_width_tiers(
+        expert_widths,
+        raw_counts,
+        active_widths,
+        max_experts=sparse_tier_max_experts,
+    )
+    actual_keep_channels = int(expert_widths.sum().item())
+    groups = _build_layer_placement_groups(
+        expert_widths,
+        active_widths,
+        ep_size=ep_size,
+    )
+    normalized_method = placement_method.lower()
+    if normalized_method == "greedy":
+        placement = _solve_placement_groups_greedy(
+            groups["placement_group_counts"],
+            groups["placement_group_widths"],
+            tolerance=placement_tolerance,
+            fix_first_layer=fix_first_layer_placement,
+            max_local_search_passes=placement_local_search_passes,
+        )
+    elif normalized_method == "milp":
+        placement = _solve_placement_groups_milp(
+            groups["placement_group_counts"],
+            groups["placement_group_widths"],
+            tolerance=placement_tolerance,
+            fix_first_layer=fix_first_layer_placement,
+        )
+        placement["placement_method"] = "milp"
+    else:
+        raise ValueError(
+            f"unsupported placement method {placement_method!r}; expected 'greedy' or 'milp'"
+        )
+
+    tier_to_rank = torch.full(
+        (expert_widths.shape[0], len(active_widths)), -1, dtype=torch.int64
+    )
+    tier_to_ranks: list[list[list[int]]] = []
+    for layer in range(expert_widths.shape[0]):
+        layer_ranks: list[list[int]] = []
+        for tier_index, width in enumerate(active_widths):
+            ranks = torch.where(placement["rank_widths"][layer] == width)[0].tolist()
+            if bool((expert_widths[layer] == width).any()) and not ranks:
+                raise RuntimeError(f"layer {layer} width {width} has no assigned EP rank")
+            if ranks:
+                tier_to_rank[layer, tier_index] = ranks[0]
+            layer_ranks.append(ranks)
+        tier_to_ranks.append(layer_ranks)
+    placement["tier_to_rank"] = tier_to_rank
+    placement["tier_to_ranks"] = tier_to_ranks
+
+    mapping = _build_masks_and_mappings(
+        expert_widths=expert_widths,
+        sorted_indices=sorted_indices,
+        expert_to_group=groups["expert_to_placement_group"],
+        group_to_rank=placement["group_to_rank"],
+        ep_size=ep_size,
+    )
+    return expert_widths, actual_keep_channels, tier_merges, groups, placement, mapping
 
 
 @torch.no_grad()
@@ -899,6 +1168,7 @@ def plan_ep4_intplan(
     binary_search_max_iter: int = 32,
     fix_first_layer_placement: bool = True,
     balance_tier_counts: bool = False,
+    sparse_tier_max_experts: int = 5,
     verbose: bool = False,
 ) -> Dict[str, Any]:
     """Build an EP4 width and placement plan.
@@ -922,6 +1192,9 @@ def plan_ep4_intplan(
         balance_tier_counts: Force the four active width tiers to contain as
             close to the same number of experts as the exact budget permits.
             This is useful for performance-only fused-MoE experiments.
+        sparse_tier_max_experts: Merge a nonzero per-layer width tier when it
+            contains at most this many experts. Set to zero to retain the old
+            mandatory-four-tier behavior.
 
     Returns:
         A dictionary containing raw/quantized channel counts, masks, per-layer
@@ -972,7 +1245,7 @@ def plan_ep4_intplan(
     continuous_target_keep = (1.0 - float(prune_ratio)) * total_channels
     target_keep_units = int(round(continuous_target_keep / unit))
     target_keep_channels = target_keep_units * unit
-    expert_widths, actual_keep_channels = _quantize_widths_to_budget(
+    expert_widths, _ = _quantize_widths_to_budget(
         raw_counts=raw_counts,
         sorted_scores=sorted_scores,
         layer_weights=layer_weights,
@@ -981,6 +1254,26 @@ def plan_ep4_intplan(
         unit=unit,
         target_keep_channels=target_keep_channels,
         balance_tier_counts=balance_tier_counts,
+    )
+
+    (
+        expert_widths,
+        actual_keep_channels,
+        tier_merges,
+        placement_groups,
+        placement,
+        mapping,
+    ) = _finalize_ep4_structure(
+        expert_widths,
+        raw_counts,
+        sorted_indices,
+        active_widths,
+        ep_size=ep_size,
+        sparse_tier_max_experts=sparse_tier_max_experts,
+        placement_tolerance=placement_tolerance,
+        fix_first_layer_placement=fix_first_layer_placement,
+        placement_method=placement_method,
+        placement_local_search_passes=placement_local_search_passes,
     )
 
     all_widths = tuple(sorted(normalized_widths, reverse=True))
@@ -995,14 +1288,6 @@ def plan_ep4_intplan(
     active_columns = [all_widths.index(width) for width in active_widths]
     active_width_counts = width_counts[:, active_columns]
 
-    placement = solve_cross_layer_placement(
-        width_counts=active_width_counts,
-        active_widths=active_widths,
-        tolerance=placement_tolerance,
-        fix_first_layer=fix_first_layer_placement,
-        method=placement_method,
-        max_local_search_passes=placement_local_search_passes,
-    )
     if strict_placement_tolerance and not placement["tolerance_satisfied"]:
         raise RuntimeError(
             "best cross-layer placement exceeds tolerance: "
@@ -1010,12 +1295,6 @@ def plan_ep4_intplan(
             f"tolerance={placement_tolerance:.6f}"
         )
 
-    mapping = _build_masks_and_mappings(
-        expert_widths=expert_widths,
-        sorted_indices=sorted_indices,
-        active_widths=active_widths,
-        tier_to_rank=placement["tier_to_rank"],
-    )
     actual_prune_ratio = 1.0 - float(actual_keep_channels) / float(total_channels)
 
     result: Dict[str, Any] = {
@@ -1039,7 +1318,11 @@ def plan_ep4_intplan(
         "layer_sensitivity_weights": layer_weights,
         "expert_sensitivity_weights": expert_weights,
         "tier_count_balance": bool(balance_tier_counts),
+        "sparse_tier_max_experts": int(sparse_tier_max_experts),
+        "sparse_tier_merges": tier_merges,
+        "post_merge_budget_delta": int(actual_keep_channels - target_keep_channels),
     }
+    result.update(placement_groups)
     result.update(placement)
     result.update(mapping)
 
@@ -1073,6 +1356,7 @@ def plan_ep4_from_masks(
     layer_smooth_fn: str = "sqrt",
     fix_first_layer_placement: bool = True,
     balance_tier_counts: bool = False,
+    sparse_tier_max_experts: int = 5,
     verbose: bool = False,
 ) -> Dict[str, Any]:
     """Quantize an existing pruning mask into an executable EP4 plan.
@@ -1132,7 +1416,7 @@ def plan_ep4_from_masks(
     continuous_target_keep = (1.0 - float(prune_ratio)) * total_channels
     target_keep_units = int(round(continuous_target_keep / unit))
     target_keep_channels = target_keep_units * unit
-    expert_widths, actual_keep_channels = _quantize_widths_to_budget(
+    expert_widths, _ = _quantize_widths_to_budget(
         raw_counts=raw_counts,
         sorted_scores=sorted_scores,
         layer_weights=layer_weights,
@@ -1141,6 +1425,25 @@ def plan_ep4_from_masks(
         unit=unit,
         target_keep_channels=target_keep_channels,
         balance_tier_counts=balance_tier_counts,
+    )
+    (
+        expert_widths,
+        actual_keep_channels,
+        tier_merges,
+        placement_groups,
+        placement,
+        mapping,
+    ) = _finalize_ep4_structure(
+        expert_widths,
+        raw_counts,
+        sorted_indices,
+        active_widths,
+        ep_size=ep_size,
+        sparse_tier_max_experts=sparse_tier_max_experts,
+        placement_tolerance=placement_tolerance,
+        fix_first_layer_placement=fix_first_layer_placement,
+        placement_method=placement_method,
+        placement_local_search_passes=placement_local_search_passes,
     )
 
     all_widths = tuple(sorted(normalized_widths, reverse=True))
@@ -1154,14 +1457,6 @@ def plan_ep4_from_masks(
     ).to(torch.int64)
     active_columns = [all_widths.index(width) for width in active_widths]
     active_width_counts = width_counts[:, active_columns]
-    placement = solve_cross_layer_placement(
-        width_counts=active_width_counts,
-        active_widths=active_widths,
-        tolerance=placement_tolerance,
-        fix_first_layer=fix_first_layer_placement,
-        method=placement_method,
-        max_local_search_passes=placement_local_search_passes,
-    )
     if strict_placement_tolerance and not placement["tolerance_satisfied"]:
         raise RuntimeError(
             "best cross-layer placement exceeds tolerance: "
@@ -1169,12 +1464,6 @@ def plan_ep4_from_masks(
             f"tolerance={placement_tolerance:.6f}"
         )
 
-    mapping = _build_masks_and_mappings(
-        expert_widths=expert_widths,
-        sorted_indices=sorted_indices,
-        active_widths=active_widths,
-        tier_to_rank=placement["tier_to_rank"],
-    )
     actual_prune_ratio = 1.0 - float(actual_keep_channels) / float(total_channels)
     result: Dict[str, Any] = {
         "plan_source": "maes_intermediate_masks",
@@ -1195,7 +1484,11 @@ def plan_ep4_from_masks(
         "layer_sensitivity_weights": layer_weights,
         "expert_sensitivity_weights": expert_weights,
         "tier_count_balance": bool(balance_tier_counts),
+        "sparse_tier_max_experts": int(sparse_tier_max_experts),
+        "sparse_tier_merges": tier_merges,
+        "post_merge_budget_delta": int(actual_keep_channels - target_keep_channels),
     }
+    result.update(placement_groups)
     result.update(placement)
     result.update(mapping)
     if verbose:
