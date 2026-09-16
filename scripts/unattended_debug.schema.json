@@ -1,0 +1,1 @@
+{"type":"object","additionalProperties":false,"properties":{"status":{"type":"string","enum":["resumed","failed","quota_wait","resource_wait","permission_blocked","attention"]},"summary":{"type":"string"}},"required":["status","summary"]}

@@ -143,6 +143,52 @@ def patch_qwen_fused_experts_forward(block: nn.Module):
     return experts, original
 
 
+def patch_internvl_qwen3_moe_forward(block: nn.Module):
+    """Keep native Qwen3-MoE routing, recording expert-local calibration masks."""
+    mlp = getattr(block, "mlp", None)
+    if type(mlp).__name__ != "Qwen3MoeSparseMoeBlock":
+        return None
+    if not isinstance(mlp.experts, nn.ModuleList):
+        raise TypeError("Unsupported InternVL Qwen3-MoE expert layout")
+    original = mlp.forward
+
+    def forward(self, hidden_states):
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, hidden_dim)
+        masks = {}
+        for field in ("moe_text_mask", "moe_media_mask", "moe_score_mask"):
+            value = getattr(self, field, None)
+            if not isinstance(value, torch.Tensor) or value.numel() != hidden_states.shape[0]:
+                raise RuntimeError(f"InternVL calibration requires aligned {field}")
+            masks[field] = value.to(device=hidden_states.device, dtype=torch.bool).reshape(-1)
+        router_logits = self.gate(hidden_states)
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        if self.norm_topk_prob:
+            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(hidden_states.dtype)
+        final_hidden_states = torch.zeros_like(hidden_states)
+        expert_mask = F.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+        for expert in self.experts:
+            for name in ("saved_text_mask", "saved_visual_mask", "saved_score_mask", "saved_router_weights"):
+                setattr(expert, name, None)
+        for expert_tensor in torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero():
+            eid = int(expert_tensor.item())
+            position, token_indices = torch.where(expert_mask[eid])
+            expert = self.experts[eid]
+            expert.saved_text_mask = masks["moe_text_mask"][token_indices]
+            expert.saved_visual_mask = masks["moe_media_mask"][token_indices]
+            expert.saved_score_mask = masks["moe_score_mask"][token_indices]
+            expert.saved_router_weights = routing_weights[token_indices, position]
+            current = hidden_states[None, token_indices].reshape(-1, hidden_dim)
+            output = expert(current) * routing_weights[token_indices, position, None]
+            final_hidden_states.index_add_(0, token_indices, output.to(hidden_states.dtype))
+        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim), router_logits
+
+    mlp.forward = types.MethodType(forward, mlp)
+    return mlp, original
+
+
 def patch_grad_enabled_kimi_moe_infer(block: nn.Module, layer_idx: int):
     mlp = getattr(block, "mlp", None)
     if mlp is None or not hasattr(mlp, "moe_infer"):

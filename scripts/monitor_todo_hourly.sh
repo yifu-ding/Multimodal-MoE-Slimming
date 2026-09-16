@@ -8,8 +8,11 @@ INTERVAL_SECONDS="${INTERVAL_SECONDS:-1800}"
 HEARTBEAT_WARNING_SECONDS="${HEARTBEAT_WARNING_SECONDS:-1800}"
 ALERT_STATE_FILE="${REPO_ROOT}/results/todo_monitor_alert_state"
 RECOVERY_STATE_FILE="${REPO_ROOT}/results/todo_monitor_recovery_state"
+PROGRESS_STATE_FILE="${REPO_ROOT}/results/todo_monitor_progress_state"
 RECOVERY_LOG="${REPO_ROOT}/results/todo_recovery_wrapper.log"
-AUTO_RECOVER="${AUTO_RECOVER:-1}"
+# Recovery requires a diagnosed cause, a scoped fix and validation. The shell
+# monitor cannot perform that reasoning; never blindly relaunch the campaign.
+AUTO_RECOVER=0
 RESTART_COOLDOWN_SECONDS="${RESTART_COOLDOWN_SECONDS:-1800}"
 MAX_CONSECUTIVE_RESTARTS="${MAX_CONSECUTIVE_RESTARTS:-3}"
 RECOVERY_SESSION="maes-todo-ours"
@@ -159,7 +162,7 @@ emit_warning_once() {
 
     set_alert_state "${key}"
     printf '[%s CST] WARNING: %s\n' "${now}" "${message}" >> "${LOG}"
-    printf '\n> [!WARNING]\n> **自动化执行流水线需要关注（%s CST）**  \n> %s\n\n' \
+    printf '\n> [!WARNING]\n> **ATTENTION：自动化执行流水线需要关注（%s CST）**  \n> %s\n\n' \
         "${now}" "${message}" >> "${REPORT}"
 }
 
@@ -218,6 +221,8 @@ artifact_state() {
     printf 'Kimi p30=%s/%s, Judge=%s; InternVL Scores=%s, Plans=%s, p30=%s/%s, Judge=%s' \
         "${kimi_count}" "${#EXPECTED_TASKS[@]}" "${kimi_judge}" \
         "${scores}" "${plans}" "${internvl_count}" "${#EXPECTED_TASKS[@]}" "${internvl_judge}"
+    printf '; '
+    python "${REPO_ROOT}/scripts/ours_campaign_state.py" summary
 }
 
 campaign_has_remaining_work() {
@@ -231,6 +236,7 @@ campaign_has_remaining_work() {
     [[ -s "${INTERNVL_P50_PLAN}" ]] || return 0
     (( internvl_count < ${#EXPECTED_TASKS[@]} )) && return 0
     judge_is_complete "${INTERNVL_OURS_RUN}" || return 0
+    python "${REPO_ROOT}/scripts/ours_campaign_state.py" check >/dev/null || return 0
     return 1
 }
 
@@ -259,11 +265,26 @@ write_recovery_state() {
 }
 
 mark_pipeline_healthy() {
-    local recovery_state attempts last_restart
+    local recovery_state attempts last_restart progress previous=0 path run
+    progress=$(( $(completed_task_count "${KIMI_OURS_RUN}") + $(completed_task_count "${INTERNVL_OURS_RUN}") ))
+    for path in "${INTERNVL_SCORES}" "${INTERNVL_P30_PLAN}" "${INTERNVL_P50_PLAN}"; do
+        [[ -s "${path}" ]] && progress=$(( progress + 1 ))
+    done
+    for run in "${KIMI_OURS_RUN}" "${INTERNVL_OURS_RUN}"; do
+        judge_is_complete "${run}" && progress=$(( progress + 1 ))
+    done
+    if [[ ! -r "${PROGRESS_STATE_FILE}" ]]; then
+        printf '%s\n' "${progress}" > "${PROGRESS_STATE_FILE}"
+        return 0
+    fi
+    read -r previous < "${PROGRESS_STATE_FILE}" || true
+    [[ "${previous}" =~ ^[0-9]+$ ]] || previous=0
+    (( progress > previous )) || return 0
+    printf '%s\n' "${progress}" > "${PROGRESS_STATE_FILE}"
     recovery_state="$(read_recovery_state)"
     read -r attempts last_restart <<< "${recovery_state}"
     if (( attempts > 0 )); then
-        emit_recovery "恢复后的流水线已持续运行到下一次巡检，连续失败计数已清零；$(artifact_state)。"
+        emit_recovery "检测到新增完成产物（${previous} -> ${progress}），连续无进展恢复计数已清零；$(artifact_state)。"
         write_recovery_state 0 0
     fi
 }
@@ -278,7 +299,7 @@ restart_current_campaign() {
 
     if (( attempts >= MAX_CONSECUTIVE_RESTARTS )); then
         emit_warning_once recovery-limit \
-            "自动恢复已连续尝试 ${attempts} 次，已停止重复拉起但巡检仍保持运行；当前产物：${state}。需要人工 debug results/todo_recovery_wrapper.log。"
+            "自动恢复已连续尝试 ${attempts} 次且无新增完成产物，已停止重复拉起但巡检仍保持运行；当前产物：${state}。请检查 results/todo_recovery_wrapper.log、results/todo_ours.log、results/todo_scores.log 和对应任务 status/*.failed，定位并验证修复后再恢复。"
         return 1
     fi
     if (( last_restart > 0 && since_restart < RESTART_COOLDOWN_SECONDS )); then
@@ -307,18 +328,24 @@ restart_current_campaign() {
 }
 
 handle_pipeline_stopped() {
-    local state previous=""
+    local state previous="" debug_status
+    debug_status="无人值守 Debug 监督会话未运行，等待诊断；巡检继续。"
+    if tmux has-session -t maes-todo-debug 2>/dev/null; then
+        debug_status="无人值守 Debug 已接入，状态及证据见 artifacts/unattended-debug/；如达到限制则 ATTENTION，巡检继续。"
+    fi
     state="$(artifact_state)"
     [[ -r "${ALERT_STATE_FILE}" ]] && previous="$(<"${ALERT_STATE_FILE}")"
     if ! campaign_has_remaining_work; then
-        emit_warning_once campaign-complete \
-            "当前 Kimi/InternVL p30 链路没有未完成产物，不再自动拉起；巡检仍保持运行。${state}。p50、测速和对比方法未被本监督器自动授权。"
+        if [[ "${previous}" != campaign-complete ]]; then
+            printf '\n> [!IMPORTANT]\n> DONE：InternVL p30 及三个模型 p50 benchmark/Judge 产物检查通过（%s CST）；巡检仍保持运行。%s。\n' "$(date '+%F %H:%M')" "${state}" >> "${REPORT}"
+            set_alert_state campaign-complete
+        fi
         return 0
     fi
 
     if [[ "${previous}" == "healthy" || "${previous}" == "recovering" || -z "${previous}" ]]; then
         emit_warning_once pipeline-stopped \
-            "自动化执行流水线已停止，但检查真实产物后仍有未完成项：${state}。监督器将按 GPU 空闲、冷却和失败次数规则自动续跑。"
+            "自动化执行流水线已停止，但检查真实产物后仍有未完成项：${state}。禁止原命令直接重跑：先检查日志、记录原因、修复、验证，再恢复未完成项；连续 3 轮 Debug 后恢复仍无进展则停止尝试。${debug_status}"
     fi
     if [[ "${AUTO_RECOVER}" == "1" ]]; then
         restart_current_campaign || true
@@ -344,11 +371,28 @@ record_snapshot() {
     now_epoch="$(date +%s)"
     stage="$(active_stage)"
     sessions="$(session_list)"
-    heartbeat="$(latest_heartbeat)"
+    heartbeat=""
+    if [[ "${stage}" != 'Scores/EP4 Plans' ]]; then
+        heartbeat="$(latest_heartbeat)"
+    fi
     state="${stage} 阶段运行中"
     detail="sessions=${sessions}"
 
-    if [[ -n "${heartbeat}" ]]; then
+    if [[ "${stage}" == 'Scores/EP4 Plans' ]]; then
+        state="$(python "${REPO_ROOT}/scripts/internvl_scores_progress.py" 2>&1)"
+        detail+="; stage=${stage}; source=storage/scores/internvl3_5-30b-a3b-mixed-512/logs/shard*.log"
+        if [[ "${state}" == *WARNING* ]]; then
+            warning_key="scores-stalled"
+            warning_message="${state}；请检查 InternVL Scores shard 日志，禁止原样重试。"
+        fi
+    elif [[ -f "${REPO_ROOT}/artifacts/ours-active-stage.json" ]] && tmux has-session -t maes-todo-ours 2>/dev/null; then
+        state="$(python "${REPO_ROOT}/scripts/ours_active_progress.py" 2>&1)"
+        detail+="; stage=${stage}; source=artifacts/ours-active-stage.json"
+        if [[ "${state}" == *WARNING* ]]; then
+            warning_key="ours-stalled"
+            warning_message="${state}；请检查当前模型/剪枝率日志。"
+        fi
+    elif [[ -n "${heartbeat}" ]]; then
         heartbeat_epoch="${heartbeat%%|*}"
         heartbeat_epoch="${heartbeat_epoch%%.*}"
         heartbeat_path="${heartbeat#*|}"
@@ -428,6 +472,7 @@ record_snapshot() {
     fi
 }
 
+main() {
 mkdir -p "$(dirname "${LOG}")"
 if [[ "${1:-}" == "--status" ]]; then
     artifact_state
@@ -440,18 +485,24 @@ if [[ "${1:-}" == "--status" ]]; then
     exit 0
 fi
 
+mark_pipeline_healthy
 if pipeline_is_active; then
-    mark_pipeline_healthy
     record_snapshot
 else
     handle_pipeline_stopped
 fi
+[[ "${1:-}" == "--once" ]] && return 0
 while true; do
     sleep "${INTERVAL_SECONDS}"
+    mark_pipeline_healthy
     if pipeline_is_active; then
-        mark_pipeline_healthy
         record_snapshot
     else
         handle_pipeline_stopped
     fi
 done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

@@ -13,6 +13,8 @@ RESOURCE_CHECK_SCRIPT="${RESOURCE_CHECK_SCRIPT:?Set RESOURCE_CHECK_SCRIPT.}"
 INTERVAL_SECONDS="${INTERVAL_SECONDS:-5400}"
 COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-1800}"
 MAX_RESTARTS="${MAX_RESTARTS:-3}"
+# Reasoning recovery belongs to an explicitly authorized Debug executor.
+AUTO_RESTART="${AUTO_RESTART:-0}"
 STATE_DIR="${STATE_DIR:-${WORKSPACE}/.automation/supervisor}"
 PIPELINE_LOG="${PIPELINE_LOG:-${WORKSPACE}/.automation/pipeline.log}"
 STATE_FILE="${STATE_DIR}/state.tsv"
@@ -127,6 +129,11 @@ inspect_once() {
     fi
     if (( check_status != 1 )); then
         alert_once invalid-state "Worker is absent and completion state is invalid; ${progress}. Inspect ${COMPLETION_CHECK_SCRIPT} and ${PIPELINE_LOG}."
+        return 0
+    fi
+
+    if [[ "${AUTO_RESTART}" != "1" ]]; then
+        alert_once diagnosis-required "Worker stopped with unfinished work; diagnose, fix and validate before resuming. Automatic shell restart is disabled; use the authorized Debug executor. ${progress}."
         return 0
     fi
 

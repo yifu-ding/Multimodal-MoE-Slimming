@@ -54,8 +54,8 @@ When the worker session disappears:
 
 1. Run the completion checker and inspect concrete outputs.
 2. If complete, record completion and keep the supervisor alive for later TODO changes.
-3. If work remains and resources are available, resume the same idempotent dispatcher.
-4. Apply a cooldown and stop automatic restarts after three consecutive failures with no artifact progress.
+3. If work remains, diagnose the failure, apply a scoped fix and validate it before resuming the same idempotent dispatcher when resources are available. Never rerun an unchanged failed command without evidence that its cause has been resolved.
+4. Apply a cooldown and stop after three consecutive Debug-and-recovery rounds with no newly validated completed artifacts. Log growth, elapsed time and a live process are not artifact progress.
 5. Write an `ATTENTION`/`WARNING` block to the report with the failed stage, evidence paths, restart count, and next action.
 
 Do not automatically kill a live but stale process. Diagnose ownership and logs first. Never compete with unrelated resource users.
@@ -65,6 +65,34 @@ Do not automatically kill a live but stale process. Diagnose ownership and logs 
 For a repeated failure, inspect the smallest relevant log, reproduce with a cheap smoke or one sample, identify the root cause, make a scoped fix, verify it, and resume only unfinished work. Record the cause, fix, validation, and recovery in the report. Skip an irreducible task only when the user authorized skipping or after the configured retry limit, and mark it explicitly rather than presenting the pipeline as complete.
 
 A shell supervisor can restart known commands but cannot reason about a new bug. For unattended reasoning, create a Codex scheduled task at the same 90-minute cadence when that product capability is available. Its prompt should invoke this skill, name the TODO/report paths, request diagnosis of the current blocker, and forbid rerunning completed work. Do not launch recursive `codex exec` agents or grant unattended mutation privileges unless the user explicitly authorizes that execution model.
+
+## Unattended Codex Debug (Explicit Opt-in)
+
+After the user authorizes an independent background Codex executor, use a separate detached supervisor with a single-instance lock and persistent state. Preserve the agreed inspection cadence (MAES currently uses 30 minutes); healthy checks must be shell-only, without invoking Codex. The bundled shell supervisor defaults to monitoring only (`AUTO_RESTART=0`); do not enable blind restarts alongside a reasoning executor.
+
+Only invoke Codex after confirming that the worker has stopped, authorized work remains, and exclusive resources are available. Treat failed status checks as unknown, not as proof of a stopped worker. For live-but-stale workers, report the evidence; do not automatically kill them.
+
+Each round must inspect the latest failure and prior attempts, identify a cause, make a minimal fix, run a small smoke with semantic artifact checks, then resume only unfinished work in detached tmux. Successful exit and finite numbers alone are insufficient: verify expected coverage, meaningful data and downstream loadability. Save diagnosis, changes, validation and recovery evidence in the existing Markdown report and per-round logs.
+
+Persist a pending-round marker before invoking Codex. Count each unsuccessful round once; stop at three consecutive rounds without new validated completed artifacts and mark `ATTENTION`. Reset only on new validated artifacts, not on another launch. Authentication, permission, quota and resource waits are not Debug failures. Corrupt state or unknown executor failures must fail closed, preserve evidence and request attention rather than reset counters. Keep ordinary monitoring independent so it can continue.
+
+Use the current CLI's supported workspace-write and approval controls; do not bypass sandboxing. On CLI versions offering `--approve-for-me`, it already selects workspace-write and must not be combined with `--sandbox`. Scope the prompt to the authorized repository/tasks, preserve existing edits and artifacts, and forbid nested agents, changes to recovery counters/policies, or unrelated operations. Verify CLI compatibility and a small connectivity check before enabling the supervisor; do not claim recovery is proven merely because connectivity passed.
+
+### Included Allowance Only — No Extra Credits
+
+- Invoke Codex using the user's existing ChatGPT login and included allowance (including applicable five-hour and weekly limits). Never enable, purchase or consume extra credits, enable automatic top-ups, or fall back to API-key billing for this workflow.
+- Do not modify billing settings or expose authentication secrets. Remove inherited API-key overrides from the executor environment and require ChatGPT authentication where the installed CLI supports it. This prevents API fallback, **not** use of an existing ChatGPT credit balance.
+- ChatGPT login is not a credits-off switch. Before unattended use, obtain confirmation that account-side credit spending is disabled or verify an actual supported billing restriction. A prompt, a quota snapshot or a guessed CLI setting is not a spending hard limit. If this cannot be established, do not enable unattended inference.
+- When included allowance is exhausted, pause inference, report the wait and resume only after allowance resets. Do not switch billing sources. Unknown quota/authentication errors should stop inference for diagnosis; script-only monitoring may continue.
+
+### Existing MAES Implementation
+
+In the MAES repository, reuse `scripts/unattended_debug.py`, `scripts/unattended_debug_prompt.md`, `scripts/unattended_debug.schema.json` and `tests/test_unattended_debug.py` rather than launching a second dispatcher. These are repository-specific, not bundled portable skill scripts; locate the repository and inspect its paths before using them elsewhere.
+
+- Debug session: `maes-todo-debug`; normal monitor: `maes-todo-hourly`.
+- Report: `docs/自动化执行结果.md`; state and round evidence: `artifacts/unattended-debug/`.
+- `--once` performs a real inspection and can trigger authorized Debug on failure; it is not a dry run. `--preflight` invokes Codex for a small connectivity check and consumes included allowance.
+- Stop only the Debug supervisor with `tmux kill-session -t maes-todo-debug`; keep the experiment worker and normal monitor running. Resolve recorded blockers before explicitly clearing an ATTENTION state.
 
 ## Reporting
 

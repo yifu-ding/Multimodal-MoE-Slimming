@@ -26,6 +26,7 @@ from .helpers.hooks import register_copied_block_hooks, register_teacher_block_h
 from .helpers.patches import (
     patch_grad_enabled_kimi_moe_infer,
     patch_qwen_fused_experts_forward,
+    patch_internvl_qwen3_moe_forward,
 )
 from .helpers.utils import (
     clear_block_saved_tensors,
@@ -295,6 +296,7 @@ def block_forward(
     copied_handles = register_copied_block_hooks(cnt_block)
     moe_infer_state = patch_grad_enabled_kimi_moe_infer(cnt_block, layer_idx=layer_idx)
     fused_expert_state = patch_qwen_fused_experts_forward(cnt_block)
+    internvl_expert_state = patch_internvl_qwen3_moe_forward(cnt_block)
 
     total_loss = 0.0
     total_batches = 0
@@ -483,6 +485,9 @@ def block_forward(
         if fused_expert_state is not None:
             experts, original_forward = fused_expert_state
             experts.forward = original_forward
+        if internvl_expert_state is not None:
+            mlp, original_forward = internvl_expert_state
+            mlp.forward = original_forward
         clear_block_saved_tensors(cnt_block)
 
     if probe_state is not None:

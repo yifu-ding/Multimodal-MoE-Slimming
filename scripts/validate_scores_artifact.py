@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from validate_modality_scores import validate_modality_scores
 
 
 def parse_layer_spec(value: str) -> list[int]:
@@ -91,6 +92,8 @@ def main() -> int:
         "expert_scores": "second_attr",
     }
     try:
+        if "internvl" in str(metadata.get("model_name_or_path", "")).lower():
+            validate_modality_scores(payload, expected_list)
         for outer_key, metric in required_nested.items():
             outer = payload.get(outer_key)
             if not isinstance(outer, dict) or metric not in outer:

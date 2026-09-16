@@ -19,3 +19,5 @@ transformers/
 results/
 wandb/
 vendors/
+artifacts/unattended-debug/
+!scripts/unattended_debug.schema.json
