@@ -5,6 +5,10 @@ from src.generate_mask.ep4_intplan import (
     _build_layer_placement_groups,
     _merge_sparse_width_tiers,
     _quantize_balanced_widths_to_budget,
+    _solve_placement_groups_greedy,
+    _solve_placement_groups_greedy_permutation_reference,
+    _solve_placement_groups_milp,
+    _solve_placement_groups_milp_permutation_reference,
     plan_ep4_from_masks,
     plan_ep4_intplan,
     solve_cross_layer_placement,
@@ -244,3 +248,89 @@ def test_default_plan_allows_duplicate_rank_widths_without_idle_ranks():
     for layer_groups in result["local_to_global"]:
         assert len(layer_groups) == 4
         assert all(layer_group for layer_group in layer_groups)
+
+
+def test_sort_initialization_matches_full_permutation_reference():
+    generator = torch.Generator().manual_seed(29)
+    counts = torch.randint(1, 20, (8, 4), generator=generator)
+    widths = torch.tensor([768, 640, 512, 384]).expand_as(counts)
+
+    sorted_result = _solve_placement_groups_greedy(
+        counts,
+        widths,
+        max_local_search_passes=0,
+    )
+    reference = _solve_placement_groups_greedy_permutation_reference(
+        counts,
+        widths,
+        max_local_search_passes=0,
+    )
+
+    assert sorted_result["rank_weight_spread"] == reference["rank_weight_spread"]
+    assert sorted_result["rank_weight_loads"].equal(reference["rank_weight_loads"])
+
+
+def test_pairwise_and_full_bijection_refinement_are_selectable():
+    counts = torch.tensor(
+        [[3, 2, 12, 2], [14, 7, 11, 1], [14, 6, 4, 2]], dtype=torch.int64
+    )
+    widths = torch.tensor([768, 640, 512, 384]).expand_as(counts)
+
+    pairwise = _solve_placement_groups_greedy(
+        counts,
+        widths,
+        refinement_neighborhood="pairwise_swap",
+    )
+    full = _solve_placement_groups_greedy(
+        counts,
+        widths,
+        refinement_neighborhood="full_bijection",
+    )
+
+    assert pairwise["refinement_neighborhood"] == "pairwise_swap"
+    assert full["refinement_neighborhood"] == "full_bijection"
+    assert full["rank_weight_spread"] <= pairwise["rank_weight_spread"]
+    assert pairwise["initial_rank_weight_spread"] >= pairwise["rank_weight_spread"]
+
+
+def test_assignment_milp_matches_permutation_milp_and_reports_dual_bound():
+    counts = torch.tensor(
+        [[8, 4, 2, 1], [7, 5, 3, 2], [6, 4, 3, 1], [8, 3, 2, 1]],
+        dtype=torch.int64,
+    )
+    widths = torch.tensor([768, 640, 512, 384]).expand_as(counts)
+
+    assignment = _solve_placement_groups_milp(counts, widths)
+    permutation = _solve_placement_groups_milp_permutation_reference(counts, widths)
+
+    assert assignment["solver_optimal"]
+    assert assignment["rank_weight_spread"] == permutation["rank_weight_spread"]
+    assert abs(assignment["mip_dual_bound"] - assignment["solver_objective"]) < 1e-6
+    assert assignment["mip_gap"] == 0.0
+    assert assignment["milp_binary_variables"] == counts.shape[0] * counts.shape[1] ** 2
+
+
+def test_greedy_and_milp_fix_the_same_first_layer():
+    counts = torch.tensor(
+        [[8, 4, 2, 1], [7, 5, 3, 2], [6, 4, 3, 1], [8, 3, 2, 1]],
+        dtype=torch.int64,
+    )
+    widths = torch.tensor([768, 640, 512, 384]).expand_as(counts)
+
+    greedy = _solve_placement_groups_greedy(counts, widths)
+    milp = _solve_placement_groups_milp(counts, widths)
+
+    expected = list(range(counts.shape[1]))
+    assert greedy["rank_group_indices"][0].tolist() == expected
+    assert milp["rank_group_indices"][0].tolist() == expected
+
+
+def test_sort_greedy_supports_sixteen_ranks_without_permutation_enumeration():
+    generator = torch.Generator().manual_seed(31)
+    counts = torch.randint(1, 9, (6, 16), generator=generator)
+    widths = torch.arange(16, 0, -1, dtype=torch.int64).mul(64).expand_as(counts)
+
+    result = _solve_placement_groups_greedy(counts, widths)
+
+    assert result["rank_weight_loads"].shape == (16,)
+    assert sorted(result["rank_group_indices"][0].tolist()) == list(range(16))

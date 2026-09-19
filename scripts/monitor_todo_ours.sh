@@ -9,6 +9,7 @@ OURS_GPU_MEMORY_UTILIZATION="${OURS_GPU_MEMORY_UTILIZATION:-0.85}"
 RUN_P50="${RUN_P50:-0}"
 OURS_MODELS="${OURS_MODELS:-all}"
 ONLY_P50="${ONLY_P50:-0}"
+OURS_CPU_AFFINITY="${OURS_CPU_AFFINITY:-0-23,25,27,29,31}"
 export TASK_MAX_ATTEMPTS=1 JUDGE_MAX_ATTEMPTS=1
 
 append_record() {
@@ -31,7 +32,7 @@ run_stage() {
     shift
     append_record "开始 ${label}。"
     set +e
-    "$@" 2>&1 | tee -a "${AUTOMATION_LOG}"
+    taskset -c "${OURS_CPU_AFFINITY}" "$@" 2>&1 | tee -a "${AUTOMATION_LOG}"
     local status=${PIPESTATUS[0]}
     set -e
     if (( status != 0 )); then
@@ -113,7 +114,7 @@ run_one() {
 
 main() {
 cd "${REPO_ROOT}"
-append_record "Ours 接力器已启动，GPU_MEMORY_UTILIZATION=${OURS_GPU_MEMORY_UTILIZATION}；等待三模型 30%/50% EP4 plans。"
+append_record "Ours 接力器已启动，GPU_MEMORY_UTILIZATION=${OURS_GPU_MEMORY_UTILIZATION}，CPU_AFFINITY=${OURS_CPU_AFFINITY}；等待三模型 30%/50% EP4 plans。"
 while tmux has-session -t maes-todo-scores 2>/dev/null; do
     sleep 60
 done

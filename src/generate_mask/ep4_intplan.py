@@ -7,9 +7,9 @@ The planner deliberately keeps the expensive decision out of a global
    channel budget first across layers and then across experts in each layer.
 2. Quantize those per-expert counts to four active widths plus zero while
    preserving the nearest globally reachable pruning budget.
-3. Assign each layer's four active widths to EP ranks by enumerating its 24
-   permutations.  A greedy pass plus local search balances cumulative rank
-   load; an exact MILP remains available as an offline reference.
+3. Assign each layer's active groups to EP ranks with the sorting-based greedy
+   initialization and pairwise-swap refinement from Algorithm 2.  An exact
+   assignment MILP remains available as an offline reference.
 
 All tensors returned by this module are CPU tensors.  Width zero means that the
 global expert remains in router space but has rank/local IDs equal to -1.
@@ -20,6 +20,7 @@ from __future__ import annotations
 import heapq
 import itertools
 import math
+import time
 from typing import Any, Dict, Sequence
 
 import numpy as np
@@ -39,15 +40,37 @@ from src.generate_mask.planners.intra_layer.algo.coverage import (
     _plan_layer_counts,
 )
 
-
 DEFAULT_WIDTHS = (0, 384, 512, 640, 768)
+
+
+class PlacementMilpNoIncumbentError(RuntimeError):
+    def __init__(self, result: Any):
+        super().__init__(
+            "cross-layer placement MILP produced no incumbent: "
+            f"status={result.status}, message={result.message}"
+        )
+        dual_bound = getattr(result, "mip_dual_bound", None)
+        mip_gap = getattr(result, "mip_gap", None)
+        node_count = getattr(result, "mip_node_count", None)
+        self.diagnostics = {
+            "solver_status": int(result.status),
+            "solver_success": bool(result.success),
+            "solver_optimal": False,
+            "solver_message": str(result.message),
+            "solver_objective": None,
+            "mip_dual_bound": None if dual_bound is None else float(dual_bound),
+            "mip_gap": None if mip_gap is None else float(mip_gap),
+            "mip_node_count": None if node_count is None else int(node_count),
+        }
 
 
 def _as_finite_float_tensor(value: torch.Tensor, name: str, ndim: int) -> torch.Tensor:
     if not isinstance(value, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor, got {type(value).__name__}")
     if value.ndim != ndim:
-        raise ValueError(f"{name} must have {ndim} dimensions, got shape {tuple(value.shape)}")
+        raise ValueError(
+            f"{name} must have {ndim} dimensions, got shape {tuple(value.shape)}"
+        )
     result = value.detach().to(device="cpu", dtype=torch.float32)
     if not bool(torch.isfinite(result).all()):
         raise ValueError(f"{name} contains NaN or Inf")
@@ -80,7 +103,9 @@ def _validate_inputs(
     prune_ratio: float,
     widths: Sequence[int],
     ep_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[int, ...], tuple[int, ...], int]:
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, tuple[int, ...], tuple[int, ...], int
+]:
     scores = _as_finite_float_tensor(scores, "scores", 3)
     layer_sensitivity = _as_finite_float_tensor(
         layer_sensitivity, "layer_sensitivity", 1
@@ -115,7 +140,9 @@ def _validate_inputs(
             f"every width must be in [0, {intermediate_size}], got {normalized_widths}"
         )
 
-    active_widths = tuple(sorted((width for width in normalized_widths if width > 0), reverse=True))
+    active_widths = tuple(
+        sorted((width for width in normalized_widths if width > 0), reverse=True)
+    )
     if len(active_widths) != ep_size:
         raise ValueError(
             f"EP{ep_size} requires exactly {ep_size} active widths, got {active_widths}"
@@ -171,7 +198,9 @@ def _match_layer_counts_to_exact_total(
                 heapq.heappush(heap, (-weighted, layer))
         while current < target_keep:
             if not heap:
-                raise RuntimeError("cannot increase layer counts to the requested total")
+                raise RuntimeError(
+                    "cannot increase layer counts to the requested total"
+                )
             _, layer = heapq.heappop(heap)
             counts[layer] += 1
             current += 1
@@ -192,7 +221,9 @@ def _match_layer_counts_to_exact_total(
                 heapq.heappush(heap, (weighted, layer))
         while current > target_keep:
             if not heap:
-                raise RuntimeError("cannot decrease layer counts to the requested total")
+                raise RuntimeError(
+                    "cannot decrease layer counts to the requested total"
+                )
             _, layer = heapq.heappop(heap)
             counts[layer] -= 1
             current -= 1
@@ -243,7 +274,9 @@ def _allocate_raw_channel_counts(
         layer_weights=layer_weights,
         target_keep=target_keep,
     )
-    layer_keep_ratios = layer_keep_counts.float() / float(num_experts * intermediate_size)
+    layer_keep_ratios = layer_keep_counts.float() / float(
+        num_experts * intermediate_size
+    )
 
     expert_weights = _loss_to_layerwise_weights(expert_sensitivity)
     sorted_indices = torch.argsort(scores, dim=-1, descending=True, stable=True)
@@ -373,10 +406,16 @@ def _quantize_balanced_widths_to_budget(
 
     expected_global = torch.tensor(best_counts, dtype=torch.int64)
     if not layer_tier_counts.sum(dim=0).equal(expected_global):
-        raise RuntimeError("balanced tier scheduler did not preserve global tier counts")
-    per_layer_spread = layer_tier_counts.max(dim=1).values - layer_tier_counts.min(dim=1).values
+        raise RuntimeError(
+            "balanced tier scheduler did not preserve global tier counts"
+        )
+    per_layer_spread = (
+        layer_tier_counts.max(dim=1).values - layer_tier_counts.min(dim=1).values
+    )
     if int(per_layer_spread.max().item()) > 1:
-        raise RuntimeError("balanced tier scheduler produced a per-layer tier-count spread above 1")
+        raise RuntimeError(
+            "balanced tier scheduler produced a per-layer tier-count spread above 1"
+        )
 
     widths = torch.zeros_like(raw_counts)
     for layer in range(num_layers):
@@ -419,7 +458,9 @@ def _quantize_widths_to_budget(
     num_layers, num_experts = raw_counts.shape
     active_ascending = tuple(sorted(active_widths))
     upgrade_widths = (0,) + active_ascending
-    width_to_upgrade_index = {width: index for index, width in enumerate(upgrade_widths)}
+    width_to_upgrade_index = {
+        width: index for index, width in enumerate(upgrade_widths)
+    }
 
     min_keep = num_layers * sum(active_widths)
     max_keep = num_layers * (
@@ -469,12 +510,12 @@ def _quantize_widths_to_budget(
         delta = new_width - old_width
         raw = int(raw_counts[layer, expert].item())
         marginal_distance = abs(new_width - raw) - abs(old_width - raw)
-        added_score = (
-            _prefix_value(prefix, layer, expert, new_width)
-            - _prefix_value(prefix, layer, expert, old_width)
+        added_score = _prefix_value(prefix, layer, expert, new_width) - _prefix_value(
+            prefix, layer, expert, old_width
         )
         sensitivity_scale = max(
-            float(layer_weights[layer].item()) * float(expert_weights[layer, expert].item()),
+            float(layer_weights[layer].item())
+            * float(expert_weights[layer, expert].item()),
             1e-12,
         )
         heapq.heappush(
@@ -528,7 +569,9 @@ def _quantize_widths_to_budget(
     for layer in range(num_layers):
         for width in active_widths:
             if int((widths[layer] == width).sum().item()) < 1:
-                raise RuntimeError(f"layer {layer} has no expert in mandatory width tier {width}")
+                raise RuntimeError(
+                    f"layer {layer} has no expert in mandatory width tier {width}"
+                )
     return widths, final_keep
 
 
@@ -575,8 +618,14 @@ def _merge_sparse_width_tiers(
                 continue
             expert_ids = torch.where(widths[layer] == width)[0].tolist()
             moved: dict[int, int] = {}
-            lower = max((candidate for candidate in destinations if candidate < width), default=None)
-            higher = min((candidate for candidate in destinations if candidate > width), default=None)
+            lower = max(
+                (candidate for candidate in destinations if candidate < width),
+                default=None,
+            )
+            higher = min(
+                (candidate for candidate in destinations if candidate > width),
+                default=None,
+            )
             for expert in expert_ids:
                 raw_width = int(raw[layer, expert])
                 if lower is None:
@@ -589,7 +638,9 @@ def _merge_sparse_width_tiers(
                     if lower_distance == higher_distance:
                         destination = higher if raw_width >= width else lower
                     else:
-                        destination = lower if lower_distance < higher_distance else higher
+                        destination = (
+                            lower if lower_distance < higher_distance else higher
+                        )
                 widths[layer, expert] = destination
                 moved[destination] = moved.get(destination, 0) + 1
             diagnostics.append(
@@ -635,7 +686,11 @@ def _build_layer_placement_groups(
             if bool((widths[layer] == width).any())
         ]
         while len(groups) < ep_size:
-            splittable = [index for index, group in enumerate(groups) if len(group["experts"]) >= 2]
+            splittable = [
+                index
+                for index, group in enumerate(groups)
+                if len(group["experts"]) >= 2
+            ]
             if not splittable:
                 raise ValueError(
                     f"layer {layer} has only {sum(len(group['experts']) for group in groups)} "
@@ -653,8 +708,13 @@ def _build_layer_placement_groups(
             group = groups.pop(split_index)
             expert_ids = list(group["experts"])
             midpoint = (len(expert_ids) + 1) // 2
-            groups.insert(split_index, {"width": group["width"], "experts": expert_ids[:midpoint]})
-            groups.insert(split_index + 1, {"width": group["width"], "experts": expert_ids[midpoint:]})
+            groups.insert(
+                split_index, {"width": group["width"], "experts": expert_ids[:midpoint]}
+            )
+            groups.insert(
+                split_index + 1,
+                {"width": group["width"], "experts": expert_ids[midpoint:]},
+            )
 
         if len(groups) != ep_size:
             raise ValueError(
@@ -677,138 +737,323 @@ def _build_layer_placement_groups(
     }
 
 
+def _placement_objective(rank_loads: np.ndarray) -> tuple[float, float]:
+    spread = float(rank_loads.max() - rank_loads.min())
+    centered = rank_loads - rank_loads.mean()
+    return spread, float(np.dot(centered, centered))
+
+
+def _placement_metrics(rank_loads: torch.Tensor, tolerance: float) -> Dict[str, Any]:
+    loads = rank_loads.double()
+    mean = float(loads.mean().item())
+    spread = float((loads.max() - loads.min()).item())
+    relative_spread = spread / mean if mean > 0.0 else 0.0
+    return {
+        "mean_rank_weight_load": mean,
+        "max_rank_weight_deviation": spread,
+        "relative_max_rank_weight_deviation": relative_spread,
+        "rank_weight_spread": spread,
+        "relative_rank_weight_spread": relative_spread,
+        "tolerance": float(tolerance),
+        "tolerance_satisfied": relative_spread <= float(tolerance) + 1e-12,
+    }
+
+
+def _validate_placement_groups(
+    group_counts: torch.Tensor,
+    group_widths: torch.Tensor,
+    tolerance: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    counts = group_counts.detach().cpu().to(torch.int64)
+    widths = group_widths.detach().cpu().to(torch.int64)
+    if counts.ndim != 2 or widths.shape != counts.shape:
+        raise ValueError("group_counts and group_widths must have the same 2D shape")
+    if counts.shape[1] <= 0:
+        raise ValueError("placement must contain at least one group")
+    if tolerance < 0.0:
+        raise ValueError(f"tolerance must be non-negative, got {tolerance}")
+    if bool((counts <= 0).any()) or bool((widths <= 0).any()):
+        raise ValueError("every placement group must have positive count and width")
+    return counts, widths
+
+
+def _decode_assignment(
+    values: np.ndarray,
+    counts: torch.Tensor,
+    widths: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    num_layers, ep_size = counts.shape
+    assignment = values[: num_layers * ep_size * ep_size].reshape(
+        num_layers, ep_size, ep_size
+    )
+    rank_group_indices = torch.empty_like(counts)
+    group_to_rank = torch.empty_like(counts)
+    rank_widths = torch.empty_like(widths)
+    for layer in range(num_layers):
+        selected_groups = []
+        for rank in range(ep_size):
+            group = int(np.argmax(assignment[layer, :, rank]))
+            if assignment[layer, group, rank] < 0.5:
+                raise RuntimeError(
+                    f"layer {layer}, rank {rank} has no integral group assignment"
+                )
+            rank_group_indices[layer, rank] = group
+            group_to_rank[layer, group] = rank
+            rank_widths[layer, rank] = widths[layer, group]
+            selected_groups.append(group)
+        if sorted(selected_groups) != list(range(ep_size)):
+            raise RuntimeError(f"layer {layer} incumbent is not a permutation")
+    rank_loads = torch.zeros(ep_size, dtype=torch.int64)
+    for layer in range(num_layers):
+        for rank in range(ep_size):
+            group = int(rank_group_indices[layer, rank])
+            rank_loads[rank] += counts[layer, group] * widths[layer, group]
+    return {
+        "rank_widths": rank_widths,
+        "group_to_rank": group_to_rank,
+        "rank_group_indices": rank_group_indices,
+        "rank_weight_loads": rank_loads,
+    }
+
+
 def _solve_placement_groups_milp(
     group_counts: torch.Tensor,
     group_widths: torch.Tensor,
     *,
     tolerance: float = 0.01,
     fix_first_layer: bool = True,
+    time_limit: float | None = None,
 ) -> Dict[str, Any]:
-    """Assign arbitrary per-layer placement groups using an exact MILP."""
-    counts = group_counts.detach().cpu().to(torch.int64)
-    widths = group_widths.detach().cpu().to(torch.int64)
-    if counts.ndim != 2 or widths.shape != counts.shape:
-        raise ValueError("group_counts and group_widths must have the same 2D shape")
+    """Solve placement exactly with an assignment-matrix MILP."""
+    counts, widths = _validate_placement_groups(group_counts, group_widths, tolerance)
     num_layers, ep_size = counts.shape
-    if ep_size <= 0 or ep_size > 7:
-        raise ValueError(f"unsupported EP size: {ep_size}")
-    if tolerance < 0.0:
-        raise ValueError(f"tolerance must be non-negative, got {tolerance}")
-    if bool((counts <= 0).any()) or bool((widths <= 0).any()):
-        raise ValueError("every placement group must have positive count and width")
+    group_loads = (counts * widths).numpy().astype(np.float64, copy=False)
+    num_binary = num_layers * ep_size * ep_size
+    max_index = num_binary
+    min_index = num_binary + 1
+    num_variables = num_binary + 2
 
-    permutations = tuple(itertools.permutations(range(ep_size)))
-    num_permutations = len(permutations)
-    num_binary = num_layers * num_permutations
-    deviation_index = num_binary
-    num_variables = num_binary + 1
-
-    group_loads = (counts * widths).numpy()
-    layer_rank_load = np.zeros((num_layers, num_permutations, ep_size), dtype=np.float64)
-    for layer in range(num_layers):
-        for permutation_id, permutation in enumerate(permutations):
-            for rank, group_index in enumerate(permutation):
-                layer_rank_load[layer, permutation_id, rank] = group_loads[layer, group_index]
-
-    total_load = float(group_loads.sum())
-    mean_load = total_load / float(ep_size)
-
-    constraint_rows = num_layers + 2 * ep_size
+    assignment_rows = 2 * num_layers * ep_size
+    load_rows = 2 * ep_size
+    valid_inequality_rows = 2
+    constraint_rows = assignment_rows + load_rows + valid_inequality_rows
     matrix = lil_matrix((constraint_rows, num_variables), dtype=np.float64)
     lower = np.full(constraint_rows, -np.inf, dtype=np.float64)
     upper = np.full(constraint_rows, np.inf, dtype=np.float64)
 
+    def variable_index(layer: int, group: int, rank: int) -> int:
+        return (layer * ep_size + group) * ep_size + rank
+
     row = 0
     for layer in range(num_layers):
-        start = layer * num_permutations
-        matrix[row, start : start + num_permutations] = 1.0
-        lower[row] = 1.0
-        upper[row] = 1.0
-        row += 1
+        for group in range(ep_size):
+            for rank in range(ep_size):
+                matrix[row, variable_index(layer, group, rank)] = 1.0
+            lower[row] = upper[row] = 1.0
+            row += 1
+        for rank in range(ep_size):
+            for group in range(ep_size):
+                matrix[row, variable_index(layer, group, rank)] = 1.0
+            lower[row] = upper[row] = 1.0
+            row += 1
 
     for rank in range(ep_size):
         for layer in range(num_layers):
-            start = layer * num_permutations
-            matrix[row, start : start + num_permutations] = layer_rank_load[layer, :, rank]
-        matrix[row, deviation_index] = -1.0
-        upper[row] = mean_load
+            for group in range(ep_size):
+                matrix[row, variable_index(layer, group, rank)] = group_loads[
+                    layer, group
+                ]
+        matrix[row, max_index] = -1.0
+        upper[row] = 0.0
         row += 1
 
         for layer in range(num_layers):
-            start = layer * num_permutations
-            matrix[row, start : start + num_permutations] = -layer_rank_load[layer, :, rank]
-        matrix[row, deviation_index] = -1.0
-        upper[row] = -mean_load
+            for group in range(ep_size):
+                matrix[row, variable_index(layer, group, rank)] = -group_loads[
+                    layer, group
+                ]
+        matrix[row, min_index] = 1.0
+        upper[row] = 0.0
         row += 1
+
+    total_load = float(group_loads.sum())
+    mean_load = total_load / float(ep_size)
+    matrix[row, max_index] = 1.0
+    lower[row] = mean_load
+    row += 1
+    matrix[row, min_index] = 1.0
+    upper[row] = mean_load
 
     bounds_lower = np.zeros(num_variables, dtype=np.float64)
     bounds_upper = np.ones(num_variables, dtype=np.float64)
-    bounds_upper[deviation_index] = np.inf
+    bounds_upper[max_index:] = total_load
     if fix_first_layer and num_layers > 0:
-        identity_id = permutations.index(tuple(range(ep_size)))
-        bounds_lower[:num_permutations] = 0.0
-        bounds_upper[:num_permutations] = 0.0
-        bounds_lower[identity_id] = 1.0
-        bounds_upper[identity_id] = 1.0
+        for group in range(ep_size):
+            for rank in range(ep_size):
+                index = variable_index(0, group, rank)
+                fixed_value = float(group == rank)
+                bounds_lower[index] = fixed_value
+                bounds_upper[index] = fixed_value
 
     objective = np.zeros(num_variables, dtype=np.float64)
-    objective[deviation_index] = 1.0
+    objective[max_index] = 1.0
+    objective[min_index] = -1.0
     integrality = np.ones(num_variables, dtype=np.int8)
-    integrality[deviation_index] = 0
+    options: Dict[str, Any] = {"presolve": True, "mip_rel_gap": 0.0}
+    if time_limit is not None:
+        if time_limit <= 0.0:
+            raise ValueError(f"time_limit must be positive, got {time_limit}")
+        options["time_limit"] = float(time_limit)
 
     result = milp(
         c=objective,
         integrality=integrality,
         bounds=Bounds(bounds_lower, bounds_upper),
         constraints=LinearConstraint(matrix.tocsr(), lower, upper),
+        options=options,
+    )
+    if result.x is None:
+        error = PlacementMilpNoIncumbentError(result)
+        error.diagnostics["milp_binary_variables"] = int(num_binary)
+        error.diagnostics["milp_time_limit"] = (
+            None if time_limit is None else float(time_limit)
+        )
+        raise error
+
+    placement = _decode_assignment(result.x, counts, widths)
+    placement.update(_placement_metrics(placement["rank_weight_loads"], tolerance))
+    dual_bound = getattr(result, "mip_dual_bound", None)
+    mip_gap = getattr(result, "mip_gap", None)
+    node_count = getattr(result, "mip_node_count", None)
+    placement.update(
+        {
+            "solver_status": int(result.status),
+            "solver_success": bool(result.success),
+            "solver_optimal": int(result.status) == 0,
+            "solver_message": str(result.message),
+            "solver_objective": placement["rank_weight_spread"],
+            "solver_reported_objective": float(result.fun),
+            "mip_dual_bound": np.nan if dual_bound is None else float(dual_bound),
+            "mip_gap": np.nan if mip_gap is None else float(mip_gap),
+            "mip_node_count": -1 if node_count is None else int(node_count),
+            "milp_encoding": "assignment",
+            "milp_binary_variables": int(num_binary),
+            "milp_time_limit": None if time_limit is None else float(time_limit),
+        }
+    )
+    return placement
+
+
+def _solve_placement_groups_milp_permutation_reference(
+    group_counts: torch.Tensor,
+    group_widths: torch.Tensor,
+    *,
+    tolerance: float = 0.01,
+    fix_first_layer: bool = True,
+) -> Dict[str, Any]:
+    """Exact permutation MILP retained to validate the assignment encoding."""
+    counts, widths = _validate_placement_groups(group_counts, group_widths, tolerance)
+    num_layers, ep_size = counts.shape
+    if ep_size > 7:
+        raise ValueError(f"unsupported reference EP size: {ep_size}")
+    permutations = tuple(itertools.permutations(range(ep_size)))
+    num_permutations = len(permutations)
+    num_binary = num_layers * num_permutations
+    max_index = num_binary
+    min_index = num_binary + 1
+    num_variables = num_binary + 2
+    group_loads = (counts * widths).numpy()
+    layer_rank_load = np.stack(
+        [group_loads[:, permutation] for permutation in permutations], axis=1
+    ).astype(np.float64, copy=False)
+
+    matrix = lil_matrix((num_layers + 2 * ep_size, num_variables), dtype=np.float64)
+    lower = np.full(matrix.shape[0], -np.inf, dtype=np.float64)
+    upper = np.full(matrix.shape[0], np.inf, dtype=np.float64)
+    row = 0
+    for layer in range(num_layers):
+        start = layer * num_permutations
+        matrix[row, start : start + num_permutations] = 1.0
+        lower[row] = upper[row] = 1.0
+        row += 1
+    for rank in range(ep_size):
+        for layer in range(num_layers):
+            start = layer * num_permutations
+            matrix[row, start : start + num_permutations] = layer_rank_load[
+                layer, :, rank
+            ]
+        matrix[row, max_index] = -1.0
+        upper[row] = 0.0
+        row += 1
+        for layer in range(num_layers):
+            start = layer * num_permutations
+            matrix[row, start : start + num_permutations] = -layer_rank_load[
+                layer, :, rank
+            ]
+        matrix[row, min_index] = 1.0
+        upper[row] = 0.0
+        row += 1
+
+    total_load = float(group_loads.sum())
+    bounds_lower = np.zeros(num_variables, dtype=np.float64)
+    bounds_upper = np.ones(num_variables, dtype=np.float64)
+    bounds_upper[max_index:] = total_load
+    if fix_first_layer and num_layers > 0:
+        identity_id = permutations.index(tuple(range(ep_size)))
+        bounds_lower[:num_permutations] = 0.0
+        bounds_upper[:num_permutations] = 0.0
+        bounds_lower[identity_id] = bounds_upper[identity_id] = 1.0
+    objective = np.zeros(num_variables, dtype=np.float64)
+    objective[max_index] = 1.0
+    objective[min_index] = -1.0
+    result = milp(
+        c=objective,
+        integrality=np.ones(num_variables, dtype=np.int8),
+        bounds=Bounds(bounds_lower, bounds_upper),
+        constraints=LinearConstraint(matrix.tocsr(), lower, upper),
         options={"presolve": True, "mip_rel_gap": 0.0},
     )
     if not result.success or result.x is None:
         raise RuntimeError(
-            f"cross-layer placement MILP failed: status={result.status}, message={result.message}"
+            f"reference placement MILP failed: status={result.status}, message={result.message}"
         )
 
-    permutation_ids = []
-    rank_widths = torch.empty_like(widths)
-    group_to_rank = torch.empty_like(counts)
     rank_group_indices = torch.empty_like(counts)
+    group_to_rank = torch.empty_like(counts)
+    rank_widths = torch.empty_like(widths)
+    permutation_ids = []
     for layer in range(num_layers):
         start = layer * num_permutations
-        values = result.x[start : start + num_permutations]
-        permutation_id = int(np.argmax(values))
-        if values[permutation_id] < 0.5:
-            raise RuntimeError(f"layer {layer} has no integral placement permutation")
+        permutation_id = int(np.argmax(result.x[start : start + num_permutations]))
         permutation_ids.append(permutation_id)
-        permutation = permutations[permutation_id]
-        for rank, group_index in enumerate(permutation):
-            rank_group_indices[layer, rank] = group_index
-            rank_widths[layer, rank] = widths[layer, group_index]
-            group_to_rank[layer, group_index] = rank
-
+        for rank, group in enumerate(permutations[permutation_id]):
+            rank_group_indices[layer, rank] = group
+            group_to_rank[layer, group] = rank
+            rank_widths[layer, rank] = widths[layer, group]
     rank_loads = torch.zeros(ep_size, dtype=torch.int64)
     for layer in range(num_layers):
         for rank in range(ep_size):
-            group_index = int(rank_group_indices[layer, rank])
-            rank_loads[rank] += counts[layer, group_index] * widths[layer, group_index]
-
-    mean = float(rank_loads.double().mean().item())
-    max_deviation = float((rank_loads.double() - mean).abs().max().item())
-    relative_deviation = max_deviation / mean if mean > 0.0 else 0.0
-    return {
+            group = int(rank_group_indices[layer, rank])
+            rank_loads[rank] += counts[layer, group] * widths[layer, group]
+    placement: Dict[str, Any] = {
         "rank_widths": rank_widths,
         "group_to_rank": group_to_rank,
         "rank_group_indices": rank_group_indices,
         "rank_weight_loads": rank_loads,
-        "mean_rank_weight_load": mean,
-        "max_rank_weight_deviation": max_deviation,
-        "relative_max_rank_weight_deviation": relative_deviation,
-        "tolerance": float(tolerance),
-        "tolerance_satisfied": relative_deviation <= float(tolerance) + 1e-12,
         "permutation_ids": torch.tensor(permutation_ids, dtype=torch.int64),
         "solver_status": int(result.status),
+        "solver_success": bool(result.success),
+        "solver_optimal": True,
         "solver_message": str(result.message),
         "solver_objective": float(result.fun),
+        "mip_dual_bound": float(getattr(result, "mip_dual_bound", np.nan)),
+        "mip_gap": float(getattr(result, "mip_gap", np.nan)),
+        "mip_node_count": int(getattr(result, "mip_node_count", -1)),
+        "milp_encoding": "permutation_reference",
+        "milp_binary_variables": int(num_binary),
     }
+    placement.update(_placement_metrics(rank_loads, tolerance))
+    return placement
 
 
 def _solve_cross_layer_placement_milp(
@@ -817,6 +1062,7 @@ def _solve_cross_layer_placement_milp(
     *,
     tolerance: float = 0.01,
     fix_first_layer: bool = True,
+    time_limit: float | None = None,
 ) -> Dict[str, Any]:
     """Assign active width groups to EP ranks with an exact placement MILP."""
     if not isinstance(width_counts, torch.Tensor) or width_counts.ndim != 2:
@@ -829,23 +1075,21 @@ def _solve_cross_layer_placement_milp(
             f"width_counts has {num_widths} columns but active_widths has {len(widths)}"
         )
     if bool((counts <= 0).any()):
-        raise ValueError("every active width tier must contain at least one expert per layer")
+        raise ValueError(
+            "every active width tier must contain at least one expert per layer"
+        )
     result = _solve_placement_groups_milp(
         counts,
         torch.tensor(widths, dtype=torch.int64).expand(num_layers, -1),
         tolerance=tolerance,
         fix_first_layer=fix_first_layer,
+        time_limit=time_limit,
     )
     result["tier_to_rank"] = result["group_to_rank"]
     return result
 
 
-def _placement_objective(rank_loads: np.ndarray) -> tuple[float, float]:
-    centered = rank_loads - rank_loads.mean()
-    return float(np.abs(centered).max()), float(np.dot(centered, centered))
-
-
-def _solve_placement_groups_greedy(
+def _solve_placement_groups_greedy_permutation_reference(
     group_counts: torch.Tensor,
     group_widths: torch.Tensor,
     *,
@@ -853,7 +1097,7 @@ def _solve_placement_groups_greedy(
     fix_first_layer: bool = True,
     max_local_search_passes: int = 100,
 ) -> Dict[str, Any]:
-    """Balance per-layer placement groups across a fixed number of EP ranks."""
+    """Original full-permutation greedy retained for small reference cases."""
     counts = group_counts.detach().cpu().to(torch.int64)
     widths = group_widths.detach().cpu().to(torch.int64)
     if counts.ndim != 2 or widths.shape != counts.shape:
@@ -869,6 +1113,8 @@ def _solve_placement_groups_greedy(
         )
 
     num_layers, ep_size = counts.shape
+    if ep_size > 8:
+        raise ValueError(f"unsupported reference EP size: {ep_size}")
     permutations = tuple(itertools.permutations(range(ep_size)))
     identity_id = permutations.index(tuple(range(ep_size)))
     group_loads = (counts * widths).numpy()
@@ -892,7 +1138,9 @@ def _solve_placement_groups_greedy(
         best_id = min(
             range(len(permutations)),
             key=lambda permutation_id: (
-                *_placement_objective(rank_loads + layer_rank_load[layer, permutation_id]),
+                *_placement_objective(
+                    rank_loads + layer_rank_load[layer, permutation_id]
+                ),
                 permutation_id,
             ),
         )
@@ -933,26 +1181,161 @@ def _solve_placement_groups_greedy(
             group_to_rank[layer, group_index] = rank
 
     rank_loads_tensor = torch.from_numpy(rank_loads.copy())
-    mean = float(rank_loads_tensor.double().mean().item())
-    max_deviation = float((rank_loads_tensor.double() - mean).abs().max().item())
-    relative_deviation = max_deviation / mean if mean > 0.0 else 0.0
-    return {
+    placement: Dict[str, Any] = {
         "rank_widths": rank_widths,
         "group_to_rank": group_to_rank,
         "rank_group_indices": rank_group_indices,
         "rank_weight_loads": rank_loads_tensor,
-        "mean_rank_weight_load": mean,
-        "max_rank_weight_deviation": max_deviation,
-        "relative_max_rank_weight_deviation": relative_deviation,
-        "tolerance": float(tolerance),
-        "tolerance_satisfied": relative_deviation <= float(tolerance) + 1e-12,
         "permutation_ids": torch.from_numpy(permutation_ids.copy()),
         "solver_status": 0,
-        "solver_message": "greedy placement-group assignment with coordinate-descent local search",
-        "solver_objective": max_deviation,
-        "placement_method": "greedy",
+        "solver_message": "full-permutation greedy reference",
+        "solver_objective": _placement_objective(rank_loads)[0],
+        "placement_method": "greedy_permutation_reference",
+        "refinement_neighborhood": "full_bijection",
         "local_search_passes": local_search_passes,
     }
+    placement.update(_placement_metrics(rank_loads_tensor, tolerance))
+    return placement
+
+
+def _permutation_id(permutation: Sequence[int]) -> int:
+    remaining = list(range(len(permutation)))
+    result = 0
+    for index, value in enumerate(permutation):
+        position = remaining.index(int(value))
+        result += position * math.factorial(len(permutation) - index - 1)
+        remaining.pop(position)
+    return result
+
+
+def _solve_placement_groups_greedy(
+    group_counts: torch.Tensor,
+    group_widths: torch.Tensor,
+    *,
+    tolerance: float = 0.01,
+    fix_first_layer: bool = True,
+    max_local_search_passes: int = 100,
+    refinement_neighborhood: str = "auto",
+) -> Dict[str, Any]:
+    """Balance rank loads with sort initialization and local refinement."""
+    counts, widths = _validate_placement_groups(group_counts, group_widths, tolerance)
+    if max_local_search_passes < 0:
+        raise ValueError(
+            "max_local_search_passes must be non-negative, got "
+            f"{max_local_search_passes}"
+        )
+    if refinement_neighborhood not in {"auto", "pairwise_swap", "full_bijection"}:
+        raise ValueError(
+            "refinement_neighborhood must be 'auto', 'pairwise_swap', or "
+            "'full_bijection', "
+            f"got {refinement_neighborhood!r}"
+        )
+
+    num_layers, ep_size = counts.shape
+    if refinement_neighborhood == "auto":
+        refinement_neighborhood = "full_bijection" if ep_size == 4 else "pairwise_swap"
+    if refinement_neighborhood == "full_bijection" and ep_size > 8:
+        raise ValueError("full-bijection refinement is restricted to EP size <= 8")
+    group_loads = (counts * widths).numpy()
+    rank_group_indices = np.full((num_layers, ep_size), -1, dtype=np.int64)
+    rank_loads = np.zeros(ep_size, dtype=np.int64)
+    first_unfixed_layer = 0
+
+    initialization_started = time.perf_counter()
+    if fix_first_layer and num_layers > 0:
+        rank_group_indices[0] = np.arange(ep_size, dtype=np.int64)
+        rank_loads += group_loads[0]
+        first_unfixed_layer = 1
+    layer_order = sorted(
+        range(first_unfixed_layer, num_layers),
+        key=lambda layer: (-int(np.ptp(group_loads[layer])), layer),
+    )
+    for layer in layer_order:
+        rank_order = sorted(range(ep_size), key=lambda rank: (rank_loads[rank], rank))
+        group_order = sorted(
+            range(ep_size), key=lambda group: (-group_loads[layer, group], group)
+        )
+        for rank, group in zip(rank_order, group_order):
+            rank_group_indices[layer, rank] = group
+            rank_loads[rank] += group_loads[layer, group]
+    initialization_seconds = time.perf_counter() - initialization_started
+    initial_rank_loads = rank_loads.copy()
+
+    refinement_started = time.perf_counter()
+    local_search_passes = 0
+    for _ in range(max_local_search_passes):
+        improved = False
+        for layer in range(first_unfixed_layer, num_layers):
+            current = rank_group_indices[layer].copy()
+            base_loads = rank_loads - group_loads[layer, current]
+            best = current
+            best_loads = rank_loads
+            best_objective = _placement_objective(rank_loads)
+            if refinement_neighborhood == "pairwise_swap":
+                candidates = []
+                for left in range(ep_size):
+                    for right in range(left + 1, ep_size):
+                        candidate = current.copy()
+                        candidate[left], candidate[right] = (
+                            candidate[right],
+                            candidate[left],
+                        )
+                        candidates.append(candidate)
+            else:
+                candidates = itertools.permutations(range(ep_size))
+            for candidate_value in candidates:
+                candidate = np.asarray(candidate_value, dtype=np.int64)
+                candidate_loads = base_loads + group_loads[layer, candidate]
+                candidate_objective = _placement_objective(candidate_loads)
+                if candidate_objective < best_objective:
+                    best = candidate.copy()
+                    best_loads = candidate_loads
+                    best_objective = candidate_objective
+            if not np.array_equal(best, current):
+                rank_group_indices[layer] = best
+                rank_loads = best_loads
+                improved = True
+        local_search_passes += 1
+        if not improved:
+            break
+    refinement_seconds = time.perf_counter() - refinement_started
+
+    rank_group_indices_tensor = torch.from_numpy(rank_group_indices.copy())
+    group_to_rank = torch.empty_like(counts)
+    rank_widths = torch.empty_like(widths)
+    permutation_ids = torch.empty(num_layers, dtype=torch.int64)
+    for layer in range(num_layers):
+        permutation = rank_group_indices[layer].tolist()
+        permutation_ids[layer] = _permutation_id(permutation)
+        for rank, group in enumerate(permutation):
+            group_to_rank[layer, group] = rank
+            rank_widths[layer, rank] = widths[layer, group]
+
+    rank_loads_tensor = torch.from_numpy(rank_loads.copy())
+    initial_rank_loads_tensor = torch.from_numpy(initial_rank_loads.copy())
+    placement: Dict[str, Any] = {
+        "rank_widths": rank_widths,
+        "group_to_rank": group_to_rank,
+        "rank_group_indices": rank_group_indices_tensor,
+        "rank_weight_loads": rank_loads_tensor,
+        "initial_rank_weight_loads": initial_rank_loads_tensor,
+        "permutation_ids": permutation_ids,
+        "solver_status": 0,
+        "solver_message": "sort initialization with local refinement",
+        "solver_objective": _placement_objective(rank_loads)[0],
+        "placement_method": "greedy",
+        "refinement_neighborhood": refinement_neighborhood,
+        "local_search_passes": local_search_passes,
+        "initialization_time_seconds": initialization_seconds,
+        "refinement_time_seconds": refinement_seconds,
+    }
+    placement.update(_placement_metrics(rank_loads_tensor, tolerance))
+    initial_metrics = _placement_metrics(initial_rank_loads_tensor, tolerance)
+    placement["initial_rank_weight_spread"] = initial_metrics["rank_weight_spread"]
+    placement["initial_relative_rank_weight_spread"] = initial_metrics[
+        "relative_rank_weight_spread"
+    ]
+    return placement
 
 
 def _solve_cross_layer_placement_greedy(
@@ -962,8 +1345,9 @@ def _solve_cross_layer_placement_greedy(
     tolerance: float = 0.01,
     fix_first_layer: bool = True,
     max_local_search_passes: int = 100,
+    refinement_neighborhood: str = "auto",
 ) -> Dict[str, Any]:
-    """Balance EP rank loads using 24-way greedy placement and local search."""
+    """Balance EP rank loads with Algorithm 2 sorting and local search."""
     if not isinstance(width_counts, torch.Tensor) or width_counts.ndim != 2:
         raise ValueError("width_counts must be a [L, num_active_widths] tensor")
     counts = width_counts.detach().cpu().to(torch.int64)
@@ -973,7 +1357,7 @@ def _solve_cross_layer_placement_greedy(
         raise ValueError(
             f"width_counts has {num_widths} columns but active_widths has {len(widths)}"
         )
-    if num_widths <= 0 or num_widths > 7:
+    if num_widths <= 0:
         raise ValueError(f"unsupported number of active widths: {num_widths}")
     if tolerance < 0.0:
         raise ValueError(f"tolerance must be non-negative, got {tolerance}")
@@ -983,7 +1367,9 @@ def _solve_cross_layer_placement_greedy(
             f"{max_local_search_passes}"
         )
     if bool((counts <= 0).any()):
-        raise ValueError("every active width tier must contain at least one expert per layer")
+        raise ValueError(
+            "every active width tier must contain at least one expert per layer"
+        )
 
     result = _solve_placement_groups_greedy(
         counts,
@@ -991,9 +1377,10 @@ def _solve_cross_layer_placement_greedy(
         tolerance=tolerance,
         fix_first_layer=fix_first_layer,
         max_local_search_passes=max_local_search_passes,
+        refinement_neighborhood=refinement_neighborhood,
     )
     result["tier_to_rank"] = result["group_to_rank"]
-    result["solver_message"] = "greedy placement with coordinate-descent local search"
+    result["solver_message"] = "sort-based greedy placement with local refinement"
     return result
 
 
@@ -1005,11 +1392,13 @@ def solve_cross_layer_placement(
     fix_first_layer: bool = True,
     method: str = "greedy",
     max_local_search_passes: int = 100,
+    refinement_neighborhood: str = "auto",
+    milp_time_limit: float | None = None,
 ) -> Dict[str, Any]:
     """Assign each layer's width groups to EP ranks.
 
-    ``greedy`` is the production default.  ``milp`` is retained for small
-    instances and optimality comparisons because its runtime grows quickly.
+    ``greedy`` is the production default. ``milp`` uses an exact assignment
+    formulation for optimality comparisons.
     """
     normalized_method = method.lower()
     if normalized_method == "greedy":
@@ -1019,6 +1408,7 @@ def solve_cross_layer_placement(
             tolerance=tolerance,
             fix_first_layer=fix_first_layer,
             max_local_search_passes=max_local_search_passes,
+            refinement_neighborhood=refinement_neighborhood,
         )
     if normalized_method == "milp":
         result = _solve_cross_layer_placement_milp(
@@ -1026,11 +1416,39 @@ def solve_cross_layer_placement(
             active_widths,
             tolerance=tolerance,
             fix_first_layer=fix_first_layer,
+            time_limit=milp_time_limit,
         )
         result["placement_method"] = "milp"
         return result
+    if normalized_method == "greedy_permutation_reference":
+        widths = torch.tensor(
+            tuple(int(width) for width in active_widths), dtype=torch.int64
+        )
+        result = _solve_placement_groups_greedy_permutation_reference(
+            width_counts,
+            widths.expand(width_counts.shape[0], -1),
+            tolerance=tolerance,
+            fix_first_layer=fix_first_layer,
+            max_local_search_passes=max_local_search_passes,
+        )
+        result["tier_to_rank"] = result["group_to_rank"]
+        return result
+    if normalized_method == "milp_permutation_reference":
+        widths = torch.tensor(
+            tuple(int(width) for width in active_widths), dtype=torch.int64
+        )
+        result = _solve_placement_groups_milp_permutation_reference(
+            width_counts,
+            widths.expand(width_counts.shape[0], -1),
+            tolerance=tolerance,
+            fix_first_layer=fix_first_layer,
+        )
+        result["tier_to_rank"] = result["group_to_rank"]
+        result["placement_method"] = "milp_permutation_reference"
+        return result
     raise ValueError(
-        f"unsupported placement method {method!r}; expected 'greedy' or 'milp'"
+        f"unsupported placement method {method!r}; expected 'greedy', 'milp', "
+        "'greedy_permutation_reference', or 'milp_permutation_reference'"
     )
 
 
@@ -1043,9 +1461,7 @@ def _build_masks_and_mappings(
 ) -> Dict[str, Any]:
     num_layers, num_experts = expert_widths.shape
     intermediate_size = sorted_indices.shape[-1]
-    masks = torch.zeros(
-        (num_layers, num_experts, intermediate_size), dtype=torch.bool
-    )
+    masks = torch.zeros((num_layers, num_experts, intermediate_size), dtype=torch.bool)
     expert_to_rank = torch.full((num_layers, num_experts), -1, dtype=torch.int64)
     expert_to_local_id = torch.full((num_layers, num_experts), -1, dtype=torch.int64)
     local_to_global: list[list[list[int]]] = []
@@ -1060,7 +1476,9 @@ def _build_masks_and_mappings(
             masks[layer, expert].index_fill_(0, chosen, True)
             group = int(expert_to_group[layer, expert].item())
             if group < 0:
-                raise RuntimeError(f"active expert {expert} in layer {layer} has no placement group")
+                raise RuntimeError(
+                    f"active expert {expert} in layer {layer} has no placement group"
+                )
             rank = int(group_to_rank[layer, group].item())
             local_id = len(layer_local_to_global[rank])
             expert_to_rank[layer, expert] = rank
@@ -1088,7 +1506,14 @@ def _finalize_ep4_structure(
     fix_first_layer_placement: bool,
     placement_method: str,
     placement_local_search_passes: int,
-) -> tuple[torch.Tensor, int, list[dict[str, Any]], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+) -> tuple[
+    torch.Tensor,
+    int,
+    list[dict[str, Any]],
+    Dict[str, Any],
+    Dict[str, Any],
+    Dict[str, Any],
+]:
     expert_widths, tier_merges = _merge_sparse_width_tiers(
         expert_widths,
         raw_counts,
@@ -1132,7 +1557,9 @@ def _finalize_ep4_structure(
         for tier_index, width in enumerate(active_widths):
             ranks = torch.where(placement["rank_widths"][layer] == width)[0].tolist()
             if bool((expert_widths[layer] == width).any()) and not ranks:
-                raise RuntimeError(f"layer {layer} width {width} has no assigned EP rank")
+                raise RuntimeError(
+                    f"layer {layer} width {width} has no assigned EP rank"
+                )
             if ranks:
                 tier_to_rank[layer, tier_index] = ranks[0]
             layer_ranks.append(ranks)
@@ -1181,14 +1608,14 @@ def plan_ep4_intplan(
             is not a keep ratio; ``keep_ratio = 1 - prune_ratio``.
         widths: Four active widths plus zero.  The default is
             ``(0, 384, 512, 640, 768)``.
-        placement_tolerance: Allowed relative deviation from mean cumulative
+        placement_tolerance: Allowed relative max-min spread of cumulative
             rank weight load.
         strict_placement_tolerance: Raise if the best placement exceeds the
             tolerance.  The default returns the best plan plus a false status.
         placement_method: ``"greedy"`` for fast production planning or
-            ``"milp"`` for an exact small-instance/offline reference.
-        placement_local_search_passes: Maximum coordinate-descent passes used
-            by the greedy placement method.
+            ``"milp"`` for an exact assignment-MILP reference.
+        placement_local_search_passes: Maximum local-refinement passes used by
+            the greedy placement method.
         balance_tier_counts: Force the four active width tiers to contain as
             close to the same number of experts as the exact budget permits.
             This is useful for performance-only fused-MoE experiments.
@@ -1279,9 +1706,7 @@ def plan_ep4_intplan(
     all_widths = tuple(sorted(normalized_widths, reverse=True))
     width_counts = torch.stack(
         [
-            torch.stack(
-                [(expert_widths[layer] == width).sum() for width in all_widths]
-            )
+            torch.stack([(expert_widths[layer] == width).sum() for width in all_widths])
             for layer in range(num_layers)
         ]
     ).to(torch.int64)
@@ -1449,9 +1874,7 @@ def plan_ep4_from_masks(
     all_widths = tuple(sorted(normalized_widths, reverse=True))
     width_counts = torch.stack(
         [
-            torch.stack(
-                [(expert_widths[layer] == width).sum() for width in all_widths]
-            )
+            torch.stack([(expert_widths[layer] == width).sum() for width in all_widths])
             for layer in range(num_layers)
         ]
     ).to(torch.int64)
