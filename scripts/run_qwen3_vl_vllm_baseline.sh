@@ -340,8 +340,16 @@ build_command() {
     local cache_root="$7"
     local heartbeat_dir="$8"
     local cache_batch_size="$9"
+    local disable_mm_processor_cache=0
+    case "${task_name}" in
+        egoschema_subset_local|mvbench_available_3800)
+            # Runtime-only cache policy: preserve model_args/answer-cache keys.
+            disable_mm_processor_cache=1
+            ;;
+    esac
     CMD=(
         env
+        "MAES_DISABLE_MM_PROCESSOR_CACHE=${disable_mm_processor_cache}"
         "LMMS_CACHE_RUN_ID=${BASELINE_LABEL}-${PARALLEL_MODE}-${task_name}"
         "LMMS_CACHE_WRITE_THROUGH_BATCH_SIZE=${cache_batch_size}"
         "LMMS_CACHE_CHECKPOINT_INTERVAL=1"

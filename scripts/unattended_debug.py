@@ -13,7 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 BASE = ROOT / "artifacts/unattended-debug"
 REPORT = ROOT / "docs/自动化执行结果.md"
 WORKERS = {"maes-todo-followup", "maes-todo-scores", "maes-todo-ours", "maes-todo-results"}
-INTERVAL = 1800
+INTERVAL = 300  # cheap liveness check; Markdown progress remains every 30 minutes
+SCOPES = [('internvl3_5-30b-a3b', 'p30'), *[(m, 'p50') for m in MODELS]]
 
 
 def command(args, **kwargs):
@@ -71,6 +72,40 @@ def reconcile(state, keys):
     return state.get('failures', 0) >= 3
 
 
+def choose_scope(state, rows):
+    """Only exhaust the failing model/ratio, never latch the whole campaign."""
+    for row in rows:
+        key = f"{row['model']}:{row['ratio']}"
+        if not row['complete'] and key not in state.get('deferred', {}):
+            return key
+    return None
+
+
+def settle_round(state, keys):
+    scope = state.get('current_scope')
+    if not scope:
+        return
+    slot = state.setdefault('scopes', {}).setdefault(scope, {})
+    if reconcile(slot, [k for k in keys if k.startswith(scope + ':')]):
+        state.setdefault('deferred', {})[scope] = '连续3轮无新增有效完成产物；隔离该配置，继续其他配置'
+
+
+def stale_worker(active):
+    """No inference for a live worker unless stage-local evidence is stale."""
+    metadata = ROOT / 'artifacts/ours-active-stage.json'
+    if 'maes-todo-ours' not in active or not metadata.exists():
+        return False
+    stage = json.loads(metadata.read_text())
+    started = stage.get('started_at', time.time())
+    root = ROOT / 'results/vllm_ours' / stage['model'] / f"ep4-{stage['ratio']}-full"
+    files = list(root.glob('watchdog/*/*/response_cache.json'))
+    files += list((root / 'logs').glob('*.log'))
+    files += list((root / 'local_judge').glob('*.log'))
+    files += list((root / 'local_judge').glob('*.jsonl'))
+    stamps = [p.stat().st_mtime for p in files if p.is_file()]
+    return time.time() - max([started, *stamps]) > 1800
+
+
 def clean_env():
     env = os.environ.copy()
     for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"):
@@ -87,33 +122,71 @@ def codex_args(output):
             "--output-last-message", str(output), "-"]
 
 
+def quota_error(run):
+    # Only classify executor error events, not arbitrary model/tool output.
+    for line in (run / 'events.jsonl').read_text().splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get('type') not in ('error', 'turn.failed'):
+            continue
+        message = json.dumps(event).lower()
+        if any(word in message for word in ('usage_limit', 'usage limit', 'rate_limit', 'rate limit')):
+            return True
+    return False
+
+
 def tick():
     statefile = BASE / "state.json"
     state = json.loads(statefile.read_text()) if statefile.exists() else {}
     # Malformed state must fail closed, never silently reset the attempt limit.
-    if state.get('attention'):
+    if state.get('attention'):  # auth/permission/unknown executor failure only
         print('ATTENTION: ' + state['attention'], flush=True)
         return
     active = sessions()
-    if active & WORKERS:
+    suspect = bool(active & WORKERS) and stale_worker(active)
+    if active & WORKERS and not suspect:
         print('HEALTHY: worker active; no Codex invocation', flush=True)
         return
     keys, done = progress()
     if done:
         print('DONE: validated benchmark/Judge scope complete', flush=True)
         return
-    if reconcile(state, keys):
-        state['attention'] = '连续 3 轮 Debug/恢复无新增有效完成产物；停止自动尝试。'
-        save(state)
-        record('ATTENTION：' + state['attention'])
+    # Give the waiting p50 queue the handoff; never race it with another worker.
+    if not active & WORKERS and 'maes-todo-p50-queue' in active:
+        print('WAIT: p50 queue owns next handoff', flush=True)
         return
+    before = set(state.get('deferred', {}))
+    settle_round(state, keys)
+    for key in set(state.get('deferred', {})) - before:
+        record(f'ATTENTION：{key} 连续3轮无进展，暂停该配置；继续其他未完成配置。')
+    rows = [run_status(*s) for s in SCOPES]
+    scope = choose_scope(state, rows)
+    if suspect:
+        stage = json.loads((ROOT / 'artifacts/ours-active-stage.json').read_text())
+        scope = f"{stage['model']}:{stage['ratio']}"
+        if scope in state.get('deferred', {}):
+            save(state)
+            print('WAIT: deferred live worker; manual ownership check needed', flush=True)
+            return
+    if not scope:
+        save(state)
+        if not state.get('exhausted_reported'):
+            record('ATTENTION：其余项已完成或均已达到各自修复上限；无可继续的独立配置，巡检保留。')
+            state['exhausted_reported'] = True
+            save(state)
+        return
+    state['current_scope'] = scope
+    slot = state.setdefault('scopes', {}).setdefault(scope, {})
+    slot.setdefault('progress', [k for k in keys if k.startswith(scope + ':')])
     save(state)
     if time.time() < state.get('not_before', 0):
         print('WAIT: cooldown / included quota reset', flush=True)
         return
     gpu = command(['nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader,nounits'])
-    if gpu.returncode or gpu.stdout.strip():
-        print('WAIT: GPU occupied or unavailable; no restart', flush=True)
+    if gpu.returncode:
+        print('WAIT: GPU status unavailable; no restart', flush=True)
         return
     auth = command(['codex', 'login', 'status'], env=clean_env())
     if auth.returncode or 'Logged in using ChatGPT' not in auth.stdout + auth.stderr:
@@ -124,11 +197,16 @@ def tick():
     run = BASE / time.strftime('%Y%m%d-%H%M%S')
     run.mkdir()
     prompt = (ROOT / 'scripts/unattended_debug_prompt.md').read_text()
-    prompt += f'\n本轮证据目录：{run}\n此前连续无进展轮数：{state.get("failures", 0)}\n'
+    prompt += (f'\n本轮证据目录：{run}\n本轮目标配置：{scope}\n'
+               f'此前该配置连续无进展轮数：{slot.get("failures", 0)}\n'
+               f'已隔离配置（不得重跑）：{json.dumps(state.get("deferred", {}), ensure_ascii=False)}\n'
+               f'GPU 是否仍有计算进程（先查归属，禁止抢占）：{bool(gpu.stdout.strip())}\n'
+               f'是否仍有活进程但本阶段日志/心跳停滞超过30分钟：{suspect}\n')
     # Persist intent before execution: a crashed executor cannot reset its budget.
-    state.update(pending=True, not_before=time.time() + INTERVAL, last_run=str(run))
+    slot['pending'] = True
+    state.update(not_before=time.time() + INTERVAL, last_run=str(run))
     save(state)
-    record(f'检测到 worker 停止且范围未完成，开始诊断；证据 {run}。')
+    record(f'检测到停止/疑似停滞，开始诊断 {scope}；证据 {run}。')
     with (run / 'events.jsonl').open('w') as out, (run / 'stderr.log').open('w') as err:
         result = subprocess.run(codex_args(run / 'result.json'), cwd=ROOT,
                                 input=prompt, text=True, stdout=out, stderr=err,
@@ -139,14 +217,29 @@ def tick():
         outcome = {}
     status = outcome.get('status')
     if result.returncode != 0 or not status:
-        # Do not repeatedly charge on authentication/network/unknown executor errors.
-        state.update(pending=False, attention=f'执行器异常，需检查 {run}；不盲目重复调用。')
+        slot['pending'] = False
+        if quota_error(run):
+            state.update(not_before=time.time() + 1800)
+            outcome = {'summary': '套餐额度/速率受限，30分钟后复查；不切换付费来源'}
+        else:
+            # Infrastructure errors get a separate bounded retry budget.
+            state['executor_errors'] = state.get('executor_errors', 0) + 1
+            state['not_before'] = time.time() + 1800
+            if state['executor_errors'] >= 3:
+                state['attention'] = f'执行器连续3次异常，需检查 {run}；正常巡检继续。'
+            outcome = {'summary': f'执行器异常 {state["executor_errors"]}/3，保留证据 {run}'}
     elif status == 'quota_wait':
-        state.update(pending=False, not_before=time.time() + 6 * 3600)
-    elif status in ('permission_blocked', 'attention'):
-        state.update(pending=False, attention=outcome.get('summary', status))
+        slot['pending'] = False
+        state.update(not_before=time.time() + 6 * 3600)
+    elif status == 'permission_blocked':
+        slot['pending'] = False
+        state.update(attention=outcome.get('summary', status))
     elif status == 'resource_wait':
-        state['pending'] = False
+        slot['pending'] = False
+        state['not_before'] = time.time() + 1800
+    if result.returncode == 0 and status:
+        state['executor_errors'] = 0
+    # A model's attention/failed result is a failed round, not a global latch.
     # repaired/resumed and failed count only when next stopped check finds no progress.
     save(state)
     record(f'本轮结束：{outcome.get("summary", state.get("attention", "见日志"))}；状态={status or "executor_error"}。')
@@ -177,13 +270,17 @@ def main():
                 raise SystemExit('Unexpected preflight response')
             print(payload['summary'])
             return
+        last_error = None
         while True:
             try:
                 tick()
+                last_error = None
             except Exception as exc:
-                # Preserve counters; halt inference on uncertain state.
-                record(f'ATTENTION：执行器安全暂停：{type(exc).__name__}: {exc}')
-                raise
+                # Preserve counters and keep checking; never infer from unreadable state.
+                message = f'{type(exc).__name__}: {exc}'
+                if message != last_error:
+                    record(f'ATTENTION：本次检查安全暂停：{message}；下一轮继续只读检查。')
+                last_error = message
             if args.once:
                 return
             time.sleep(INTERVAL)

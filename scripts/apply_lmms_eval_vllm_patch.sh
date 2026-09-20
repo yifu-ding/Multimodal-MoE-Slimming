@@ -12,6 +12,7 @@ VIDEOMME_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_vllm_qwen3_videomme.patch"
 VIDEOMMMU_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_vllm_qwen3_videommmu.patch"
 SHORT_VIDEO_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_vllm_chat_short_video.patch"
 PREFILL_METRICS_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_vllm_prefill_metrics.patch"
+MM_CACHE_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_vllm_mm_processor_cache.patch"
 
 if [[ ! -f "${TARGET}" ]]; then
     echo "error: local lmms-eval checkout is missing: ${TARGET}" >&2
@@ -23,6 +24,10 @@ if [[ ! -f "${CHAT_TARGET}" ]]; then
 fi
 
 silent_marker_count="$(grep -c '^[[:space:]]*use_tqdm=SILENT_VLLM_TQDM,$' "${TARGET}" || true)"
+if ! grep -q 'MAES_DISABLE_MM_PROCESSOR_CACHE' "${TARGET}"; then
+    patch --dry-run --silent --forward -d "${REPO_ROOT}" -p1 < "${MM_CACHE_PATCH_FILE}"
+    patch --silent --forward -d "${REPO_ROOT}" -p1 < "${MM_CACHE_PATCH_FILE}"
+fi
 if [[ "${silent_marker_count}" == "2" || "${silent_marker_count}" == "3" ]]; then
     :
 elif [[ "${silent_marker_count}" != "0" ]]; then

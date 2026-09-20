@@ -1,0 +1,9 @@
+--- a/lmms-eval/lmms_eval/models/simple/vllm.py
++++ b/lmms-eval/lmms_eval/models/simple/vllm.py
+@@ -205,1 +205,6 @@
++        # Runtime-only policy; does not invalidate persisted answer-cache keys.
++        if os.getenv("MAES_DISABLE_MM_PROCESSOR_CACHE", "0") == "1":
++            kwargs["mm_processor_cache_gb"] = 0
++            eval_logger.info("Disabling vLLM multimodal processor cache; answer cache unchanged")
++
+         # Set up vllm client

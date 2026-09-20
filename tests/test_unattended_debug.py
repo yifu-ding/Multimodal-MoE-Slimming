@@ -8,6 +8,25 @@ import unattended_debug as d
 
 
 class DebugTests(unittest.TestCase):
+    def test_failed_scope_does_not_block_next_model(self):
+        state = {'current_scope': 'internvl3_5-30b-a3b:p30', 'scopes': {
+            'internvl3_5-30b-a3b:p30': {'progress': [], 'pending': True, 'failures': 2}}}
+        d.settle_round(state, [])
+        rows = [dict(model=m, ratio=r, complete=False) for m, r in d.SCOPES]
+        self.assertEqual(d.choose_scope(state, rows), 'qwen3-vl-30b-a3b:p50')
+        self.assertNotIn('attention', state)
+
+    def test_unrelated_progress_does_not_reset_scope_budget(self):
+        state = {'current_scope': 'kimi:p50', 'scopes': {
+            'kimi:p50': {'progress': [], 'pending': True, 'failures': 2}}}
+        d.settle_round(state, ['qwen3-vl-30b-a3b:p50:gqa'])
+        self.assertIn('kimi:p50', state['deferred'])
+
+    def test_all_exhausted_is_not_complete(self):
+        rows = [dict(model=m, ratio=r, complete=False) for m, r in d.SCOPES]
+        state = {'deferred': {f'{m}:{r}': 'failed' for m, r in d.SCOPES}}
+        self.assertIsNone(d.choose_scope(state, rows))
+
     def test_healthy_never_invokes_codex(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp, patch.object(d, 'BASE', Path(tmp)), \
