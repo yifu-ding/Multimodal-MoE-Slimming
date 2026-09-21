@@ -32,6 +32,7 @@ PY
     exit 2
 }
 echo "[MAES EP4] ${PLAN_INFO}"
+PLAN_SHA256="$(sha256sum "${EP4_PLAN}" | awk '{print $1}')"
 
 case "${MODEL}" in
     moonshotai/Kimi-VL-A3B-Instruct)
@@ -55,6 +56,7 @@ esac
 PRUNING_LABEL="${PRUNING_LABEL:-ours}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/results/vllm_ours/${MODEL_TAG}}"
 export MAES_EP4_PLAN="$(realpath "${EP4_PLAN}")"
+export MAES_EXPERIMENT_FINGERPRINT="ep4_plan_sha256=${PLAN_SHA256}"
 export PYTHONPATH="${REPO_ROOT}/runtime/vllm_ep4${PYTHONPATH:+:${PYTHONPATH}}"
 export MODEL OUTPUT_ROOT
 export BASELINE_LABEL="${BASELINE_LABEL:-${MODEL_TAG}_${PRUNING_LABEL}}"

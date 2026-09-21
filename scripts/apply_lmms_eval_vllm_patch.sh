@@ -13,6 +13,8 @@ VIDEOMMMU_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_vllm_qwen3_videommmu.patch"
 SHORT_VIDEO_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_vllm_chat_short_video.patch"
 PREFILL_METRICS_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_vllm_prefill_metrics.patch"
 MM_CACHE_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_vllm_mm_processor_cache.patch"
+RESPONSE_CACHE_IDENTITY_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_response_cache_identity.patch"
+RESPONSE_CACHE_TARGET="${REPO_ROOT}/lmms-eval/lmms_eval/caching/response_cache.py"
 
 if [[ ! -f "${TARGET}" ]]; then
     echo "error: local lmms-eval checkout is missing: ${TARGET}" >&2
@@ -21,6 +23,18 @@ fi
 if [[ ! -f "${CHAT_TARGET}" ]]; then
     echo "error: local lmms-eval chat vLLM backend is missing: ${CHAT_TARGET}" >&2
     exit 2
+fi
+if [[ ! -f "${RESPONSE_CACHE_TARGET}" ]]; then
+    echo "error: local lmms-eval response cache is missing: ${RESPONSE_CACHE_TARGET}" >&2
+    exit 2
+fi
+
+if ! grep -q '^RUNTIME_ONLY_MODEL_ARGS = frozenset(' "${RESPONSE_CACHE_TARGET}"; then
+    if ! patch --dry-run --silent --forward -d "${REPO_ROOT}" -p1 < "${RESPONSE_CACHE_IDENTITY_PATCH_FILE}"; then
+        echo "error: ${RESPONSE_CACHE_IDENTITY_PATCH_FILE} does not apply to the current lmms-eval checkout." >&2
+        exit 2
+    fi
+    patch --silent --forward -d "${REPO_ROOT}" -p1 < "${RESPONSE_CACHE_IDENTITY_PATCH_FILE}"
 fi
 
 silent_marker_count="$(grep -c '^[[:space:]]*use_tqdm=SILENT_VLLM_TQDM,$' "${TARGET}" || true)"

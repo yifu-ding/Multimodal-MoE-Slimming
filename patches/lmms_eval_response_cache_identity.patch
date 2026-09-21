@@ -1,0 +1,102 @@
+--- a/lmms-eval/lmms_eval/caching/response_cache.py
++++ b/lmms-eval/lmms_eval/caching/response_cache.py
+@@ -51,2 +51,13 @@ CACHE_RELEVANT_KEYS = frozenset(
+     }
+ )
++RUNTIME_ONLY_MODEL_ARGS = frozenset(
++    {
++        "disable_log_stats",
++        "enforce_eager",
++        "gpu_memory_utilization",
++        "kv_cache_memory_bytes",
++        "max_num_batched_tokens",
++        "max_num_seqs",
++    }
++)
++
+@@ -419,17 +430,27 @@ class ResponseCache:
+-        # Model fingerprint
++        # Model fingerprint. Resource and scheduler knobs do not change the
++        # experiment, so retries may tune them without invalidating responses.
+         if isinstance(model_args, dict):
+-            model_args_fp = json.dumps(model_args, sort_keys=True, ensure_ascii=True, separators=(",", ":"), default=str)
++            parsed = model_args
+         elif isinstance(model_args, str):
+             try:
+                 parsed = simple_parse_args_string(model_args)
+             except Exception:
+                 parsed = model_args
+-            if isinstance(parsed, dict):
+-                model_args_fp = json.dumps(parsed, sort_keys=True, ensure_ascii=True, separators=(",", ":"), default=str)
+-            else:
+-                model_args_fp = str(model_args)
+         else:
+-            model_args_fp = str(model_args)
+-        model_fp = f"{model}|{model_args_fp}"
++            parsed = model_args
++        if isinstance(parsed, dict):
++            full_model_args_fp = json.dumps(parsed, sort_keys=True, ensure_ascii=True, separators=(",", ":"), default=str)
++            semantic_model_args = {
++                key: value
++                for key, value in parsed.items()
++                if key not in RUNTIME_ONLY_MODEL_ARGS
++            }
++            model_args_fp = json.dumps(semantic_model_args, sort_keys=True, ensure_ascii=True, separators=(",", ":"), default=str)
++        else:
++            full_model_args_fp = str(parsed)
++            model_args_fp = str(parsed)
++        fingerprint_salt = os.environ.get("LMMS_CACHE_FINGERPRINT_SALT", "")
++        model_fp = f"{model}|{model_args_fp}|{fingerprint_salt}"
++        legacy_model_fp = f"{model}|{full_model_args_fp}"
+         model_hash = hash_string(model_fp)[:16]
+         eval_version = get_lmms_eval_cache_version()
+@@ -465,6 +486,7 @@ class ResponseCache:
+             task_fingerprints=task_fingerprints,
+             shared_db_path=shared_db_path,
+             eval_version=eval_version,
++            legacy_model_fingerprint_hashes=[hash_string(legacy_model_fp)[:16]],
+         )
+         # Store metadata for finalize()
+         instance._cache_root = cache_root
+@@ -495,12 +517,18 @@ class ResponseCache:
+         task_fingerprints: Optional[Dict[str, str]] = None,
+         shared_db_path: Optional[str] = None,
+         eval_version: str = "",
++        legacy_model_fingerprint_hashes: Optional[List[str]] = None,
+     ):
+         self.db_path = db_path
+         self.audit_path = audit_path
+         self.model_fingerprint = model_fingerprint
+         self._model_fingerprint_hash = _short_hash(model_fingerprint)
+         self._task_fingerprints: Dict[str, str] = task_fingerprints or {}
+         self._eval_version = eval_version
++        self._legacy_model_fingerprint_hashes = [
++            value
++            for value in (legacy_model_fingerprint_hashes or [])
++            if value and value != self._model_fingerprint_hash
++        ]
+         self.db: Optional[sqlite3.Connection] = None
+         self._audit_file = None
+@@ -850,6 +878,22 @@ class ResponseCache:
+                 eval_version=self._eval_version,
+             )
+             cached = self._lookup(cache_key)
++            if cached is None:
++                for legacy_hash in self._legacy_model_fingerprint_hashes:
++                    legacy_key = compute_cache_key(
++                        request_type=reqtype,
++                        task_name=req.task_name,
++                        doc_id=req.doc_id,
++                        gen_kwargs=gen_kwargs,
++                        idx=req.idx,
++                        content_hash=ch,
++                        task_fingerprint=tf,
++                        model_fingerprint_hash=legacy_hash,
++                        eval_version=self._eval_version,
++                    )
++                    cached = self._lookup(legacy_key)
++                    if cached is not None:
++                        break
+             if cached is not None:
+                 results[i] = cached
+                 self._hits += 1

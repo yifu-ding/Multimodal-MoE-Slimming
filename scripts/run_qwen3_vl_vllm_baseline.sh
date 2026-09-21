@@ -201,6 +201,43 @@ export VIDEO_MMMU_ROOT="${VIDEO_MMMU_ROOT:-${HF_DATASETS_CACHE}/VideoMMMU}"
 export VIDEO_MMMU_MEDIA_LOG="${VIDEO_MMMU_MEDIA_LOG:-${RUN_DIR}/video_mmmu_media_paths.jsonl}"
 export EGOSCHEMA_ROOT="${EGOSCHEMA_ROOT:-${HF_DATASETS_CACHE}/egoschema}"
 
+EXPERIMENT_IDENTITY_FILE="${RUN_DIR}/experiment_identity.txt"
+EXPERIMENT_IDENTITY="$({
+    printf '%s\n' \
+        "model=${MODEL}" \
+        "model_variant=${MAES_EXPERIMENT_FINGERPRINT:-unpruned}" \
+        "dtype=bfloat16" \
+        "limit=${LIMIT:-full}" \
+        "max_model_len=${MAX_MODEL_LEN}" \
+        "videomme_max_model_len=${VIDEOMME_MAX_MODEL_LEN}" \
+        "video_mmmu_max_model_len=${VIDEO_MMMU_MAX_MODEL_LEN}" \
+        "max_frame_num=${MAX_FRAME_NUM}" \
+        "video_nframes=${VIDEO_NFRAMES:-default}" \
+        "max_new_tokens=${MAX_NEW_TOKENS}" \
+        "image_first=${IMAGE_FIRST_ARG}" \
+        "limit_mm_per_prompt=${LIMIT_MM_PER_PROMPT_JSON:-default}" \
+        "qwen3_native_video=${ENABLE_QWEN3_NATIVE_VIDEO}" \
+        "videomme_fps=${QWEN3_VIDEOMME_FPS}" \
+        "videomme_max_frames=${QWEN3_VIDEOMME_MAX_FRAMES}" \
+        "videomme_min_tokens_per_frame=${QWEN3_VIDEOMME_MIN_TOKENS_PER_FRAME}" \
+        "videomme_max_tokens_per_frame=${QWEN3_VIDEOMME_MAX_TOKENS_PER_FRAME}" \
+        "videomme_total_video_tokens=${QWEN3_VIDEOMME_TOTAL_VIDEO_TOKENS}" \
+        "video_mmmu_fps=${QWEN3_VIDEOMMMU_FPS}" \
+        "video_mmmu_max_frames=${QWEN3_VIDEOMMMU_MAX_FRAMES}" \
+        "video_mmmu_max_tokens_per_frame=${QWEN3_VIDEOMMMU_MAX_TOKENS_PER_FRAME}" \
+        "video_mmmu_total_video_tokens=${QWEN3_VIDEOMMMU_TOTAL_VIDEO_TOKENS}"
+})"
+if [[ -s "${EXPERIMENT_IDENTITY_FILE}" ]] && [[ "$(<"${EXPERIMENT_IDENTITY_FILE}")" != "${EXPERIMENT_IDENTITY}" ]]; then
+    echo "error: RUN_DIR belongs to a different experiment: ${RUN_DIR}" >&2
+    echo "       Use a new RUN_DIR for a different model, EP4 plan, limit, or media protocol." >&2
+    diff -u "${EXPERIMENT_IDENTITY_FILE}" <(printf '%s\n' "${EXPERIMENT_IDENTITY}") >&2 || true
+    exit 2
+fi
+if [[ ! -e "${EXPERIMENT_IDENTITY_FILE}" ]]; then
+    printf '%s\n' "${EXPERIMENT_IDENTITY}" > "${EXPERIMENT_IDENTITY_FILE}.tmp.$$"
+    mv "${EXPERIMENT_IDENTITY_FILE}.tmp.$$" "${EXPERIMENT_IDENTITY_FILE}"
+fi
+
 # A RUN_DIR may intentionally be reused to fill in missing tasks. Preserve all
 # run-level metadata from earlier invocations instead of replacing it.
 unique_invocation_path() {
@@ -288,6 +325,13 @@ response_cache_batch_size_for() {
     esac
 }
 
+response_cache_fingerprint_for() {
+    local task_name="$1"
+    {
+        printf '%s\n' "${EXPERIMENT_IDENTITY}" "task=${task_name}"
+    } | sha256sum | awk '{print $1}'
+}
+
 # GPT-dependent tasks run in output-only mode after the regular benchmark pass.
 # This keeps the four inference GPUs dedicated to the evaluated model. Their
 # JSONL predictions can be scored after the model process has exited.
@@ -340,6 +384,7 @@ build_command() {
     local cache_root="$7"
     local heartbeat_dir="$8"
     local cache_batch_size="$9"
+    local cache_fingerprint="${10}"
     local disable_mm_processor_cache=0
     case "${task_name}" in
         egoschema_subset_local|mvbench_available_3800)
@@ -353,6 +398,7 @@ build_command() {
         "LMMS_CACHE_RUN_ID=${BASELINE_LABEL}-${PARALLEL_MODE}-${task_name}"
         "LMMS_CACHE_WRITE_THROUGH_BATCH_SIZE=${cache_batch_size}"
         "LMMS_CACHE_CHECKPOINT_INTERVAL=1"
+        "LMMS_CACHE_FINGERPRINT_SALT=${cache_fingerprint}"
         "MAES_EFFICIENCY_TRACE=${MAES_EFFICIENCY_TRACE:-}"
         "MAES_EFFICIENCY_WARMUP_BATCHES=${MAES_EFFICIENCY_WARMUP_BATCHES:-0}"
         bash "${SCRIPT_DIR}/run_with_stall_watchdog.sh"
@@ -515,7 +561,7 @@ run_task_once() {
     local complete_marker="${TASK_STATUS_ROOT}/${safe_task}.complete"
     local failed_marker="${TASK_STATUS_ROOT}/${safe_task}.failed"
     local task_limit="${LIMIT}"
-    local task_batch_size cache_batch_size task_model_args
+    local task_batch_size cache_batch_size task_model_args cache_fingerprint
     local task_start task_end task_wall task_status task_signature
     local cache_root="${RUN_DIR}/response_cache/${safe_task}"
     local heartbeat_dir="${RUN_DIR}/watchdog/${safe_task}/${RUN_TIMESTAMP}-$$"
@@ -523,6 +569,7 @@ run_task_once() {
     task_batch_size="$(task_batch_size_for "${task_name}")"
     cache_batch_size="$(response_cache_batch_size_for "${task_name}" "${task_batch_size}")"
     task_model_args="$(model_args_for_task "${task_name}")"
+    cache_fingerprint="$(response_cache_fingerprint_for "${task_name}")"
 
     # MME scores paired yes/no questions and cannot aggregate an odd prefix.
     if [[ "${task_name}" == "mme" && "${task_limit}" =~ ^[0-9]+$ ]]; then
@@ -572,7 +619,7 @@ run_task_once() {
     preserve_existing_marker "${failed_marker}"
     mkdir -p "${task_output_dir}"
     task_log="$(unique_invocation_path "${task_log}")"
-    build_command "${task_name}" "${predict_only}" "${task_output_dir}" "${task_limit}" "${task_batch_size}" "${task_model_args}" "${cache_root}" "${heartbeat_dir}" "${cache_batch_size}"
+    build_command "${task_name}" "${predict_only}" "${task_output_dir}" "${task_limit}" "${task_batch_size}" "${task_model_args}" "${cache_root}" "${heartbeat_dir}" "${cache_batch_size}" "${cache_fingerprint}"
     {
         printf 'task_%s_command=' "${safe_task}"
         printf '%q ' "${CMD[@]}"

@@ -30,9 +30,10 @@ LOG_SAMPLES=0
 PYTHON_CMD=(python)
 '''
         for task, flag in [('egoschema_subset_local', '1'), ('mvbench_available_3800', '1'), ('gqa', '0'), ('videomme_qwen3_vllm', '0')]:
-            command = setup + f'build_command {task} 0 /tmp/output "" 8 unchanged_args /tmp/answers /tmp/heartbeat 1\nprintf "%s\\n" "${{CMD[@]}}"'
+            command = setup + f'build_command {task} 0 /tmp/output "" 8 unchanged_args /tmp/answers /tmp/heartbeat 1 semantic-id\nprintf "%s\\n" "${{CMD[@]}}"'
             args = subprocess.check_output(['bash', '-c', command], text=True).splitlines()
             self.assertIn('MAES_DISABLE_MM_PROCESSOR_CACHE=' + flag, args)
+            self.assertIn('LMMS_CACHE_FINGERPRINT_SALT=semantic-id', args)
             self.assertEqual(args[args.index('--model_args') + 1], 'unchanged_args')
             self.assertEqual(args[args.index('--use_cache') + 1], '/tmp/answers')
 
