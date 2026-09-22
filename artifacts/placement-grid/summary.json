@@ -1,0 +1,15 @@
+{
+  "cases_sha256": "59ffe063593a42f7190df384dff9631b675d66af72a9b887645273cdcbb04bfc",
+  "experiment": "placement-grid-summary",
+  "experiment_sha256": "2917ba8ec237e93a414a11bfaafde7d89c79ce5287212d16ba64125895348e2e",
+  "figures": [
+    "heatmap-p30.png",
+    "heatmap-p50.png"
+  ],
+  "max_seconds": 876.5432346260059,
+  "median_seconds": 22.02764040500915,
+  "num_cases": 144,
+  "num_computed": 126,
+  "num_proven": 101,
+  "num_reused": 18
+}
