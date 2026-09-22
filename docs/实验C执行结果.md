@@ -1,16 +1,18 @@
 # 实验 C：Greedy 与 MILP
 
 > [!IMPORTANT]
-> **E0c DONE（2026-09-22 18:50 CST）**
-> EP 规模与层深网格已完成 144/144，并通过完成检查。101 个格点取得最优性证明，43 个格点在预算内未认证。
+> **E0c + constructive fallback DONE（2026-09-22）**
+> EP 规模与层深网格已完成 144/144，并通过完成检查。101 个格点取得最优性证明；其余 43 个格点的可行性 MILP 在预算结束时没有返回 incumbent，现均由构造式 G0 返回有效放置及认证下界。
 
 - 仓库汇总：`artifacts/placement-grid/summary.md`
 - 仓库逐格产物：`artifacts/placement-grid/cases/`
 - 完整 CSV 与热力图：`artifacts/placement-grid/grid.csv`、`heatmap-p30.png`、`heatmap-p50.png`
+- 43 个 fallback 汇总：`artifacts/placement-grid-fallback/summary.md`
 - 复用 E0/E0b 产物 18 个，新计算 126 个；每个新 case 使用互不重叠的四物理核 affinity。
 - p=0.3、L=48：m=4/6/8/12/16 均达到并证明 `DeltaPhi=128`；m=24/32/48/64 在预算内未认证。
 - p=0.5、L=48：m=4/6/8/12/16/24/32/48/64 全部达到并证明 `DeltaPhi=0`；m=48 为 83.253 秒，m=64 为 110.746 秒。
 - `time_limit=300` 是 HiGHS 求解器预算，不包含 Python 建模和部分预处理；最大格点总墙钟为 876.543 秒，不能表述为“每格总墙钟最多 300 秒”。
+- 43/43 个预算结束 case 均返回完整 G0；构造中位耗时 0.00592 秒、最大 0.02299 秒。37 个 case 保留算术下界，6 个 case 通过已证明 infeasible 的 target 进一步抬高下界；G0 的认证近似比上界中位为 5x、最大为 8x。
 - 论文正文仍未修改。
 
 > [!IMPORTANT]

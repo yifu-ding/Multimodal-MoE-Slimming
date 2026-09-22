@@ -1,0 +1,10 @@
+{
+  "experiment": "placement-grid-constructive-fallback",
+  "max_approximation_ratio_upper_bound": 8.0,
+  "max_fallback_seconds": 0.02298860900918953,
+  "median_absolute_gap_upper_bound": 512.0,
+  "median_approximation_ratio_upper_bound": 5.0,
+  "median_fallback_seconds": 0.005918615002883598,
+  "num_cases": 43,
+  "num_returned": 43
+}

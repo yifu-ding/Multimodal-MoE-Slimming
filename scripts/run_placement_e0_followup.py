@@ -18,7 +18,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.run_placement_ablation import checkpoint, environment_metadata, warm_up_highs
+from scripts.run_placement_ablation import (
+    checkpoint,
+    environment_metadata,
+    placement_summary,
+    warm_up_highs,
+)
 from scripts.run_placement_e0 import (
     canonical_digest,
     load_plan,
@@ -30,6 +35,7 @@ from scripts.run_placement_e0 import (
 from src.generate_mask.ep4_intplan import (
     _build_layer_placement_groups,
     _placement_spread_arithmetic_lower_bound,
+    _solve_placement_groups_greedy,
 )
 
 DEFAULT_DEPTH = Path("results/placement_ablation/depth_sweep.json")
@@ -206,6 +212,80 @@ def build_manifest(args: argparse.Namespace) -> None:
     print(f"wrote {len(cases)} E0b cases to {args.output}")
 
 
+def build_constructive_fallback(
+    counts: torch.Tensor, widths: torch.Tensor
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    placement = _solve_placement_groups_greedy(
+        counts,
+        widths,
+        max_local_search_passes=0,
+        refinement_neighborhood="pairwise_swap",
+    )
+    summary = placement_summary(placement)
+    summary["elapsed_seconds"] = time.perf_counter() - started
+    summary["construction"] = "descending_group_load_to_ascending_rank_load"
+    return summary
+
+
+def certified_lower_bound_from_attempts(
+    *, floor: float, quantum: float, attempts: list[dict[str, Any]]
+) -> tuple[float, float | None]:
+    lower_bound = floor
+    last_infeasible_target = None
+    for attempt in attempts:
+        if int(attempt["solver_status"]) != 2:
+            break
+        last_infeasible_target = float(attempt["target_spread"])
+        lower_bound = max(lower_bound, last_infeasible_target + quantum)
+    return lower_bound, last_infeasible_target
+
+
+def attach_constructive_fallback(
+    counts: torch.Tensor,
+    widths: torch.Tensor,
+    ladder: dict[str, Any],
+    *,
+    constructive: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if ladder.get("found_feasible"):
+        return ladder
+    arithmetic = _placement_spread_arithmetic_lower_bound(counts, widths)
+    floor = float(arithmetic["arithmetic_spread_lower_bound"])
+    quantum = float(arithmetic["arithmetic_quantum"])
+    fallback = constructive or build_constructive_fallback(counts, widths)
+    lower_bound, last_infeasible_target = certified_lower_bound_from_attempts(
+        floor=floor, quantum=quantum, attempts=ladder["attempts"]
+    )
+    fallback_spread = float(fallback["spread"])
+    if fallback_spread + 1e-6 < lower_bound:
+        raise RuntimeError(
+            f"constructive spread {fallback_spread} is below certified lower bound "
+            f"{lower_bound}"
+        )
+    absolute_gap = fallback_spread - lower_bound
+    relative_gap = absolute_gap / lower_bound if lower_bound > 0.0 else None
+    approximation_ratio = fallback_spread / lower_bound if lower_bound > 0.0 else None
+    milp_elapsed = float(ladder["elapsed_seconds"])
+    return {
+        **ladder,
+        "spread": fallback_spread,
+        "rank_weight_loads": fallback["rank_weight_loads"],
+        "returned_placement": fallback,
+        "returned_via": "constructive_fallback",
+        "fallback_used": True,
+        "constructive_fallback": fallback,
+        "last_proven_infeasible_target": last_infeasible_target,
+        "certified_lower_bound": lower_bound,
+        "certified_absolute_gap_upper_bound": absolute_gap,
+        "certified_relative_gap_upper_bound": relative_gap,
+        "certified_approximation_ratio_upper_bound": approximation_ratio,
+        "milp_ladder_elapsed_seconds": milp_elapsed,
+        "elapsed_seconds": milp_elapsed + float(fallback["elapsed_seconds"]),
+        "stopped_reason": "budget_constructive_fallback",
+    }
+
+
 def solve_feasibility_ladder(
     counts: torch.Tensor,
     widths: torch.Tensor,
@@ -214,6 +294,7 @@ def solve_feasibility_ladder(
 ) -> dict[str, Any]:
     if total_time_limit <= 0.0:
         raise ValueError("total_time_limit must be positive")
+    constructive = build_constructive_fallback(counts, widths)
     arithmetic = _placement_spread_arithmetic_lower_bound(counts, widths)
     floor = float(arithmetic["arithmetic_spread_lower_bound"])
     quantum = float(arithmetic["arithmetic_quantum"])
@@ -254,6 +335,18 @@ def solve_feasibility_ladder(
                 "elapsed_seconds": time.perf_counter() - started,
                 "optimality_proven": all_lower_targets_infeasible,
                 "optimality_proof": proof if all_lower_targets_infeasible else None,
+                "returned_placement": result,
+                "returned_via": "milp_feasibility",
+                "fallback_used": False,
+                "constructive_fallback": constructive,
+                "last_proven_infeasible_target": (
+                    target - quantum if len(attempts) > 1 else None
+                ),
+                "certified_lower_bound": spread,
+                "certified_absolute_gap_upper_bound": 0.0,
+                "certified_relative_gap_upper_bound": 0.0,
+                "certified_approximation_ratio_upper_bound": 1.0,
+                "milp_ladder_elapsed_seconds": time.perf_counter() - started,
                 "stopped_reason": "feasible",
             }
         if int(result["solver_status"]) != 2:
@@ -261,7 +354,7 @@ def solve_feasibility_ladder(
             break
         target += quantum
 
-    return {
+    ladder = {
         "attempts": attempts,
         "found_feasible": False,
         "retry_count": max(0, len(attempts) - 1),
@@ -272,6 +365,9 @@ def solve_feasibility_ladder(
         "optimality_proof": None,
         "stopped_reason": "budget_or_unproven",
     }
+    return attach_constructive_fallback(
+        counts, widths, ladder, constructive=constructive
+    )
 
 
 def run_case(

@@ -82,16 +82,21 @@ max_load - min_load <= floor
 
 Arm B 才实现“命中 floor 后立即返回”的真实早停。Arm A 用于测预算阶梯下的可观测上界，两者都保留。
 
-## 停止规则
+## 停止规则与构造式终止保证
 
 ```text
+G0 <- pair descending group loads with ascending accumulated rank loads
 floor = 0 if total_quanta % m == 0 else quantum
+target <- floor
 
-incumbent reaches floor -> return with arithmetic optimality proof
-budget B is exhausted   -> return incumbent if any and report OOT/unproven
+feasible(target)   -> return its placement with an optimality proof
+infeasible(target) -> target <- target + quantum
+budget exhausted   -> return G0 with certified lower bound = target
 ```
 
-两个条件缺一不可。不能只等待 floor，因为 floor 可能组合上不可达，或在现实预算内找不到；也不能只等固定时限，因为命中严格下界后继续搜索没有意义。
+构造式 G0 是 `O(L*m log m)` 的确定性终止保证，不依赖 MILP 的 primal heuristic 是否及时找到第一个整数可行点。它不是主体求解方法；主体仍是“闭式算术下界 + 有界可行性 MILP”。若当前 target 超时，只有更低 target 被明确证明 infeasible 时才抬高认证下界；否则认证下界仍是算术 floor。特别地，若上一档 `target-quantum` 已证明 infeasible，则离散性给出的下界是当前 `target`，而不是 `target-quantum`。
+
+两个停止条件缺一不可。不能只等待 floor，因为 floor 可能组合上不可达，或在现实预算内找不到；也不能只等固定时限，因为命中严格下界后继续搜索没有意义。
 
 ## CPU 并行与计时
 
@@ -207,11 +212,24 @@ E0c 只补实验与过程记录，结果审阅前仍不修改论文正文。
 
 ### E0c 最终结果（2026-09-22 18:50 CST）
 
-144/144 个格点均达到有效终态并通过产物检查：101 个取得最优性证明，43 个在预算内未认证；18 个格点复用 E0/E0b，126 个格点新计算。完整结果见 `artifacts/placement-grid/summary.md`。
+144/144 个格点均达到有效终态并通过产物检查：101 个取得最优性证明，43 个可行性 MILP 在预算内没有返回 incumbent；18 个格点复用 E0/E0b，126 个格点新计算。完整结果见 `artifacts/placement-grid/summary.md`。
 
 L=48 的 EP 扫描给出两种明显不同的情形：
 
 - p=0.3 的算术下界为 128。m=4/6/8/12/16 分别在 0.368/1.384/2.132/11.648/35.056 秒达到并证明下界；m=24/32/48/64 未在预算内取得可认证解。
 - p=0.5 的算术下界为 0。m=4/6/8/12/16/24/32/48/64 全部找到完美均衡；除 m=48 的 83.253 秒和 m=64 的 110.746 秒外，其余均在 3 秒内完成。
 
-因此不能笼统声称“m 越大必然出现求解断崖”：可认证性强烈依赖 plan/剪枝率对应的组合结构。但 p=0.3 的结果也表明，300 秒求解预算下从 m=24 开始需要保留 fallback 或明确报告未认证。`time_limit=300` 只约束 HiGHS 内部求解，不覆盖 Python 建模与部分预处理；报告总墙钟时必须使用实际观测值，最大为 876.543 秒。
+因此不能笼统声称“m 越大必然出现求解断崖”：可认证性强烈依赖 plan/剪枝率对应的组合结构。但 p=0.3 的结果也表明，300 秒求解预算下从 m=24 开始需要保留 fallback。`time_limit=300` 只约束 HiGHS 内部求解，不覆盖 Python 建模与部分预处理；报告总墙钟时必须使用实际观测值，最大为 876.543 秒。
+
+### E0c constructive fallback 验证（2026-09-22）
+
+43 个预算结束格点的原始 ladder 记录逐字节复用，没有重复执行 300 秒 MILP。原始终态全部是 HiGHS time limit、`primal_status=None`、`spread=null`，即求解器没有返回任何整数可行 incumbent，而不是“有解但未证明最优”。
+
+在进入 ladder 前构造 G0；若 ladder 超时，则返回 G0 和已有证明能支持的最强下界。验证结果：
+
+- 43/43 返回完整 placement；G0 构造耗时中位 0.00592 秒、最大 0.02299 秒。
+- 37 个格点未证明任何 target infeasible，认证下界保持算术 floor；4 个证明一档、1 个证明两档、1 个证明三档 infeasible。
+- G0 的认证近似比上界中位为 5x、最大为 8x；绝对 gap 上界中位为 512 个 width-load 单位。
+- `grid-p30-l04-m12` 的 128/256/384 三档均已证明 infeasible，512 档超时，因此返回 G0 spread=896，并认证 `DeltaPhi >= 512`，近似比上界为 1.75x。
+
+逐格结果与来源 SHA256 见 `artifacts/placement-grid-fallback/`。这验证了 Algorithm 2 的预算耗尽分支：MILP 是否及时产生 incumbent 不再影响算法返回有效放置；未认证的是 G0 的最优性，不是放置可行性。

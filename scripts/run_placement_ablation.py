@@ -158,6 +158,21 @@ def checkpoint(path: Path, payload: dict[str, Any]) -> None:
 
 def placement_summary(result: dict[str, Any]) -> dict[str, Any]:
     return {
+        "rank_group_indices": (
+            result["rank_group_indices"].tolist()
+            if result.get("rank_group_indices") is not None
+            else None
+        ),
+        "group_to_rank": (
+            result["group_to_rank"].tolist()
+            if result.get("group_to_rank") is not None
+            else None
+        ),
+        "rank_widths": (
+            result["rank_widths"].tolist()
+            if result.get("rank_widths") is not None
+            else None
+        ),
         "rank_weight_loads": result["rank_weight_loads"].tolist(),
         "spread": float(result["rank_weight_spread"]),
         "relative_spread": float(result["relative_rank_weight_spread"]),
@@ -193,6 +208,9 @@ def placement_summary(result: dict[str, Any]) -> dict[str, Any]:
 def no_incumbent_summary(error: PlacementMilpNoIncumbentError) -> dict[str, Any]:
     diagnostics = error.diagnostics
     return {
+        "rank_group_indices": None,
+        "group_to_rank": None,
+        "rank_widths": None,
         "rank_weight_loads": None,
         "spread": None,
         "relative_spread": None,

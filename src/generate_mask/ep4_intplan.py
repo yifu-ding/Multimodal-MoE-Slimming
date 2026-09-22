@@ -1375,10 +1375,13 @@ def _solve_placement_groups_greedy(
     rank_group_indices_tensor = torch.from_numpy(rank_group_indices.copy())
     group_to_rank = torch.empty_like(counts)
     rank_widths = torch.empty_like(widths)
-    permutation_ids = torch.empty(num_layers, dtype=torch.int64)
+    permutation_ids = (
+        torch.empty(num_layers, dtype=torch.int64) if ep_size <= 20 else None
+    )
     for layer in range(num_layers):
         permutation = rank_group_indices[layer].tolist()
-        permutation_ids[layer] = _permutation_id(permutation)
+        if permutation_ids is not None:
+            permutation_ids[layer] = _permutation_id(permutation)
         for rank, group in enumerate(permutation):
             group_to_rank[layer, group] = rank
             rank_widths[layer, rank] = widths[layer, group]

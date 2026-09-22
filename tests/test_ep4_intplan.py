@@ -1,5 +1,6 @@
 import torch
 
+import scripts.run_placement_e0_followup as e0_followup
 from scripts.run_placement_e0_followup import solve_feasibility_ladder
 from src.generate_mask.ep4_intplan import (
     DEFAULT_WIDTHS,
@@ -364,6 +365,36 @@ def test_feasibility_ladder_retries_until_first_feasible_quantum():
     assert result["spread"] == 384.0
     assert result["optimality_proven"]
     assert result["optimality_proof"] == "quantum_feasibility_ladder"
+    assert result["returned_via"] == "milp_feasibility"
+    assert not result["fallback_used"]
+    assert result["returned_placement"]["rank_group_indices"] is not None
+
+
+def test_feasibility_ladder_timeout_returns_constructive_placement(monkeypatch):
+    counts = torch.ones((1, 4), dtype=torch.int64)
+    widths = torch.tensor([[768, 640, 512, 384]], dtype=torch.int64)
+
+    def fake_solve_once(*args, spread_upper_bound, **kwargs):
+        status = 2 if spread_upper_bound == 128.0 else 1
+        return {
+            "incumbent": None,
+            "spread": None,
+            "solver_status": status,
+            "solver_message": "infeasible" if status == 2 else "time limit",
+        }
+
+    monkeypatch.setattr(e0_followup, "solve_once", fake_solve_once)
+    result = solve_feasibility_ladder(counts, widths, total_time_limit=10.0)
+
+    assert not result["found_feasible"]
+    assert result["fallback_used"]
+    assert result["returned_via"] == "constructive_fallback"
+    assert result["spread"] == 384.0
+    assert result["certified_lower_bound"] == 256.0
+    assert result["certified_absolute_gap_upper_bound"] == 128.0
+    assert result["certified_relative_gap_upper_bound"] == 0.5
+    assert result["certified_approximation_ratio_upper_bound"] == 1.5
+    assert result["returned_placement"]["rank_group_indices"] == [[0, 1, 2, 3]]
 
 
 def test_greedy_and_milp_fix_the_same_first_layer():
@@ -390,3 +421,20 @@ def test_sort_greedy_supports_sixteen_ranks_without_permutation_enumeration():
 
     assert result["rank_weight_loads"].shape == (16,)
     assert sorted(result["rank_group_indices"][0].tolist()) == list(range(16))
+
+
+def test_sort_greedy_supports_large_rank_count_without_permutation_id_overflow():
+    generator = torch.Generator().manual_seed(37)
+    counts = torch.randint(1, 9, (4, 24), generator=generator)
+    widths = torch.arange(24, 0, -1, dtype=torch.int64).mul(128).expand_as(counts)
+
+    result = _solve_placement_groups_greedy(
+        counts,
+        widths,
+        max_local_search_passes=0,
+    )
+
+    assert result["permutation_ids"] is None
+    assert result["rank_weight_loads"].shape == (24,)
+    for layer in result["rank_group_indices"]:
+        assert sorted(layer.tolist()) == list(range(24))
