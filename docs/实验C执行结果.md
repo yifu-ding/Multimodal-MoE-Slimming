@@ -19,3 +19,7 @@
 > [!IMPORTANT]
 > **DONE (2026-09-19 18:37 CST)**
 > 多窗口 depth sweep 与 M 扩展性扫描均已完成并通过产物检查。
+
+> [!IMPORTANT]
+> **SUPPLEMENT QUEUED（2026-09-22 CST）**
+> 新版补充实验已排在当前 Qwen3-VL p=0.3 视频流水线之后。范围包括 5 个 MILP 时限 pilot、三模型六份 plan 的 stride=4 滑窗、p=0.3 多模型 m 补点，以及 m=5/6/7 greedy 邻域直接对照。只有当前视频流水线通过完成校验后才会启动。
