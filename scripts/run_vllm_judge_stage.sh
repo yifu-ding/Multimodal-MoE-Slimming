@@ -8,6 +8,9 @@ JUDGE_MAX_ATTEMPTS="${JUDGE_MAX_ATTEMPTS:-2}"
 PORT="${PORT:-8010}"
 JUDGE_LOG="${JUDGE_LOG:-${PREDICTIONS_DIR}/local_judge/server.log}"
 JUDGE_MODEL="${JUDGE_MODEL:-/home/data/dyf/models/Qwen2.5-32B-Instruct}"
+JUDGE_RANDOM_SUBSET_FRACTION="${JUDGE_RANDOM_SUBSET_FRACTION:-}"
+JUDGE_RANDOM_SUBSET_MIN_SAMPLES="${JUDGE_RANDOM_SUBSET_MIN_SAMPLES:-500}"
+JUDGE_RANDOM_SUBSET_SEED="${JUDGE_RANDOM_SUBSET_SEED:-42}"
 SERVER_PID=""
 
 if [[ ! "${JUDGE_MAX_ATTEMPTS}" =~ ^[1-9][0-9]*$ ]]; then
@@ -83,12 +86,19 @@ judge_status=0
 for ((attempt = 1; attempt <= JUDGE_MAX_ATTEMPTS; attempt++)); do
     echo "[judge attempt] ${attempt}/${JUDGE_MAX_ATTEMPTS}; tasks=${TASKS}"
     set +e
+    judge_subset_args=()
+    if [[ -n "${JUDGE_RANDOM_SUBSET_FRACTION}" ]]; then
+        judge_subset_args+=(--random-subset-fraction "${JUDGE_RANDOM_SUBSET_FRACTION}" \
+            --random-subset-min-samples "${JUDGE_RANDOM_SUBSET_MIN_SAMPLES}" \
+            --random-subset-seed "${JUDGE_RANDOM_SUBSET_SEED}")
+    fi
     conda run --no-capture-output -n vllm-maes \
         python scripts/judge_vllm_predictions.py \
             --predictions-dir "${PREDICTIONS_DIR}" \
             --tasks "${TASKS}" \
             --api-base "http://127.0.0.1:${PORT}/v1" \
-            --workers "${JUDGE_WORKERS:-8}"
+            --workers "${JUDGE_WORKERS:-8}" \
+            "${judge_subset_args[@]}"
     judge_status=$?
     set -e
     (( judge_status == 0 )) && exit 0

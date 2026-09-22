@@ -1,0 +1,176 @@
+--- a/lmms-eval/lmms_eval/evaluator_utils.py
++++ b/lmms-eval/lmms_eval/evaluator_utils.py
+@@ -1,6 +1,8 @@
+ # credit to https://github.com/EleutherAI/lm-evaluation-harness
+ import collections
++import hashlib
+ import inspect
+ import math
++import random
+ import pathlib
+ import sys
+@@ -288,4 +290,54 @@ def get_sample_size(task, limit: Optional[Union[int, float]]) -> Union[int, None
+     return int(limit)
+ 
+ 
++def build_random_subset_doc_ids(task_sizes, task_groups, fraction, min_samples, seed):
++    """Return deterministic, exact-size, group-stratified document IDs."""
++    if not 0 < fraction <= 1:
++        raise ValueError(f"random subset fraction must be in (0, 1], got {fraction}")
++    if min_samples < 0:
++        raise ValueError(f"random subset minimum must be non-negative, got {min_samples}")
++
++    grouped_tasks = collections.defaultdict(list)
++    for task_name in sorted(task_sizes):
++        grouped_tasks[task_groups.get(task_name) or task_name].append(task_name)
++
++    selected = {}
++    for group_name, task_names in grouped_tasks.items():
++        total_size = sum(task_sizes[name] for name in task_names)
++        target = min(total_size, max(math.ceil(total_size * fraction), min_samples))
++        allocations = {}
++        remainders = []
++        allocated = 0
++        for task_name in task_names:
++            exact = task_sizes[task_name] * target / total_size if total_size else 0
++            count = min(task_sizes[task_name], math.floor(exact))
++            allocations[task_name] = count
++            allocated += count
++            remainders.append((exact - count, task_name))
++        for _, task_name in sorted(remainders, key=lambda item: (-item[0], item[1])):
++            if allocated >= target:
++                break
++            if allocations[task_name] < task_sizes[task_name]:
++                allocations[task_name] += 1
++                allocated += 1
++
++        for task_name in task_names:
++            task_size = task_sizes[task_name]
++            count = allocations[task_name]
++            if task_name == "mme" and 0 < count < task_size:
++                count = min(task_size, count + count % 2)
++                pair_count = task_size // 2
++                selected_pairs = count // 2
++                population = list(range(pair_count))
++                seed_material = f"{seed}:{group_name}:{task_name}:pairs"
++                task_seed = int.from_bytes(hashlib.sha256(seed_material.encode()).digest()[:8], "big")
++                pair_ids = random.Random(task_seed).sample(population, selected_pairs)
++                selected[task_name] = sorted(doc_id for pair_id in pair_ids for doc_id in (2 * pair_id, 2 * pair_id + 1))
++                continue
++            seed_material = f"{seed}:{group_name}:{task_name}"
++            task_seed = int.from_bytes(hashlib.sha256(seed_material.encode()).digest()[:8], "big")
++            selected[task_name] = sorted(random.Random(task_seed).sample(range(task_size), count))
++    return selected
++
++
+ def prepare_print_tasks(
+--- a/lmms-eval/lmms_eval/evaluator.py
++++ b/lmms-eval/lmms_eval/evaluator.py
+@@ -40,3 +40,4 @@ from lmms_eval.caching.response_cache import ResponseCache
+ from lmms_eval.evaluator_utils import (
+     compute_baseline_comparison,
++    build_random_subset_doc_ids,
+     consolidate_group_results,
+@@ -877,4 +878,28 @@ def evaluate(
+ 
+     # get lists of group hierarchy and each type of request
+     eval_tasks = get_task_list(task_dict)
++    subset_doc_ids = None
++    subset_fraction = getattr(cli_args, "random_subset_fraction", None) if cli_args else None
++    if subset_fraction is not None:
++        if limit not in (None, -1):
++            raise ValueError("--random_subset_fraction cannot be combined with --limit")
++        if offset:
++            raise ValueError("--random_subset_fraction cannot be combined with --offset")
++        task_sizes = {task_output.task_name: len(task_output.task.eval_docs) for task_output in eval_tasks}
++        task_groups = {task_output.task_name: task_output.group_name for task_output in eval_tasks}
++        for group_name, subtask_names in get_subtask_list(task_dict).items():
++            if not subtask_names:
++                continue
++            for subtask_name in subtask_names:
++                if subtask_name in task_groups:
++                    task_groups[subtask_name] = group_name
++        subset_doc_ids = build_random_subset_doc_ids(
++            task_sizes,
++            task_groups,
++            fraction=subset_fraction,
++            min_samples=getattr(cli_args, "random_subset_min_samples", 0),
++            seed=getattr(cli_args, "random_subset_seed", 42),
++        )
++        for task_name, doc_ids in subset_doc_ids.items():
++            eval_logger.info(f"Random subset: {task_name} selected {len(doc_ids)}/{task_sizes[task_name]} documents")
+     name_to_task = {}
+@@ -918,7 +938,7 @@ def evaluate(
+         if "task_alias" in configs[task_name]:
+             task_group_alias[task_name] = configs[task_name]["task_alias"]
+ 
+-        limit = get_sample_size(task, limit)
++        task_limit = get_sample_size(task, limit)
+         task.build_all_requests(
+-            limit=limit,
++            limit=task_limit,
+             offset=offset,
+@@ -932,3 +952,6 @@ def evaluate(
+             tokenizer_name=getattr(lm, "tokenizer_name", "") if apply_chat_template else "",
+         )
++        if subset_doc_ids is not None:
++            selected_ids = set(subset_doc_ids[task_name])
++            task._instances = [instance for instance in task.instances if instance.doc_id in selected_ids]
+         eval_logger.debug(f"Task: {task_output.task_name}; number of requests on this rank: {len(task._instances)}")
+@@ -1093,9 +1116,15 @@ def evaluate(
+             task_reasoning_tags = getattr(task.config, "reasoning_tags", None)
+             reasoning_tags = parse_reasoning_tags_config(cli_value=cli_reasoning_tags, task_value=task_reasoning_tags)
+ 
+-            if cli_args is not None and not cli_args.process_with_media:
++            if subset_doc_ids is not None:
++                selected_ids = subset_doc_ids[task_output.task_name]
++                docs = task.eval_docs_no_media if cli_args is not None and not cli_args.process_with_media else task.eval_docs
++                ranked_ids = [doc_id for doc_id in selected_ids if doc_id % WORLD_SIZE == RANK]
++                doc_iterator = ((doc_id, docs[doc_id]) for doc_id in ranked_ids)
++                total_docs = len(ranked_ids)
++            elif cli_args is not None and not cli_args.process_with_media:
+                 doc_iterator = create_iterator(
+                     enumerate(task.eval_docs_no_media),
+                     rank=RANK,
+-                    limit=int(limit) if limit else None,
++                    limit=int(task_limit) if task_limit else None,
+                     world_size=WORLD_SIZE,
+@@ -1102,10 +1131,11 @@ def evaluate(
+                     offset=offset,
+                 )
+             else:
+-                doc_iterator = task.doc_iterator(rank=RANK, limit=limit, world_size=WORLD_SIZE, offset=offset)
+-            doc_iterator_for_counting = (
++                doc_iterator = task.doc_iterator(rank=RANK, limit=task_limit, world_size=WORLD_SIZE, offset=offset)
++            if subset_doc_ids is None:
++                doc_iterator_for_counting = (
+                 create_iterator(
+                     range(len(task.test_docs())),
+                     rank=RANK,
+-                    limit=limit,
++                    limit=task_limit,
+                     world_size=WORLD_SIZE,
+@@ -1115,10 +1145,10 @@ def evaluate(
+                 else create_iterator(
+                     range(len(task.validation_docs())),
+                     rank=RANK,
+-                    limit=limit,
++                    limit=task_limit,
+                     world_size=WORLD_SIZE,
+                     offset=offset,
+                 )
+-            )
+-            total_docs = sum(1 for _ in doc_iterator_for_counting)
++                )
++                total_docs = sum(1 for _ in doc_iterator_for_counting)
+             pbar = tqdm(total=total_docs, desc="Postprocessing", disable=(RANK != 0))
+--- a/lmms-eval/lmms_eval/__main__.py
++++ b/lmms-eval/lmms_eval/__main__.py
+@@ -214,4 +214,7 @@ def setup_parser() -> argparse.ArgumentParser:
+         default=0,
+         help="Start evaluation from this dataset index for each task.",
+     )
++    parser.add_argument("--random_subset_fraction", type=float, default=None, help="Deterministically sample this fraction of each top-level benchmark.")
++    parser.add_argument("--random_subset_min_samples", type=int, default=0, help="Minimum sample count per top-level benchmark, capped by its size.")
++    parser.add_argument("--random_subset_seed", type=int, default=42, help="Seed for deterministic random subset selection.")
+     parser.add_argument(

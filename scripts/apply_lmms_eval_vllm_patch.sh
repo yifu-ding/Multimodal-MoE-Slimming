@@ -15,6 +15,7 @@ PREFILL_METRICS_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_vllm_prefill_metrics.
 MM_CACHE_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_vllm_mm_processor_cache.patch"
 RESPONSE_CACHE_IDENTITY_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_response_cache_identity.patch"
 RESPONSE_CACHE_TARGET="${REPO_ROOT}/lmms-eval/lmms_eval/caching/response_cache.py"
+RANDOM_SUBSET_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_random_subset.patch"
 
 if [[ ! -f "${TARGET}" ]]; then
     echo "error: local lmms-eval checkout is missing: ${TARGET}" >&2
@@ -41,6 +42,10 @@ silent_marker_count="$(grep -c '^[[:space:]]*use_tqdm=SILENT_VLLM_TQDM,$' "${TAR
 if ! grep -q 'MAES_DISABLE_MM_PROCESSOR_CACHE' "${TARGET}"; then
     patch --dry-run --silent --forward -d "${REPO_ROOT}" -p1 < "${MM_CACHE_PATCH_FILE}"
     patch --silent --forward -d "${REPO_ROOT}" -p1 < "${MM_CACHE_PATCH_FILE}"
+fi
+if ! grep -q 'random_subset_fraction' "${REPO_ROOT}/lmms-eval/lmms_eval/evaluator.py"; then
+    patch --dry-run --silent --forward -d "${REPO_ROOT}" -p1 < "${RANDOM_SUBSET_PATCH_FILE}"
+    patch --silent --forward -d "${REPO_ROOT}" -p1 < "${RANDOM_SUBSET_PATCH_FILE}"
 fi
 if [[ "${silent_marker_count}" == "2" || "${silent_marker_count}" == "3" ]]; then
     :

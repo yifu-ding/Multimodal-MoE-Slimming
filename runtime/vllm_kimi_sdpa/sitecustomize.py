@@ -6,7 +6,7 @@ import importlib.util
 import os
 
 
-if os.environ.get("MAES_EP4_PLAN"):
+if os.environ.get("MAES_EP4_PLAN") or os.environ.get("MAES_MASK_PLAN"):
     # Python imports only the first sitecustomize on PYTHONPATH. Compose the
     # EP4 import hook here before importing any vLLM module for the SDPA patch.
     import maes_ep4_bootstrap  # noqa: F401

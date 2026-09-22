@@ -58,6 +58,9 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
 IMAGE_FIRST="${IMAGE_FIRST:-1}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
 LIMIT="${LIMIT:-}"
+RANDOM_SUBSET_FRACTION="${RANDOM_SUBSET_FRACTION:-}"
+RANDOM_SUBSET_MIN_SAMPLES="${RANDOM_SUBSET_MIN_SAMPLES:-500}"
+RANDOM_SUBSET_SEED="${RANDOM_SUBSET_SEED:-42}"
 VERBOSITY="${VERBOSITY:-INFO}"
 LOG_SAMPLES="${LOG_SAMPLES:-1}"
 WORKERS="${WORKERS:-16}"
@@ -117,6 +120,24 @@ if [[ -n "${VIDEO_NFRAMES}" ]] && { [[ ! "${VIDEO_NFRAMES}" =~ ^[1-9][0-9]*$ ]] 
 fi
 if [[ ! "${TASK_MAX_ATTEMPTS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "error: TASK_MAX_ATTEMPTS must be a positive integer; got '${TASK_MAX_ATTEMPTS}'." >&2
+    exit 2
+fi
+if [[ -n "${RANDOM_SUBSET_FRACTION}" ]]; then
+    if [[ -n "${LIMIT}" ]]; then
+        echo "error: RANDOM_SUBSET_FRACTION cannot be combined with LIMIT." >&2
+        exit 2
+    fi
+    if ! awk -v value="${RANDOM_SUBSET_FRACTION}" 'BEGIN { exit !(value > 0 && value <= 1) }'; then
+        echo "error: RANDOM_SUBSET_FRACTION must be in (0, 1]; got '${RANDOM_SUBSET_FRACTION}'." >&2
+        exit 2
+    fi
+fi
+if [[ ! "${RANDOM_SUBSET_MIN_SAMPLES}" =~ ^[0-9]+$ ]]; then
+    echo "error: RANDOM_SUBSET_MIN_SAMPLES must be a non-negative integer; got '${RANDOM_SUBSET_MIN_SAMPLES}'." >&2
+    exit 2
+fi
+if [[ ! "${RANDOM_SUBSET_SEED}" =~ ^-?[0-9]+$ ]]; then
+    echo "error: RANDOM_SUBSET_SEED must be an integer; got '${RANDOM_SUBSET_SEED}'." >&2
     exit 2
 fi
 if [[ ! "${QWEN3_VIDEOMME_FPS}" =~ ^[0-9]+([.][0-9]+)?$ ]] || [[ "${QWEN3_VIDEOMME_FPS}" == "0" ]]; then
@@ -193,6 +214,7 @@ fi
 RUN_TIMESTAMP="${RUN_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/results/vllm_baseline/qwen3-vl-30b-a3b}"
 RUN_DIR="${RUN_DIR:-${OUTPUT_ROOT}/${PARALLEL_MODE}-${RUN_TIMESTAMP}}"
+RESPONSE_CACHE_ROOT="${RESPONSE_CACHE_ROOT:-${RUN_DIR}/response_cache}"
 TASK_OUTPUT_ROOT="${RUN_DIR}/tasks"
 TASK_LOG_ROOT="${RUN_DIR}/logs"
 TASK_STATUS_ROOT="${RUN_DIR}/status"
@@ -427,6 +449,13 @@ build_command() {
     if [[ -n "${task_limit}" ]]; then
         CMD+=(--limit "${task_limit}")
     fi
+    if [[ -n "${RANDOM_SUBSET_FRACTION}" ]]; then
+        CMD+=(
+            --random_subset_fraction "${RANDOM_SUBSET_FRACTION}"
+            --random_subset_min_samples "${RANDOM_SUBSET_MIN_SAMPLES}"
+            --random_subset_seed "${RANDOM_SUBSET_SEED}"
+        )
+    fi
     if [[ "${LOG_SAMPLES}" == "1" ]] || [[ "${predict_only}" == "1" ]]; then
         CMD+=(--log_samples --log_samples_suffix "${BASELINE_LABEL}_${PARALLEL_MODE}_${task_name}")
     fi
@@ -462,8 +491,8 @@ task_batch_size_for() {
 LOCAL_TASKS_CSV="$(join_by_comma "${LOCAL_TASKS[@]}")"
 DEFERRED_TASKS_CSV="$(join_by_comma "${DEFERRED_JUDGE_TASKS[@]}")"
 printf -v RESUME_COMMAND \
-    'RUN_DIR=%q TASKS=%q MODEL=%q CONDA_ENV_NAME=%q PARALLEL_MODE=%q CUDA_VISIBLE_DEVICES=%q BATCH_SIZE=%q LIGHT_IMAGE_BATCH_SIZE=%q IMAGE_BATCH_SIZE=%q VIDEO_BATCH_SIZE=%q VIDEOMME_BATCH_SIZE=%q VIDEO_MMMU_BATCH_SIZE=%q GPU_MEMORY_UTILIZATION=%q MAX_MODEL_LEN=%q VIDEOMME_MAX_MODEL_LEN=%q VIDEO_MMMU_MAX_MODEL_LEN=%q VIDEOMME_MAX_NUM_BATCHED_TOKENS=%q VIDEO_MMMU_MAX_NUM_BATCHED_TOKENS=%q QWEN3_VIDEOMME_FPS=%q QWEN3_VIDEOMME_MAX_FRAMES=%q QWEN3_VIDEOMME_MIN_TOKENS_PER_FRAME=%q QWEN3_VIDEOMME_MAX_TOKENS_PER_FRAME=%q QWEN3_VIDEOMME_TOTAL_VIDEO_TOKENS=%q QWEN3_VIDEOMMMU_FPS=%q QWEN3_VIDEOMMMU_MAX_FRAMES=%q QWEN3_VIDEOMMMU_MAX_TOKENS_PER_FRAME=%q QWEN3_VIDEOMMMU_TOTAL_VIDEO_TOKENS=%q MAX_FRAME_NUM=%q VIDEO_NFRAMES=%q MAX_NEW_TOKENS=%q IMAGE_FIRST=%q ENFORCE_EAGER=%q LIMIT=%q LOG_SAMPLES=%q ENABLE_QWEN3_NATIVE_VIDEO=%q ENABLE_RESPONSE_CACHE=%q LIMIT_MM_PER_PROMPT_JSON=%q STALL_TIMEOUT_SECONDS=%q WATCHDOG_POLL_SECONDS=%q TASK_MAX_ATTEMPTS=%q BASELINE_LABEL=%q bash %q' \
-    "${RUN_DIR}" "${TASKS}" "${MODEL}" "${CONDA_ENV_NAME}" "${PARALLEL_MODE}" "${CUDA_VISIBLE_DEVICES}" \
+    'RUN_DIR=%q RESPONSE_CACHE_ROOT=%q TASKS=%q MODEL=%q CONDA_ENV_NAME=%q PARALLEL_MODE=%q CUDA_VISIBLE_DEVICES=%q BATCH_SIZE=%q LIGHT_IMAGE_BATCH_SIZE=%q IMAGE_BATCH_SIZE=%q VIDEO_BATCH_SIZE=%q VIDEOMME_BATCH_SIZE=%q VIDEO_MMMU_BATCH_SIZE=%q GPU_MEMORY_UTILIZATION=%q MAX_MODEL_LEN=%q VIDEOMME_MAX_MODEL_LEN=%q VIDEO_MMMU_MAX_MODEL_LEN=%q VIDEOMME_MAX_NUM_BATCHED_TOKENS=%q VIDEO_MMMU_MAX_NUM_BATCHED_TOKENS=%q QWEN3_VIDEOMME_FPS=%q QWEN3_VIDEOMME_MAX_FRAMES=%q QWEN3_VIDEOMME_MIN_TOKENS_PER_FRAME=%q QWEN3_VIDEOMME_MAX_TOKENS_PER_FRAME=%q QWEN3_VIDEOMME_TOTAL_VIDEO_TOKENS=%q QWEN3_VIDEOMMMU_FPS=%q QWEN3_VIDEOMMMU_MAX_FRAMES=%q QWEN3_VIDEOMMMU_MAX_TOKENS_PER_FRAME=%q QWEN3_VIDEOMMMU_TOTAL_VIDEO_TOKENS=%q MAX_FRAME_NUM=%q VIDEO_NFRAMES=%q MAX_NEW_TOKENS=%q IMAGE_FIRST=%q ENFORCE_EAGER=%q LIMIT=%q RANDOM_SUBSET_FRACTION=%q RANDOM_SUBSET_MIN_SAMPLES=%q RANDOM_SUBSET_SEED=%q LOG_SAMPLES=%q ENABLE_QWEN3_NATIVE_VIDEO=%q ENABLE_RESPONSE_CACHE=%q LIMIT_MM_PER_PROMPT_JSON=%q STALL_TIMEOUT_SECONDS=%q WATCHDOG_POLL_SECONDS=%q TASK_MAX_ATTEMPTS=%q BASELINE_LABEL=%q bash %q' \
+    "${RUN_DIR}" "${RESPONSE_CACHE_ROOT}" "${TASKS}" "${MODEL}" "${CONDA_ENV_NAME}" "${PARALLEL_MODE}" "${CUDA_VISIBLE_DEVICES}" \
     "${BATCH_SIZE}" "${LIGHT_IMAGE_BATCH_SIZE}" "${IMAGE_BATCH_SIZE}" "${VIDEO_BATCH_SIZE}" "${VIDEOMME_BATCH_SIZE}" "${VIDEO_MMMU_BATCH_SIZE}" \
     "${GPU_MEMORY_UTILIZATION}" "${MAX_MODEL_LEN}" "${VIDEOMME_MAX_MODEL_LEN}" "${VIDEO_MMMU_MAX_MODEL_LEN}" \
     "${VIDEOMME_MAX_NUM_BATCHED_TOKENS}" "${VIDEO_MMMU_MAX_NUM_BATCHED_TOKENS}" \
@@ -472,11 +501,15 @@ printf -v RESUME_COMMAND \
     "${QWEN3_VIDEOMMMU_FPS}" "${QWEN3_VIDEOMMMU_MAX_FRAMES}" \
     "${QWEN3_VIDEOMMMU_MAX_TOKENS_PER_FRAME}" "${QWEN3_VIDEOMMMU_TOTAL_VIDEO_TOKENS}" \
     "${MAX_FRAME_NUM}" "${VIDEO_NFRAMES}" "${MAX_NEW_TOKENS}" "${IMAGE_FIRST}" "${ENFORCE_EAGER}" \
-    "${LIMIT}" "${LOG_SAMPLES}" "${ENABLE_QWEN3_NATIVE_VIDEO}" "${ENABLE_RESPONSE_CACHE}" "${LIMIT_MM_PER_PROMPT_JSON}" \
+    "${LIMIT}" "${RANDOM_SUBSET_FRACTION}" "${RANDOM_SUBSET_MIN_SAMPLES}" "${RANDOM_SUBSET_SEED}" \
+    "${LOG_SAMPLES}" "${ENABLE_QWEN3_NATIVE_VIDEO}" "${ENABLE_RESPONSE_CACHE}" "${LIMIT_MM_PER_PROMPT_JSON}" \
     "${STALL_TIMEOUT_SECONDS}" "${WATCHDOG_POLL_SECONDS}" "${TASK_MAX_ATTEMPTS}" "${BASELINE_LABEL}" "${RUNNER_SCRIPT}"
 if [[ -n "${MAES_EP4_PLAN:-}" ]]; then
     printf -v RESUME_COMMAND 'EP4_PLAN=%q MAES_EP4_PLAN=%q PYTHONPATH=%q MODEL=%q %s' \
         "${MAES_EP4_PLAN}" "${MAES_EP4_PLAN}" "${PYTHONPATH}" "${MODEL}" "${RESUME_COMMAND}"
+fi
+if [[ -n "${MAES_MASK_PLAN:-}" ]]; then
+    printf -v RESUME_COMMAND 'MASK_PLAN=%q %s' "${MAES_MASK_PLAN}" "${RESUME_COMMAND}"
 fi
 
 {
@@ -500,6 +533,9 @@ fi
     echo "videomme_batch_size=${VIDEOMME_BATCH_SIZE}"
     echo "video_mmmu_batch_size=${VIDEO_MMMU_BATCH_SIZE}"
     echo "limit=${LIMIT:-full}"
+    echo "random_subset_fraction=${RANDOM_SUBSET_FRACTION:-disabled}"
+    echo "random_subset_min_samples=${RANDOM_SUBSET_MIN_SAMPLES}"
+    echo "random_subset_seed=${RANDOM_SUBSET_SEED}"
     echo "dtype=bfloat16"
     echo "enforce_eager=${EAGER_ARG}"
     echo "gpu_memory_utilization=${GPU_MEMORY_UTILIZATION}"
@@ -527,9 +563,11 @@ fi
     echo "hf_home=${HF_HOME}"
     echo "run_dir=${RUN_DIR}"
     echo "maes_ep4_plan=${MAES_EP4_PLAN:-disabled}"
+    echo "maes_mask_plan=${MAES_MASK_PLAN:-disabled}"
     echo "maes_efficiency_trace=${MAES_EFFICIENCY_TRACE:-disabled}"
     echo "maes_efficiency_warmup_batches=${MAES_EFFICIENCY_WARMUP_BATCHES:-0}"
     echo "response_cache=${ENABLE_RESPONSE_CACHE}"
+    echo "response_cache_root=${RESPONSE_CACHE_ROOT}"
     echo "limit_mm_per_prompt=${LIMIT_MM_PER_PROMPT_JSON:-default}"
     echo "stall_timeout_seconds=${STALL_TIMEOUT_SECONDS}"
     echo "watchdog_poll_seconds=${WATCHDOG_POLL_SECONDS}"
@@ -563,7 +601,7 @@ run_task_once() {
     local task_limit="${LIMIT}"
     local task_batch_size cache_batch_size task_model_args cache_fingerprint
     local task_start task_end task_wall task_status task_signature
-    local cache_root="${RUN_DIR}/response_cache/${safe_task}"
+    local cache_root="${RESPONSE_CACHE_ROOT}/${safe_task}"
     local heartbeat_dir="${RUN_DIR}/watchdog/${safe_task}/${RUN_TIMESTAMP}-$$"
 
     task_batch_size="$(task_batch_size_for "${task_name}")"
@@ -583,6 +621,8 @@ run_task_once() {
     task_signature="$({
         printf '%s\n' "${task_name}" "${predict_only}" "${task_model_args}"
         printf '%s\n' "batch_size=${task_batch_size}" "limit=${task_limit}" "log_samples=${LOG_SAMPLES}"
+        printf '%s\n' "random_subset_fraction=${RANDOM_SUBSET_FRACTION:-disabled}" \
+            "random_subset_min_samples=${RANDOM_SUBSET_MIN_SAMPLES}" "random_subset_seed=${RANDOM_SUBSET_SEED}"
         printf '%s\n' "response_cache=${ENABLE_RESPONSE_CACHE}" "cache_write_batch_size=${cache_batch_size}"
         printf '%s\n' "limit_mm_per_prompt=${LIMIT_MM_PER_PROMPT_JSON:-default}"
         if task_uses_native_video "${task_name}"; then

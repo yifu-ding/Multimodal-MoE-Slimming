@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -91,6 +93,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument("--random-subset-fraction", type=float, default=None)
+    parser.add_argument("--random-subset-min-samples", type=int, default=500)
+    parser.add_argument("--random-subset-seed", type=int, default=42)
     parser.add_argument(
         "--judge-prediction-max-chars",
         type=int,
@@ -379,6 +384,67 @@ def load_samples(paths: list[Path]) -> list[tuple[Path, dict[str, Any]]]:
     return samples
 
 
+def _sample_rank(task: str, source: Path, sample: dict[str, Any], seed: int) -> bytes:
+    key = f"{seed}:{task}:{source}:{sample.get('doc_id')}"
+    return hashlib.sha256(key.encode()).digest()
+
+
+def random_subset(
+    task: str,
+    samples: list[tuple[Path, dict[str, Any]]],
+    fraction: float | None,
+    min_samples: int,
+    seed: int,
+) -> list[tuple[Path, dict[str, Any]]]:
+    if fraction is None:
+        return samples
+    target = min(len(samples), max(math.ceil(len(samples) * fraction), min_samples))
+    if target == len(samples):
+        return samples
+
+    if task == "mmbench":
+        grouped: dict[int, list[tuple[Path, dict[str, Any]]]] = {}
+        for source, sample in samples:
+            index = int(sample.get("gpt_eval_score", {}).get("index", sample.get("doc_id")))
+            grouped.setdefault(index % 1_000_000, []).append((source, sample))
+        ranked_groups = sorted(
+            grouped.values(),
+            key=lambda group: _sample_rank(task, group[0][0], group[0][1], seed),
+        )
+        selected = []
+        for group in ranked_groups:
+            selected.extend(group)
+            if len(selected) >= target:
+                break
+        return sorted(selected, key=lambda item: (str(item[0]), item[1].get("doc_id", -1)))
+
+    by_source: dict[Path, list[tuple[Path, dict[str, Any]]]] = {}
+    for source, sample in samples:
+        by_source.setdefault(source, []).append((source, sample))
+    allocations = {}
+    allocated = 0
+    remainders = []
+    for source, source_samples in by_source.items():
+        exact = len(source_samples) * target / len(samples)
+        count = math.floor(exact)
+        allocations[source] = count
+        allocated += count
+        remainders.append((exact - count, str(source), source))
+    for _, _, source in sorted(remainders, reverse=True):
+        if allocated >= target:
+            break
+        allocations[source] += 1
+        allocated += 1
+    selected = []
+    for source, source_samples in by_source.items():
+        selected.extend(
+            sorted(source_samples, key=lambda item: _sample_rank(task, item[0], item[1], seed))[
+                : allocations[source]
+            ]
+        )
+    return sorted(selected, key=lambda item: (str(item[0]), item[1].get("doc_id", -1)))
+
+
 def result_key(record: dict[str, Any]) -> str:
     return f"{record.get('source_file', '')}\0{record.get('doc_id')}"
 
@@ -390,6 +456,14 @@ def score_task(
     if args.overwrite and output_path.exists():
         output_path.unlink()
 
+    source_samples = random_subset(
+        task,
+        load_samples(sources),
+        args.random_subset_fraction,
+        args.random_subset_min_samples,
+        args.random_subset_seed,
+    )
+    selected_keys = {f"{source}\0{sample.get('doc_id')}" for source, sample in source_samples}
     existing: list[dict[str, Any]] = []
     if output_path.exists():
         with output_path.open("r", encoding="utf-8") as handle:
@@ -400,6 +474,7 @@ def score_task(
         result_key(record): record
         for record in existing
         if isinstance(record.get("score"), (int, float))
+        and result_key(record) in selected_keys
     }
     existing = list(successful_by_key.values())
     completed = set(successful_by_key)
@@ -408,7 +483,6 @@ def score_task(
             for record in existing:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    source_samples = load_samples(sources)
     pending = []
     for source, sample in source_samples:
         key = f"{source}\0{sample.get('doc_id')}"
@@ -500,6 +574,9 @@ def score_task(
         "judge_model": args.model,
         "source_files": [str(path) for path in sources],
         "per_sample_output": str(output_path),
+        "random_subset_fraction": args.random_subset_fraction,
+        "random_subset_min_samples": args.random_subset_min_samples,
+        "random_subset_seed": args.random_subset_seed,
     }
     if task == "mmbench":
         summary["num_static"] = sum(
@@ -590,6 +667,12 @@ def main() -> int:
         return 2
     if args.mmvet_prediction_max_chars < 0:
         print("error: --mmvet-prediction-max-chars cannot be negative", file=sys.stderr)
+        return 2
+    if args.random_subset_fraction is not None and not 0 < args.random_subset_fraction <= 1:
+        print("error: --random-subset-fraction must be in (0, 1]", file=sys.stderr)
+        return 2
+    if args.random_subset_min_samples < 0:
+        print("error: --random-subset-min-samples cannot be negative", file=sys.stderr)
         return 2
     root = args.predictions_dir.resolve()
     if not root.is_dir():
