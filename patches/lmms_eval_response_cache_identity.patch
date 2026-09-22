@@ -1,8 +1,13 @@
 --- a/lmms-eval/lmms_eval/caching/response_cache.py
 +++ b/lmms-eval/lmms_eval/caching/response_cache.py
-@@ -51,2 +51,13 @@ CACHE_RELEVANT_KEYS = frozenset(
+@@ -59,7 +59,19 @@ CACHE_RELEVANT_KEYS = frozenset(
+         "repetition_penalty",
+         "n",
+         "best_of",
+         "num_return_sequences",
      }
  )
++
 +RUNTIME_ONLY_MODEL_ARGS = frozenset(
 +    {
 +        "disable_log_stats",
@@ -14,6 +19,7 @@
 +    }
 +)
 +
+ _SCHEMA_VERSION = 3
 @@ -419,17 +430,27 @@ class ResponseCache:
 -        # Model fingerprint
 +        # Model fingerprint. Resource and scheduler knobs do not change the

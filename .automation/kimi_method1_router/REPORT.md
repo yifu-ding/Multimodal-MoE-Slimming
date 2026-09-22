@@ -13,3 +13,10 @@
 - 2026-09-22 00:03 CST: WAITING | queue session=`kimi-method1-router-queue`; future worker=`kimi-method1-router-worker`; future supervisor=`kimi-method1-router-supervisor`.
 - 2026-09-22 15:44 CST: UPDATED | campaign changed to deterministic random 1/2 subsets (`seed=42`, minimum 500, or full dataset below 500). Results use separate `*-random-half-seed42` directories and are not mixed with full-dataset metrics.
 - 2026-09-22 15:51 CST: QUEUED | waiting for the current kimi-direct campaign to validate 28/28 benchmarks and 2/2 Judge stages.
+- 2026-09-22 17:24 CST: READY | current kimi-direct campaign is complete; waiting for all four GPUs to become free.
+- 2026-09-22 17:24 CST: STARTED | worker=kimi-method1-router-worker, supervisor=kimi-method1-router-supervisor.
+- 2026-09-22 17:24 CST: RUNNING | 0/28 benchmarks (0%), judges=0/2, current=waiting-for-resources, stage_elapsed=1s, GPU MiB=0/0/0/0 | session=kimi-method1-router-worker.
+- 2026-09-22 17:24 CST: WARNING | gqa p30 stopped before inference on both configured attempts because `response_cache.py` raised `SyntaxError`; no sample was evaluated and no response cache was lost.
+- 2026-09-22 18:18 CST: RECOVERED | fixed the response-cache identity patch's ambiguous first hunk and repaired the local checkout. Python compilation, patch reverse-check, response-cache tests (3/3), and random-subset tests (3/3) passed.
+- 2026-09-22 18:18 CST: RUNNING | worker restarted at gqa p30; lmms-eval passed imports and entered vLLM model initialization. Progress remains 0/28 until the first validated result is complete.
+- 2026-09-22 18:21 CST: HEALTHY | gqa p30 is performing inference; response cache advanced to 1760/6289 and all four GPUs hold about 89.9 GiB. No current stall or error is present.

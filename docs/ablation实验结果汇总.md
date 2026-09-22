@@ -8,18 +8,27 @@
 - 剪枝后不做圆整，不做向上取整或向下取整规整，也不做 Rearrange。
 - Mask 配置为 `align_inter = 0`、`min_per_expert = 0`，不进行额外宽度或 expert 数量调整。
 - 已完成且有效的结果保持原全量口径，不重跑。自 2026-09-22 15:18 CST 起，所有尚未完成的测试改为确定性随机子集：`seed = 42`，目标数量为 `min(N, max(ceil(N/2), 500))`；总量不足 500 时使用全量。
-- 组合 benchmark 按子任务分层抽样：MVBench 为 1900/3800（20 类各 100），VideoMMMU 为 500/900（167/167/166）。MME 保持 yes/no 配对；MMBench Judge 保持 circular 变体组完整，因此实际为 2168/4329。
+- 组合 benchmark 按子任务分层抽样：MVBench 为 1900/3800（20 类各 100），VideoMMMU 为 500/900（167/167/166）。MME 保持 yes/no 配对；MMBench Judge 保持 circular 变体组完整，因此 p = 0.3/p = 0.5 实际分别为 2166/4329、2168/4329。
 
 ## 当前结果
 
-更新时间：2026-09-22 15:44 CST。当前“方法1 + 方法2”流水线已有 27/28 个 benchmark 的全量结果，Judge 为 0/2。最后一个 p = 0.5 MVBench 全量任务已按新要求暂停，已安全保留 1111/3800 条响应缓存；后续将在同一缓存基础上完成随机 1/2 子集（1900 条），不会从零重跑。“方法1-only”仍为 0/28，后续全部按随机 1/2、至少 500 的口径执行。
+更新时间：2026-09-22 18:21 CST。“方法1 + 方法2”流水线已完成 28/28 个 benchmark 和 2/2 个 Judge 阶段。最后一个 p = 0.5 MVBench 已复用此前 1111/3800 条响应缓存完成随机 1/2 子集（1900/3800），没有从零重跑。“方法1-only”当前为 0/28，p = 0.3 GQA 正常推理中，响应缓存已到 1760/6289；全部按随机 1/2、至少 500 的口径执行。
 
 **Kimi-VL-A3B-Instruct**
 
 | 剪枝比例 | 方法 | GQA | COCO CIDEr | TextVQA | ChartQA | MMStar | MMBench | MME-P | MME-C | RealWorldQA | MMVet Judge | Video-MME | LongVideoBench | EgoSchema | VideoMMMU（总体） | VideoMMMU Adaptation | VideoMMMU Comprehension | VideoMMMU Perception | MVBench |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| p = 0.3 | Ablation（方法1+方法2，Direct Mask） | 62.0687 | 0.9002 | 86.3760 | 86.9600 | 61.8556 | 82.5601 | 1631.7338 | 513.9286 | 66.0131 | —（待 Judge，随机 1/2） | 63.4815 | 60.8080 | 73.20 | 49.78 | 36.00 | 43.33 | 70.00 | 60.4211 |
-| p = 0.5 | Ablation（方法1+方法2，Direct Mask） | 60.3594 | 1.1260 | 81.4300 | 79.6400 | 56.2819 | 80.2405 | 1579.1719 | 506.0714 | 62.8758 | —（待 Judge，随机 1/2） | 60.0370（重跑） | 60.2090 | 70.60 | 48.00（重跑） | 37.00 | 39.00 | 68.00 | —（随机 1/2 恢复中） |
+| p = 0.3 | Ablation（方法1+方法2，Direct Mask） | 62.0687 | 0.9002 | 86.3760 | 86.9600 | 61.8556 | 82.5601 | 1631.7338 | 513.9286 | 66.0131 | 62.3394（全量 218） | 63.4815 | 60.8080 | 73.20 | 49.78 | 36.00 | 43.33 | 70.00 | 60.4211 |
+| p = 0.5 | Ablation（方法1+方法2，Direct Mask） | 60.3594 | 1.1260 | 81.4300 | 79.6400 | 56.2819 | 80.2405 | 1579.1719 | 506.0714 | 62.8758 | 50.5046（全量 218） | 60.0370（重跑） | 60.2090 | 70.60 | 48.00（重跑） | 37.00 | 39.00 | 68.00 | 59.5789（随机 1/2） |
+
+### 本地 Judge 补充结果
+
+下表是本地多模态 Judge 的独立结果。主表中的 MMBench 与 VideoMMMU 列是各 benchmark 原生指标，不能用这里的 Judge 分数覆盖。
+
+| 剪枝比例 | MMVet Judge | MMBench Judge | VideoMMMU Judge（总体） | Adaptation | Comprehension | Perception |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| p = 0.3 | 62.3394（218/218） | 83.8210（随机 2166/4329） | 52.80（随机 500/900） | 42.1687（166） | 43.1138（167） | 73.0539（167） |
+| p = 0.5 | 50.5046（218/218） | 81.7869（随机 2168/4329） | 51.40（随机 500/900） | 41.5663（166） | 44.3114（167） | 68.2635（167） |
 
 ## 状态说明
 
@@ -36,6 +45,7 @@
 - p = 0.5 Video-MME：首次执行在 `1143/2700` 后触发 vLLM 多模态处理器缓存一致性断言：`Expected a cached item for mm_hash=...`，属于推理框架的 multimodal processor cache bug，不是模型指标异常。流水线保留已有响应并自动重跑，最终完整结果为 `60.0370`。
 - p = 0.5 VideoMMMU：首次执行在 `134/900` 处因 `validation_Electronics_13.mp4` 的 decord EOF 解码问题卡住，主进程被终止并遗留 vLLM worker。清理残留进程后改用选择性 OpenCV 解码，从原缓存恢复并于 2026-09-22 10:18 CST 完成；最终总体结果为 `48.00`。这是视频解码/进程清理 bug，不是模型指标异常。
 - p = 0.5 MVBench：全量执行到缓存 1111/3800 时，根据新的随机 1/2 实验口径主动暂停，不是报错或卡住。缓存 SQLite 完整性检查为 `ok`；随机子集恢复时复用其中重叠响应，只补缺失样本。
+- 方法1-only p = 0.3 GQA：首次启动的两次 attempt 均在推理前因 `lmms_eval/caching/response_cache.py` 的补丁错位触发 `SyntaxError`，因此没有产生样本，也不计为实验失败。根因是 `patches/lmms_eval_response_cache_identity.patch` 首个 hunk 上下文不足，将常量插入了 `CACHE_RELEVANT_KEYS` 集合内部。已修复补丁及本地工作副本，通过 Python 编译、响应缓存单测和随机抽样单测，并于 2026-09-22 18:18 CST 恢复运行。
 
 ## 数据来源
 
@@ -45,12 +55,13 @@
 - p = 0.3 结果：`results/vllm_ours/kimi/direct-mask/p30-full/tasks/`
 - p = 0.5 结果：`results/vllm_ours/kimi/direct-mask/p50-full/tasks/`
 - 后续随机 1/2 结果：`results/vllm_ours/kimi/direct-mask/p30-random-half-seed42/`、`results/vllm_ours/kimi/direct-mask/p50-random-half-seed42/`
+- 方法1-only 随机 1/2 结果：`results/vllm_ours/kimi/method1-router-direct/p30-random-half-seed42/`、`results/vllm_ours/kimi/method1-router-direct/p50-random-half-seed42/`
 
-本表只填写已生成且通过当前流水线校验的结果；后续 benchmark 和 Judge 完成后再补充对应单元格。
+本表只填写已生成且通过当前流水线校验的结果；方法1-only 后续结果完成后再补充对应单元格。
 
-## 后续实验（已排队）
+## 后续实验（运行中）
 
-- 当前 `方法1 + 方法2` campaign 完整结束后，将运行 **方法1-only** 对照实验。
+- 当前 `方法1 + 方法2` campaign 已完整结束，正在运行 **方法1-only** 对照实验。
 - 方法1-only 配置保持 `modality_aware = 1`，将 `intra_layer_method` 从二阶 attribution 改为 Router 自身输出 `router`。
 - 已检查 Kimi `scores.pt`：`router`、`usage`、`token_count_text`、`token_count_visual` 均覆盖全部 26 × 64 个 expert 且为非零；成品中没有 `usage_fillzero` 或 `router_fillzero` 键，因此采用 planner 原生支持的 `router`。
 - 该配置仍使用独立的 text/visual channel scores 生成双模态 mask，Router 分数只替换 expert 内预算来源，因此 `modality_aware = 1` 仍然生效。
