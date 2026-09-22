@@ -1,0 +1,12 @@
+{
+  "completed": 90,
+  "experiment": "placement-grid-partial-snapshot",
+  "experiment_sha256": "2917ba8ec237e93a414a11bfaafde7d89c79ce5287212d16ba64125895348e2e",
+  "max_seconds": 876.5432346260059,
+  "median_seconds": 18.948741907501244,
+  "proven": 64,
+  "reused": 12,
+  "snapshot_unix": 1790072351.3568647,
+  "total": 144,
+  "unproven": 26
+}

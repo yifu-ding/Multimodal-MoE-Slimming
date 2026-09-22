@@ -12,15 +12,15 @@
 DeltaPhi = max_u Phi_u - min_u Phi_u
 ```
 
-当前宽度档 `384/512/640/768` 都是 128 的倍数，因此每个 group load、每个 `Phi_u` 和 `DeltaPhi` 都是 128 的整数倍。令：
+令 `q` 为当前 placement group 宽度的最大公约数。每个 group load、每个 `Phi_u` 和 `DeltaPhi` 都是 `q` 的整数倍。当前宽度档 `384/512/640/768` 对应 `q=128`。令：
 
 ```text
-total_quanta = sum_u Phi_u / 128
-floor = 0    if total_quanta % m == 0
-floor = 128  otherwise
+total_quanta = sum_u Phi_u / q
+floor = 0  if total_quanta % m == 0
+floor = q  otherwise
 ```
 
-当 `total_quanta % m != 0` 时，所有 rank 负载不可能相等，而任何非零极差至少为 128，所以 `floor=128` 是严格下界。该下界严格强于当前 MILP 的 LP 松弛下界 0。
+当 `total_quanta % m != 0` 时，所有 rank 负载不可能相等，而任何非零极差至少为 `q`，所以 `floor=q` 是严格下界。该下界严格强于当前 MILP 的 LP 松弛下界 0。
 
 当 `total_quanta % m == 0` 时，`floor=0` 只表示完美均衡在算术上没有被整除条件排除；它不是组合可行性的充分证明。m=12/16 是否能达到 0 仍由实验判断。
 
@@ -181,3 +181,26 @@ E0 已完成 31/31，提交到仓库的完整结果见 `artifacts/placement-e0/s
 L=4 的最优 spread 为 384--18688，最多需要 146 次 retry。即使该 case 也只用 3.133 s；24 个 L=4 case 的中位时间为 0.470 s。因为每个更小 target 都被 HiGHS 明确证明 infeasible，而 spread 只能按 128 的整数倍变化，第一个可行 target 本身构成精确最优性证明。
 
 EP 扩展没有在 m=32 出现断崖，但 m=64 已不是低个位秒。因此正文可以准确说“m=32 秒级、m=64 两分钟内可认证最优”，不应写成“m=64 仍为几秒”。论文仍未修改。
+
+## E0c：EP 规模与层深网格（2026-09-22）
+
+为补齐 m=6/8/24 的新可行性模式结果，并观察求解成本随 EP 规模和层深的联合变化，新增二维网格：
+
+```text
+m in {4, 6, 8, 12, 16, 24, 32, 48, 64}
+L in {4, 8, 12, 16, 24, 32, 40, 48}
+p in {0.3, 0.5}
+```
+
+共 144 个格点。每个格点使用 plan 的前 L 层，固定每层 E=128 个专家；m 表示 EP rank 数以及每层构造出的非空 placement group 数，不是宽度档位数。m=2 不合法，因为两份 plan 的每层都有四个非空宽度档，无法将四个档位无损映射到两个非空 rank group。
+
+E0c 继续使用“算术下界 + 可行性 ladder”，每格总预算 300 秒。四个 worker 分别固定四个互不重叠的物理核，缺失格点按 `L*m^2` 估算的二元变量规模做静态均衡。与 E0/E0b 的 plan SHA256、起始层、L、m 完全相同的格点直接复用原始产物；manifest 当前匹配到 18 个可复用格点，其余 126 个才重新求解。
+
+输出包括：
+
+- p=0.3 和 p=0.5 各自的 L=48 EP 扫描表；
+- 全部 144 格的 CSV、逐格 JSON 和复用来源；
+- 每个剪枝率一张双 panel 热力图：对数求解时间和 target 尝试次数；
+- 未在预算内获得最优性证明的格点用叉号标记，而不是从图中删除。
+
+E0c 只补实验与过程记录，结果审阅前仍不修改论文正文。

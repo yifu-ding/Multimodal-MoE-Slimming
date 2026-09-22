@@ -1,0 +1,119 @@
+{
+  "case": {
+    "active_widths": [
+      768,
+      640,
+      512,
+      384
+    ],
+    "arithmetic_quantum": 128,
+    "arithmetic_spread_lower_bound": 128,
+    "case_id": "grid-p30-l16-m12",
+    "layer_start": 0,
+    "layers": 16,
+    "m": 12,
+    "num_experts_per_layer": 128,
+    "plan": "/home/dyf/data/MARS-results/storage/ep4_plans/qwen3-vl-30b-a3b-p30.pt",
+    "plan_sha256": "af4e07085878198a8757a5680a1d4289071f093ab3ac6cd1b26490fc423b094e",
+    "prune_ratio": 0.3,
+    "shard_id": 3,
+    "total_load_quanta": 8363,
+    "total_rank_weight_load": 1070464
+  },
+  "cases_sha256": "59ffe063593a42f7190df384dff9631b675d66af72a9b887645273cdcbb04bfc",
+  "completed_at_unix": 1790069964.7353685,
+  "execution_cpu_affinity": [
+    24,
+    26,
+    28,
+    30
+  ],
+  "execution_environment": {
+    "cpu_affinity": [
+      24,
+      26,
+      28,
+      30
+    ],
+    "git_commit": "a35863f6a262e054f7030439ddab7efc4f22414c",
+    "numpy": "2.2.6",
+    "platform": "Linux-5.15.0-161-generic-x86_64-with-glibc2.35",
+    "processor": "x86_64",
+    "python": "3.11.15",
+    "scipy": "1.17.1",
+    "thread_environment": {
+      "MKL_NUM_THREADS": "4",
+      "NUMEXPR_NUM_THREADS": "4",
+      "OMP_NUM_THREADS": "4",
+      "OPENBLAS_NUM_THREADS": "4"
+    },
+    "torch": "2.9.0+cu128"
+  },
+  "experiment": "placement-grid-case",
+  "experiment_sha256": "2917ba8ec237e93a414a11bfaafde7d89c79ce5287212d16ba64125895348e2e",
+  "ladder": {
+    "attempts": [
+      {
+        "arithmetic_optimal": true,
+        "arithmetic_quantum": 128,
+        "arithmetic_spread_lower_bound": 128,
+        "dual_bound": 0.0,
+        "elapsed_seconds": 168.72337282501394,
+        "feasibility_proven": true,
+        "highs_model_optimal": true,
+        "highs_optimal": false,
+        "incumbent": 128.0,
+        "milp_binary_variables": 2304,
+        "milp_mode": "feasibility",
+        "mip_gap": 0.0,
+        "mip_node_count": 36507,
+        "optimality_proof": "arithmetic_lower_bound",
+        "rank_weight_loads": [
+          89088,
+          89216,
+          89216,
+          89216,
+          89216,
+          89216,
+          89216,
+          89216,
+          89216,
+          89216,
+          89216,
+          89216
+        ],
+        "relative_spread": 0.0014348917852445295,
+        "relative_spread_percent": 0.14348917852445295,
+        "solver_message": "Optimization terminated successfully. (HiGHS Status 7: Optimal)",
+        "solver_optimal": true,
+        "solver_reported_objective": 0.0,
+        "solver_status": 0,
+        "solver_success": true,
+        "spread": 128.0,
+        "spread_upper_bound": 128.0,
+        "target_spread": 128.0,
+        "time_limit": 299.99999972601654,
+        "total_load_quanta": 8363,
+        "total_rank_weight_load": 1070464
+      }
+    ],
+    "elapsed_seconds": 168.72337994500413,
+    "final_target_spread": 128.0,
+    "found_feasible": true,
+    "optimality_proof": "arithmetic_lower_bound",
+    "optimality_proven": true,
+    "retry_count": 0,
+    "spread": 128.0,
+    "stopped_reason": "feasible"
+  },
+  "materialization_seconds": 168.74048616498476,
+  "source_artifact": null,
+  "source_kind": "computed",
+  "total_time_limit": 300.0,
+  "worker_cpu_affinity": [
+    24,
+    26,
+    28,
+    30
+  ]
+}

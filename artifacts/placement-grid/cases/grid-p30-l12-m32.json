@@ -1,0 +1,106 @@
+{
+  "case": {
+    "active_widths": [
+      768,
+      640,
+      512,
+      384
+    ],
+    "arithmetic_quantum": 128,
+    "arithmetic_spread_lower_bound": 128,
+    "case_id": "grid-p30-l12-m32",
+    "layer_start": 0,
+    "layers": 12,
+    "m": 32,
+    "num_experts_per_layer": 128,
+    "plan": "/home/dyf/data/MARS-results/storage/ep4_plans/qwen3-vl-30b-a3b-p30.pt",
+    "plan_sha256": "af4e07085878198a8757a5680a1d4289071f093ab3ac6cd1b26490fc423b094e",
+    "prune_ratio": 0.3,
+    "shard_id": 2,
+    "total_load_quanta": 6301,
+    "total_rank_weight_load": 806528
+  },
+  "cases_sha256": "59ffe063593a42f7190df384dff9631b675d66af72a9b887645273cdcbb04bfc",
+  "completed_at_unix": 1790069144.3218977,
+  "execution_cpu_affinity": [
+    16,
+    18,
+    20,
+    22
+  ],
+  "execution_environment": {
+    "cpu_affinity": [
+      16,
+      18,
+      20,
+      22
+    ],
+    "git_commit": "a35863f6a262e054f7030439ddab7efc4f22414c",
+    "numpy": "2.2.6",
+    "platform": "Linux-5.15.0-161-generic-x86_64-with-glibc2.35",
+    "processor": "x86_64",
+    "python": "3.11.15",
+    "scipy": "1.17.1",
+    "thread_environment": {
+      "MKL_NUM_THREADS": "4",
+      "NUMEXPR_NUM_THREADS": "4",
+      "OMP_NUM_THREADS": "4",
+      "OPENBLAS_NUM_THREADS": "4"
+    },
+    "torch": "2.9.0+cu128"
+  },
+  "experiment": "placement-grid-case",
+  "experiment_sha256": "2917ba8ec237e93a414a11bfaafde7d89c79ce5287212d16ba64125895348e2e",
+  "ladder": {
+    "attempts": [
+      {
+        "arithmetic_optimal": false,
+        "arithmetic_quantum": 128,
+        "arithmetic_spread_lower_bound": 128,
+        "dual_bound": null,
+        "elapsed_seconds": 300.1235088960093,
+        "feasibility_proven": false,
+        "highs_model_optimal": false,
+        "highs_optimal": false,
+        "incumbent": null,
+        "milp_binary_variables": 12288,
+        "milp_mode": "feasibility",
+        "mip_gap": null,
+        "mip_node_count": null,
+        "optimality_proof": null,
+        "rank_weight_loads": null,
+        "relative_spread": null,
+        "relative_spread_percent": null,
+        "solver_message": "Time limit reached. (HiGHS Status 13: model_status is Time limit reached; primal_status is None)",
+        "solver_optimal": false,
+        "solver_reported_objective": null,
+        "solver_status": 1,
+        "solver_success": false,
+        "spread": null,
+        "spread_upper_bound": 128.0,
+        "target_spread": 128.0,
+        "time_limit": 299.9999995690014,
+        "total_load_quanta": 6301,
+        "total_rank_weight_load": 806528
+      }
+    ],
+    "elapsed_seconds": 300.1235175149923,
+    "final_target_spread": 128.0,
+    "found_feasible": false,
+    "optimality_proof": null,
+    "optimality_proven": false,
+    "retry_count": 0,
+    "spread": null,
+    "stopped_reason": "budget_or_unproven"
+  },
+  "materialization_seconds": 300.1385862540046,
+  "source_artifact": null,
+  "source_kind": "computed",
+  "total_time_limit": 300.0,
+  "worker_cpu_affinity": [
+    16,
+    18,
+    20,
+    22
+  ]
+}
