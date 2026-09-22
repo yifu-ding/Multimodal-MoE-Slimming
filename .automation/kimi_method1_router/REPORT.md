@@ -20,3 +20,8 @@
 - 2026-09-22 18:18 CST: RECOVERED | fixed the response-cache identity patch's ambiguous first hunk and repaired the local checkout. Python compilation, patch reverse-check, response-cache tests (3/3), and random-subset tests (3/3) passed.
 - 2026-09-22 18:18 CST: RUNNING | worker restarted at gqa p30; lmms-eval passed imports and entered vLLM model initialization. Progress remains 0/28 until the first validated result is complete.
 - 2026-09-22 18:21 CST: HEALTHY | gqa p30 is performing inference; response cache advanced to 1760/6289 and all four GPUs hold about 89.9 GiB. No current stall or error is present.
+- 2026-09-22 18:54 CST: RUNNING | 3/28 benchmarks (11%), judges=0/2, current=textvqa_val p50, stage_elapsed=454s, GPU MiB=89845/89845/89845/89845 | session=kimi-method1-router-worker.
+- 2026-09-23 00:20 CST: UPDATED | reordered the remaining queue so VideoMMMU p30/p50 run last, after LongVideoBench, EgoSchema, and MVBench. The active p50 Video-MME response cache is preserved across the dispatcher restart.
+- 2026-09-22 20:24 CST: RUNNING | 16/28 benchmarks (57%), judges=0/2, current=realworldqa p30, stage_elapsed=196s, GPU MiB=89843/89843/89843/89843 | session=kimi-method1-router-worker.
+- 2026-09-22 21:54 CST: RUNNING | 18/28 benchmarks (64%), judges=0/2, current=videomme p30, stage_elapsed=5015s, GPU MiB=89863/89863/89863/89863 | session=kimi-method1-router-worker.
+- 2026-09-22 23:24 CST: RUNNING | 19/28 benchmarks (68%), judges=0/2, current=videomme p50, stage_elapsed=2596s, GPU MiB=89863/89863/89863/89863 | session=kimi-method1-router-worker.

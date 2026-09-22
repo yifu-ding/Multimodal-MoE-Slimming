@@ -9,7 +9,7 @@ cd "${ROOT}"
 tasks=(
     gqa textvqa_val coco2017_cap_val_local chartqa mmstar
     mmbench_en_dev_static_local mmvet mme realworldqa videomme
-    longvideobench_val_v video_mmmu_local egoschema_subset mvbench_available_3800
+    longvideobench_val_v egoschema_subset mvbench_available_3800 video_mmmu_local
 )
 for task in "${tasks[@]}"; do
     for ratio in p30 p50; do
