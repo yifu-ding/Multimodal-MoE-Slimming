@@ -9,6 +9,7 @@ from src.generate_mask.ep4_intplan import (
     _solve_placement_groups_greedy_permutation_reference,
     _solve_placement_groups_milp,
     _solve_placement_groups_milp_permutation_reference,
+    _placement_spread_arithmetic_lower_bound,
     plan_ep4_from_masks,
     plan_ep4_intplan,
     solve_cross_layer_placement,
@@ -308,6 +309,42 @@ def test_assignment_milp_matches_permutation_milp_and_reports_dual_bound():
     assert abs(assignment["mip_dual_bound"] - assignment["solver_objective"]) < 1e-6
     assert assignment["mip_gap"] == 0.0
     assert assignment["milp_binary_variables"] == counts.shape[0] * counts.shape[1] ** 2
+
+
+def test_arithmetic_spread_lower_bound_uses_width_quantum_and_divisibility():
+    widths = torch.tensor([768, 640, 512, 384]).expand(2, -1)
+    divisible = torch.tensor([[1, 1, 1, 1], [1, 1, 1, 1]])
+    indivisible = torch.tensor([[2, 1, 1, 1], [1, 1, 1, 1]])
+
+    zero_floor = _placement_spread_arithmetic_lower_bound(divisible, widths)
+    nonzero_floor = _placement_spread_arithmetic_lower_bound(indivisible, widths)
+
+    assert zero_floor["arithmetic_quantum"] == 128
+    assert zero_floor["arithmetic_spread_lower_bound"] == 0
+    assert nonzero_floor["arithmetic_spread_lower_bound"] == 128
+
+
+def test_milp_feasibility_at_arithmetic_floor_certifies_optimality():
+    counts = torch.ones((2, 4), dtype=torch.int64)
+    widths = torch.tensor([768, 640, 512, 384]).expand_as(counts)
+    floor = _placement_spread_arithmetic_lower_bound(counts, widths)[
+        "arithmetic_spread_lower_bound"
+    ]
+
+    result = _solve_placement_groups_milp(
+        counts,
+        widths,
+        spread_upper_bound=floor,
+        feasibility_only=True,
+    )
+
+    assert result["rank_weight_spread"] == floor
+    assert result["arithmetic_optimal"]
+    assert result["solver_optimal"]
+    assert result["highs_model_optimal"]
+    assert result["feasibility_proven"]
+    assert not result["highs_optimal"]
+    assert result["milp_mode"] == "feasibility"
 
 
 def test_greedy_and_milp_fix_the_same_first_layer():

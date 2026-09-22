@@ -1,0 +1,9 @@
+{
+  "arm_a_reached_floor": 29,
+  "arm_b_reached_target": 31,
+  "cases_sha256": "53ffe2cd74b2fed9e488fb89d9c8a92dd826f4bd9f787b682fe315360e1e2a5a",
+  "experiment": "placement-e0-summary",
+  "experiment_sha256": "e841d96f23e8a08235714b6015ec16289872be1964e10e73d1f61369c7be3e94",
+  "median_arm_a_time_to_floor_upper_bound_seconds": 1.0,
+  "num_cases": 31
+}

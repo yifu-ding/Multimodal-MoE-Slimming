@@ -777,6 +777,34 @@ def _validate_placement_groups(
     return counts, widths
 
 
+def _placement_spread_arithmetic_lower_bound(
+    group_counts: torch.Tensor,
+    group_widths: torch.Tensor,
+) -> Dict[str, int]:
+    """Return the divisibility lower bound for the integral rank-load spread."""
+    counts, widths = _validate_placement_groups(group_counts, group_widths, 0.0)
+    quantum = 0
+    for width in widths.flatten().tolist():
+        quantum = math.gcd(quantum, int(width))
+    if quantum <= 0:
+        raise ValueError("placement width quantum must be positive")
+
+    total_load = int((counts * widths).sum().item())
+    if total_load % quantum:
+        raise RuntimeError(
+            f"total placement load {total_load} is not divisible by quantum {quantum}"
+        )
+    ep_size = int(counts.shape[1])
+    total_quanta = total_load // quantum
+    lower_bound = 0 if total_quanta % ep_size == 0 else quantum
+    return {
+        "arithmetic_quantum": quantum,
+        "total_rank_weight_load": total_load,
+        "total_load_quanta": total_quanta,
+        "arithmetic_spread_lower_bound": lower_bound,
+    }
+
+
 def _decode_assignment(
     values: np.ndarray,
     counts: torch.Tensor,
@@ -823,9 +851,18 @@ def _solve_placement_groups_milp(
     tolerance: float = 0.01,
     fix_first_layer: bool = True,
     time_limit: float | None = None,
+    spread_upper_bound: float | None = None,
+    feasibility_only: bool = False,
 ) -> Dict[str, Any]:
-    """Solve placement exactly with an assignment-matrix MILP."""
+    """Solve placement with an assignment MILP or a bounded feasibility model."""
     counts, widths = _validate_placement_groups(group_counts, group_widths, tolerance)
+    if feasibility_only and spread_upper_bound is None:
+        raise ValueError("feasibility_only requires spread_upper_bound")
+    if spread_upper_bound is not None and spread_upper_bound < 0.0:
+        raise ValueError(
+            f"spread_upper_bound must be non-negative, got {spread_upper_bound}"
+        )
+    arithmetic = _placement_spread_arithmetic_lower_bound(counts, widths)
     num_layers, ep_size = counts.shape
     group_loads = (counts * widths).numpy().astype(np.float64, copy=False)
     num_binary = num_layers * ep_size * ep_size
@@ -835,7 +872,7 @@ def _solve_placement_groups_milp(
 
     assignment_rows = 2 * num_layers * ep_size
     load_rows = 2 * ep_size
-    valid_inequality_rows = 2
+    valid_inequality_rows = 2 + int(spread_upper_bound is not None)
     constraint_rows = assignment_rows + load_rows + valid_inequality_rows
     matrix = lil_matrix((constraint_rows, num_variables), dtype=np.float64)
     lower = np.full(constraint_rows, -np.inf, dtype=np.float64)
@@ -883,6 +920,11 @@ def _solve_placement_groups_milp(
     row += 1
     matrix[row, min_index] = 1.0
     upper[row] = mean_load
+    row += 1
+    if spread_upper_bound is not None:
+        matrix[row, max_index] = 1.0
+        matrix[row, min_index] = -1.0
+        upper[row] = float(spread_upper_bound)
 
     bounds_lower = np.zeros(num_variables, dtype=np.float64)
     bounds_upper = np.ones(num_variables, dtype=np.float64)
@@ -896,8 +938,9 @@ def _solve_placement_groups_milp(
                 bounds_upper[index] = fixed_value
 
     objective = np.zeros(num_variables, dtype=np.float64)
-    objective[max_index] = 1.0
-    objective[min_index] = -1.0
+    if not feasibility_only:
+        objective[max_index] = 1.0
+        objective[min_index] = -1.0
     integrality = np.ones(num_variables, dtype=np.int8)
     options: Dict[str, Any] = {"presolve": True, "mip_rel_gap": 0.0}
     if time_limit is not None:
@@ -914,14 +957,27 @@ def _solve_placement_groups_milp(
     )
     if result.x is None:
         error = PlacementMilpNoIncumbentError(result)
+        error.diagnostics.update(arithmetic)
         error.diagnostics["milp_binary_variables"] = int(num_binary)
         error.diagnostics["milp_time_limit"] = (
             None if time_limit is None else float(time_limit)
+        )
+        error.diagnostics["milp_mode"] = (
+            "feasibility" if feasibility_only else "optimization"
+        )
+        error.diagnostics["spread_upper_bound"] = (
+            None if spread_upper_bound is None else float(spread_upper_bound)
         )
         raise error
 
     placement = _decode_assignment(result.x, counts, widths)
     placement.update(_placement_metrics(placement["rank_weight_loads"], tolerance))
+    arithmetic_optimal = (
+        placement["rank_weight_spread"]
+        <= float(arithmetic["arithmetic_spread_lower_bound"]) + 1e-6
+    )
+    highs_model_optimal = int(result.status) == 0
+    highs_optimal = highs_model_optimal and not feasibility_only
     dual_bound = getattr(result, "mip_dual_bound", None)
     mip_gap = getattr(result, "mip_gap", None)
     node_count = getattr(result, "mip_node_count", None)
@@ -929,7 +985,18 @@ def _solve_placement_groups_milp(
         {
             "solver_status": int(result.status),
             "solver_success": bool(result.success),
-            "solver_optimal": int(result.status) == 0,
+            "solver_optimal": highs_optimal or arithmetic_optimal,
+            "highs_optimal": highs_optimal,
+            "highs_model_optimal": highs_model_optimal,
+            "feasibility_proven": feasibility_only and highs_model_optimal,
+            "arithmetic_optimal": arithmetic_optimal,
+            "optimality_proof": (
+                "highs"
+                if highs_optimal
+                else "arithmetic_lower_bound"
+                if arithmetic_optimal
+                else None
+            ),
             "solver_message": str(result.message),
             "solver_objective": placement["rank_weight_spread"],
             "solver_reported_objective": float(result.fun),
@@ -937,8 +1004,13 @@ def _solve_placement_groups_milp(
             "mip_gap": np.nan if mip_gap is None else float(mip_gap),
             "mip_node_count": -1 if node_count is None else int(node_count),
             "milp_encoding": "assignment",
+            "milp_mode": "feasibility" if feasibility_only else "optimization",
             "milp_binary_variables": int(num_binary),
             "milp_time_limit": None if time_limit is None else float(time_limit),
+            "spread_upper_bound": (
+                None if spread_upper_bound is None else float(spread_upper_bound)
+            ),
+            **arithmetic,
         }
     )
     return placement

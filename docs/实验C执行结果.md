@@ -1,6 +1,25 @@
 # 实验 C：Greedy 与 MILP
 
 > [!IMPORTANT]
+> **E0 DONE（2026-09-22 15:42 CST）**
+> 新的算术下界早停验证已完成 31/31 case，旧 475-case supplement 已作废。本轮只修改求解与实验代码，论文尚未修改，等待 E0 结果审阅后再决定方法叙述。
+
+- 仓库汇总：`artifacts/placement-e0/summary.md`
+- 仓库逐 case 产物：`artifacts/placement-e0/cases/`
+- 旧结果重标：`artifacts/placement-e0/relabelled_depth_cases.md`
+- 运行时原始产物：`results/placement_e0/`
+- 自动化状态：`.automation/placement_e0/STATUS.md`
+- CPU：4 个并行 shard，每个 shard 固定 4 个互不重叠的物理核；完整墙钟约 130 秒。
+
+| 组别 | Arm A | Arm B |
+| --- | --- | --- |
+| m=4，29 个 `floor=128` case | 29/29 命中；0.5 s: 7，1 s: 16，2 s: 5，5 s: 1；中位上界 1 s | 29/29 命中；中位 0.297 s，最慢 1.755 s |
+| m=12，`floor=0` | 60 s 内未命中，最后 incumbent=256 | 2.984 s 找到 spread=0，由算术下界证明全局最优 |
+| m=16，`floor=0` | 60 s 内未命中，60 s incumbent=2304 | 1.305 s 找到 spread=0，由算术下界证明全局最优 |
+
+E0 否定了“m=12/16 的 floor=0 组合上不可达”这一猜测：两者都可达，只是原始优化模型的搜索/证明路径在固定预算内效率较低。Arm B 31/31 命中下界，因此“算术下界 + 有界可行性 MILP”应作为方法切换的主要候选；Greedy 是否保留为预算耗尽 fallback 等待审阅决定。
+
+> [!IMPORTANT]
 > **DONE（2026-09-19 CST）**
 > 旧的 3600 秒方案已在 14/39 处停止并保留 checkpoint。确认 Greedy 与 MILP 都固定第 0 层为 identity；新方案使用 300 秒上限、多窗口和加密 L，并固定在 CPU `24,26,28,30` 上完成。assignment MILP 保持现有实现，未加入两阶段求解或 warm start。
 
@@ -20,6 +39,9 @@
 > **DONE (2026-09-19 18:37 CST)**
 > 多窗口 depth sweep 与 M 扩展性扫描均已完成并通过产物检查。
 
-> [!IMPORTANT]
-> **SUPPLEMENT QUEUED（2026-09-22 CST）**
-> 新版补充实验已排在当前 Qwen3-VL p=0.3 视频流水线之后。范围包括 5 个 MILP 时限 pilot、三模型六份 plan 的 stride=4 滑窗、p=0.3 多模型 m 补点，以及 m=5/6/7 greedy 邻域直接对照。只有当前视频流水线通过完成校验后才会启动。
+> [!NOTE]
+> **HISTORICAL / SUPERSEDED（2026-09-22 CST）**
+> 下述 475-case supplement 排队记录已被 E0 新规划取代，从未启动。
+
+- 2026-09-22 14:08 CST：补充实验仍为 0/475（pilot 0/10、depth 0/396、m-sweep 0/69）。Qwen VideoMMMU 当前 244/900，近期约 44 条/小时且持续增长，未卡住；其 Judge 完成后本流水线自动解除等待，预计 2026-09-23 05:00 CST 左右启动。当前 worker/supervisor 均存活，0/475 是有条件排队状态，不是执行停滞。
+- 2026-09-22 15:00 CST：Qwen VideoMMMU 已按用户要求暂停在 283/900，缓存保留且不自动恢复。实验 C 旧补充流水线未启动；用户将提供新的规划，在新规划确认前保持暂停，不运行旧的 475-case 方案。

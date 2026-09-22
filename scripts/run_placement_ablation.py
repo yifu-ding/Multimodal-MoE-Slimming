@@ -165,6 +165,11 @@ def placement_summary(result: dict[str, Any]) -> dict[str, Any]:
         "solver_status": result.get("solver_status"),
         "solver_success": result.get("solver_success"),
         "solver_optimal": result.get("solver_optimal"),
+        "highs_optimal": result.get("highs_optimal"),
+        "highs_model_optimal": result.get("highs_model_optimal"),
+        "feasibility_proven": result.get("feasibility_proven"),
+        "arithmetic_optimal": result.get("arithmetic_optimal"),
+        "optimality_proof": result.get("optimality_proof"),
         "solver_message": result.get("solver_message"),
         "incumbent": finite_or_none(result.get("solver_objective")),
         "solver_reported_objective": finite_or_none(
@@ -174,6 +179,14 @@ def placement_summary(result: dict[str, Any]) -> dict[str, Any]:
         "mip_gap": finite_or_none(result.get("mip_gap")),
         "mip_node_count": finite_or_none(result.get("mip_node_count")),
         "milp_binary_variables": result.get("milp_binary_variables"),
+        "milp_mode": result.get("milp_mode"),
+        "arithmetic_quantum": result.get("arithmetic_quantum"),
+        "total_rank_weight_load": result.get("total_rank_weight_load"),
+        "total_load_quanta": result.get("total_load_quanta"),
+        "arithmetic_spread_lower_bound": result.get(
+            "arithmetic_spread_lower_bound"
+        ),
+        "spread_upper_bound": result.get("spread_upper_bound"),
     }
 
 
@@ -187,6 +200,11 @@ def no_incumbent_summary(error: PlacementMilpNoIncumbentError) -> dict[str, Any]
         "solver_status": diagnostics["solver_status"],
         "solver_success": diagnostics["solver_success"],
         "solver_optimal": False,
+        "highs_optimal": False,
+        "highs_model_optimal": False,
+        "feasibility_proven": False,
+        "arithmetic_optimal": False,
+        "optimality_proof": None,
         "solver_message": diagnostics["solver_message"],
         "incumbent": None,
         "solver_reported_objective": None,
@@ -194,6 +212,14 @@ def no_incumbent_summary(error: PlacementMilpNoIncumbentError) -> dict[str, Any]
         "mip_gap": finite_or_none(diagnostics["mip_gap"]),
         "mip_node_count": finite_or_none(diagnostics["mip_node_count"]),
         "milp_binary_variables": diagnostics.get("milp_binary_variables"),
+        "milp_mode": diagnostics.get("milp_mode"),
+        "arithmetic_quantum": diagnostics.get("arithmetic_quantum"),
+        "total_rank_weight_load": diagnostics.get("total_rank_weight_load"),
+        "total_load_quanta": diagnostics.get("total_load_quanta"),
+        "arithmetic_spread_lower_bound": diagnostics.get(
+            "arithmetic_spread_lower_bound"
+        ),
+        "spread_upper_bound": diagnostics.get("spread_upper_bound"),
     }
 
 
