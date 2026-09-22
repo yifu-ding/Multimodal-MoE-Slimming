@@ -1,5 +1,6 @@
 import torch
 
+from scripts.run_placement_e0_followup import solve_feasibility_ladder
 from src.generate_mask.ep4_intplan import (
     DEFAULT_WIDTHS,
     _build_layer_placement_groups,
@@ -345,6 +346,24 @@ def test_milp_feasibility_at_arithmetic_floor_certifies_optimality():
     assert result["feasibility_proven"]
     assert not result["highs_optimal"]
     assert result["milp_mode"] == "feasibility"
+
+
+def test_feasibility_ladder_retries_until_first_feasible_quantum():
+    counts = torch.ones((1, 4), dtype=torch.int64)
+    widths = torch.tensor([[768, 640, 512, 384]], dtype=torch.int64)
+
+    result = solve_feasibility_ladder(counts, widths, total_time_limit=10.0)
+
+    assert [attempt["target_spread"] for attempt in result["attempts"]] == [
+        128.0,
+        256.0,
+        384.0,
+    ]
+    assert [attempt["solver_status"] for attempt in result["attempts"]] == [2, 2, 0]
+    assert result["retry_count"] == 2
+    assert result["spread"] == 384.0
+    assert result["optimality_proven"]
+    assert result["optimality_proof"] == "quantum_feasibility_ladder"
 
 
 def test_greedy_and_milp_fix_the_same_first_layer():

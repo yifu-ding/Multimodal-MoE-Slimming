@@ -1,0 +1,10 @@
+{
+  "cases_sha256": "40522b02af71b6381331b594a384497ccdebcea7cfef8296063e99c8e1ec59eb",
+  "experiment": "placement-e0-followup-summary",
+  "experiment_sha256": "e182ebe0866b1d09d5c12c5725544567fc80d1647c6641954da0f37e54ce087a",
+  "max_seconds": 110.74555167500512,
+  "median_seconds": 0.3603796729876194,
+  "num_cases": 31,
+  "optimality_proven": 31,
+  "retry_branch_exercised": 24
+}

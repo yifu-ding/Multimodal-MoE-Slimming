@@ -1,6 +1,25 @@
 # 实验 C：Greedy 与 MILP
 
 > [!IMPORTANT]
+> **E0b DONE（2026-09-22 16:30 CST）**
+> 论文修改前的补充验证已完成 31/31：24 个 L=4 retry case、5 个 m=4/floor=0 case，以及 m=32/64 扩展 case，全部获得最优性证明。
+
+- 仓库汇总：`artifacts/placement-e0-followup/summary.md`
+- 仓库逐 case 产物：`artifacts/placement-e0-followup/cases/`
+- 运行时原始产物：`results/placement_e0_followup/`
+- 自动化状态：`.automation/placement_e0_followup/STATUS.md`
+- 总墙钟约 118.2 s，4 个 shard 使用四组互不重叠的 4 物理核 affinity。
+
+| 补充项 | 结果 |
+| --- | --- |
+| L=4 retry | 24/24 触发，且第一个可行 target 与旧精确 MILP 最优值逐例相等；中位 0.470 s，最慢 3.133 s |
+| m=4 floor=0 | 5/5 找到 spread=0，中位 0.252 s，最慢 0.344 s |
+| m=32 | spread=0，1.184 s，算术下界证明最优 |
+| m=64 | spread=0，110.746 s，算术下界证明最优 |
+
+retry 分支不再是未测路径。当 floor 不可达时，算法逐 quantum 提高 target；只有 HiGHS 明确返回 infeasible 才继续，首个可行 target 在离散 quantum 上构成精确最优性证明。论文尚未修改。
+
+> [!IMPORTANT]
 > **E0 DONE（2026-09-22 15:42 CST）**
 > 新的算术下界早停验证已完成 31/31 case，旧 475-case supplement 已作废。本轮只修改求解与实验代码，论文尚未修改，等待 E0 结果审阅后再决定方法叙述。
 
