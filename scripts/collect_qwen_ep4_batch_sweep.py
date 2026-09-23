@@ -12,7 +12,7 @@ from statistics import median
 
 from collect_qwen_ep4_efficiency import percentile, read_gpu_trace
 
-STRATEGIES = ("padded", "multi_kernel", "cross_layer")
+STRATEGIES = ("default", "padded", "multi_kernel", "single_width", "cross_layer")
 KV_PATTERN = re.compile(r"GPU KV cache size: ([0-9,]+) tokens")
 KV_GIB_PATTERN = re.compile(r"Available KV cache memory: ([0-9.]+) GiB")
 MODEL_MEMORY_PATTERN = re.compile(r"Model loading took ([0-9.]+) GiB memory")

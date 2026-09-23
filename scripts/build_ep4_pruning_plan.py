@@ -41,6 +41,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--normalize", type=int, choices=(0, 1), default=0)
     parser.add_argument("--expertwise-budget-normalize", type=int, choices=(0, 1), default=1)
     parser.add_argument("--use-ema", type=int, choices=(0, 1), default=1)
+    parser.add_argument(
+        "--align-inter",
+        type=int,
+        default=0,
+        help="Round each expert's kept channel count to a multiple of this value "
+        "(0 disables; see src/generate_mask/adjusters/align.py).",
+    )
+    parser.add_argument(
+        "--min-per-expert",
+        type=int,
+        default=0,
+        help="Minimum kept channels for an active expert (0 disables); "
+        "should itself be a multiple of --align-inter when both are set.",
+    )
+    parser.add_argument(
+        "--adjust-method",
+        choices=("largest_channel", "largest_score_sum"),
+        default="largest_score_sum",
+        help="largest_channel uses adjusters/align.py (round every expert to the "
+        "align grid, redistribute leftover budget by channel count); "
+        "largest_score_sum uses adjusters/align_score.py instead.",
+    )
     return parser.parse_args()
 
 
@@ -95,7 +117,11 @@ def main() -> int:
     pruning_config = {
         "prune_ratio": args.prune_ratio,
         "mask_method_kwargs": mask_method_kwargs,
-        "adjust_masks_kwargs": {"align_inter": 0, "min_per_expert": 0},
+        "adjust_masks_kwargs": {
+            "align_inter": args.align_inter,
+            "min_per_expert": args.min_per_expert,
+            "adjust_method": args.adjust_method,
+        },
         "smooth_fn": args.smooth_fn,
         "modality_aware": bool(args.modality_aware),
         "shared_protect": bool(args.shared_protect),

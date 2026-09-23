@@ -1,0 +1,23 @@
+- 2026-09-23 00:41 CST: RUNNING | acp p30 padded: kimi=2/7 qwen3=0/7 internvl=0/7 (total 2/21) | session=maes-acp-worker.
+- 2026-09-23 01:11 CST: RUNNING | acp p30 padded: kimi=7/7 qwen3=1/7 internvl=0/7 (total 8/21) | session=maes-acp-worker.
+- 2026-09-23 01:41 CST: RUNNING | acp p30 padded: kimi_p30=7/11 qwen3_p30=4/11 internvl_p30=0/11 kimi_p50=0/11 qwen3_p50=0/11 internvl_p50=0/11 (total 11/66) | session=maes-acp-worker.
+- 2026-09-23 02:11 CST: RUNNING | acp p30 padded: kimi_p30=7/11 qwen3_p30=7/11 internvl_p30=2/11 kimi_p50=0/11 qwen3_p50=0/11 internvl_p50=0/11 (total 16/66) | session=maes-acp-worker.
+- 2026-09-23 02:41 CST: RUNNING | acp p30 padded: kimi_p30=7/11 qwen3_p30=7/11 internvl_p30=7/11 kimi_p50=0/11 qwen3_p50=0/11 internvl_p50=0/11 (total 21/66) | session=maes-acp-worker.
+- 2026-09-23 03:11 CST: RUNNING | acp p30 padded: kimi_p30=7/11 qwen3_p30=7/11 internvl_p30=7/11 kimi_p50=0/11 qwen3_p50=0/11 internvl_p50=0/11 (total 21/66) | session=maes-acp-worker.
+- 2026-09-23 03:41 CST: RUNNING | acp p30 padded: kimi_p30=8/11 qwen3_p30=7/11 internvl_p30=7/11 kimi_p50=0/11 qwen3_p50=0/11 internvl_p50=0/11 (total 22/66) | session=maes-acp-worker.
+- 2026-09-23 04:11 CST: RUNNING | acp p30 padded: kimi_p30=9/11 qwen3_p30=7/11 internvl_p30=7/11 kimi_p50=0/11 qwen3_p50=0/11 internvl_p50=0/11 (total 23/66) | session=maes-acp-worker.
+- 2026-09-23 04:41 CST: RUNNING | acp p30 padded: kimi_p30=9/11 qwen3_p30=7/11 internvl_p30=7/11 kimi_p50=0/11 qwen3_p50=0/11 internvl_p50=0/11 (total 23/66) | session=maes-acp-worker.
+- 2026-09-23 05:11 CST: RUNNING | acp p30 padded: kimi_p30=9/11 qwen3_p30=7/11 internvl_p30=7/11 kimi_p50=0/11 qwen3_p50=0/11 internvl_p50=0/11 (total 23/66) | session=maes-acp-worker.
+- 2026-09-23 05:41 CST: RUNNING | acp p30 padded: kimi_p30=11/11 qwen3_p30=7/11 internvl_p30=7/11 kimi_p50=0/11 qwen3_p50=0/11 internvl_p50=0/11 (total 25/66) | session=maes-acp-worker.
+- 2026-09-23 06:11 CST: RUNNING | acp p30 padded: kimi_p30=11/11 qwen3_p30=8/11 internvl_p30=7/11 kimi_p50=0/11 qwen3_p50=0/11 internvl_p50=0/11 (total 26/66) | session=maes-acp-worker.
+- 2026-09-23 06:41 CST: RUNNING | acp p30 padded: kimi_p30=11/11 qwen3_p30=9/11 internvl_p30=7/11 kimi_p50=0/11 qwen3_p50=0/11 internvl_p50=0/11 (total 27/66) | session=maes-acp-worker.
+- 2026-09-23 07:11 CST: RUNNING | acp p30 padded: kimi_p30=11/11 qwen3_p30=9/11 internvl_p30=7/11 kimi_p50=0/11 qwen3_p50=0/11 internvl_p50=0/11 (total 27/66) | session=maes-acp-worker.
+- 2026-09-23 07:41 CST: RUNNING | acp p30 padded: kimi_p30=11/11 qwen3_p30=11/11 internvl_p30=7/11 kimi_p50=0/11 qwen3_p50=0/11 internvl_p50=0/11 (total 29/66) | session=maes-acp-worker.
+- 2026-09-23 08:11 CST: RUNNING | acp p30 padded: kimi_p30=11/11 qwen3_p30=11/11 internvl_p30=9/11 kimi_p50=0/11 qwen3_p50=0/11 internvl_p50=0/11 (total 31/66) | session=maes-acp-worker.
+- 2026-09-23 08:41 CST: RUNNING | acp p30 padded: kimi_p30=11/11 qwen3_p30=11/11 internvl_p30=9/11 kimi_p50=0/11 qwen3_p50=0/11 internvl_p50=0/11 (total 31/66) | session=maes-acp-worker.
+- 2026-09-23 09:11 CST: RUNNING | acp p30 padded: kimi_p30=11/11 qwen3_p30=11/11 internvl_p30=11/11 kimi_p50=2/11 qwen3_p50=0/11 internvl_p50=0/11 (total 35/66) | session=maes-acp-worker.
+- 2026-09-23 09:41 CST: RUNNING | acp p30 padded: kimi_p30=11/11 qwen3_p30=11/11 internvl_p30=11/11 kimi_p50=7/11 qwen3_p50=0/11 internvl_p50=0/11 (total 40/66) | session=maes-acp-worker.
+- 2026-09-23 10:11 CST: RUNNING | acp p30 padded: kimi_p30=11/11 qwen3_p30=11/11 internvl_p30=11/11 kimi_p50=7/11 qwen3_p50=0/11 internvl_p50=0/11 (total 40/66) | session=maes-acp-worker.
+- 2026-09-23 10:41 CST: RUNNING | acp p30 padded: kimi_p30=11/11 qwen3_p30=11/11 internvl_p30=11/11 kimi_p50=8/11 qwen3_p50=0/11 internvl_p50=0/11 (total 41/66) | session=maes-acp-worker.
+- 2026-09-23 11:11 CST: RUNNING | acp p30 padded: kimi_p30=11/11 qwen3_p30=11/11 internvl_p30=11/11 kimi_p50=9/11 qwen3_p50=0/11 internvl_p50=0/11 (total 42/66) | session=maes-acp-worker.
+- 2026-09-23 11:41 CST: RUNNING | acp p30 padded: kimi_p30=11/11 qwen3_p30=11/11 internvl_p30=11/11 kimi_p50=9/11 qwen3_p50=0/11 internvl_p50=0/11 (total 42/66) | session=maes-acp-worker.

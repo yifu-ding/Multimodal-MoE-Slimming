@@ -1,0 +1,6 @@
+task=gqa_prefill
+signature=507072550ad4106e6915bd83aae0cba56281c70c55788bc35f89fe5180b2edec
+completed_at=2026-09-22T22:49:18+08:00
+batch_size=512
+wall_time_seconds=254
+output_dir=/home/dyf/code/distill/MAES/artifacts/efficiency_figure/internvl3_5_gqa_ep4/batch512_main/prune_30/multi_kernel/bs_512/eval/tasks/gqa_prefill

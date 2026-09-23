@@ -1,0 +1,6 @@
+task=gqa_prefill
+signature=9cbee866e440e9c7b5aad6c63c811fc01908ac7fe64f3553359e0757b1b05e41
+completed_at=2026-09-22T22:36:24+08:00
+batch_size=512
+wall_time_seconds=112
+output_dir=/home/dyf/code/distill/MAES/artifacts/efficiency_figure/qwen3_gqa_ep4/batch512_main/prune_50/cross_layer/bs_512/eval/tasks/gqa_prefill

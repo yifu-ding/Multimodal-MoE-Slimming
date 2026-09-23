@@ -13,6 +13,12 @@ MODEL_WIDTH_PRESETS = {
     "moonshotai/Kimi-VL-A3B-Instruct": (0, 704, 960, 1152, 1408),
     "Qwen/Qwen3-VL-30B-A3B-Instruct": (0, 384, 512, 640, 768),
     "OpenGVLab/InternVL3_5-30B-A3B-HF": (0, 384, 512, 640, 768),
+    # Speed-only presets (no accuracy plan exists for these two): a fine
+    # width-quantum near the top of each model's real moe_intermediate_size,
+    # chosen empirically so a forced-balanced tier budget stays reachable
+    # near both p=0.30 and p=0.50 (see build_ep4_balanced_plan.py).
+    "mistralai/Mistral-Small-4-119B-2603": (0, 1280, 1536, 1792, 2048),
+    "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8": (0, 960, 1152, 1344, 1536),
 }
 
 
@@ -62,7 +68,8 @@ def validate_ep4_plan(plan: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"rank_widths must have shape {(num_layers, 4)}")
     if len(active_widths) != 4 or any(value <= 0 for value in active_widths):
         raise ValueError("EP4 plan must contain exactly four positive active widths")
-    if not torch.isin(rank_widths, torch.tensor(active_widths, dtype=torch.int64)).all():
+    active_widths_tensor = torch.tensor(active_widths, dtype=torch.int64, device="cpu")
+    if not torch.isin(rank_widths, active_widths_tensor).all():
         raise ValueError("rank_widths contains a width outside active_widths")
 
     removed = widths == 0

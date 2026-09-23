@@ -1,0 +1,6 @@
+exit_code=0
+wall_time_seconds=175
+completed_this_invocation=1
+skipped_completed=0
+failed_this_invocation=0
+task_status_file=/home/dyf/code/distill/MAES/artifacts/efficiency_figure/kimi_vl_gqa_ep4/batch512_main/prune_50/single_width/bs_512/eval/task_status.tsv

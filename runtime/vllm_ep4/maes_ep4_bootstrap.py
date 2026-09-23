@@ -12,6 +12,7 @@ _INSTALLERS = {
     "vllm.model_executor.layers.fused_moe.layer": "install_into",
     "vllm.model_executor.models.qwen3_moe": "install_qwen_moe_into",
     "vllm.model_executor.models.qwen3_vl_moe": "install_qwen_vl_loader_into",
+    "vllm.model_executor.models.deepseek_v2": "install_kimi_moe_into",
 }
 
 

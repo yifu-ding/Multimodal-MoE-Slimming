@@ -2,7 +2,11 @@ import torch
 
 from src.generate_mask.ep4_intplan import plan_ep4_intplan
 from src.vllm_ep4_plan import SCHEMA_VERSION, validate_ep4_plan
-from src.vllm_ep4_runtime import _rank_expert_map, _slice_expert_weight
+from src.vllm_ep4_runtime import (
+    _rank_expert_map,
+    _single_width_layer_plan,
+    _slice_expert_weight,
+)
 
 
 def _valid_plan():
@@ -53,6 +57,32 @@ def test_weight_slicing_uses_same_channels_for_gate_up_and_down():
     assert torch.equal(
         _slice_expert_weight(down, "w2", channels, 8), down[:, channels]
     )
+
+
+def test_single_width_pins_one_tier_per_rank_across_all_layers():
+    plan = validate_ep4_plan(_valid_plan())
+    active_widths = sorted(int(value) for value in plan["active_widths"])
+    num_layers = plan["expert_widths"].shape[0]
+    for position in range(num_layers):
+        layer_widths = plan["expert_widths"][position]
+        seen_experts: set[int] = set()
+        for rank in range(4):
+            active = _single_width_layer_plan(
+                plan, position, model_layer_id=position, ep_rank=rank
+            )
+            # The naive baseline must never rotate: rank `r` always owns the
+            # r-th smallest active width, in every single layer.
+            assert active.rank_width == active_widths[rank]
+            for expert_id in active.local_to_global:
+                assert int(layer_widths[expert_id]) == active_widths[rank]
+                assert expert_id not in seen_experts
+                seen_experts.add(expert_id)
+        expected = {
+            int(expert_id)
+            for expert_id in range(int(layer_widths.shape[0]))
+            if int(layer_widths[expert_id]) != 0
+        }
+        assert seen_experts == expected
 
 
 def test_validator_rejects_removed_expert_with_live_mapping():

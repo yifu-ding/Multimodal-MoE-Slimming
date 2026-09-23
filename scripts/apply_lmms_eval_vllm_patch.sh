@@ -16,6 +16,7 @@ MM_CACHE_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_vllm_mm_processor_cache.patc
 RESPONSE_CACHE_IDENTITY_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_response_cache_identity.patch"
 RESPONSE_CACHE_TARGET="${REPO_ROOT}/lmms-eval/lmms_eval/caching/response_cache.py"
 RANDOM_SUBSET_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_random_subset.patch"
+DECODE_SAMPLING_PATCH_FILE="${REPO_ROOT}/patches/lmms_eval_vllm_decode_sampling_kwargs.patch"
 
 if [[ ! -f "${TARGET}" ]]; then
     echo "error: local lmms-eval checkout is missing: ${TARGET}" >&2
@@ -147,4 +148,18 @@ else
         exit 2
     fi
     patch --silent --forward -d "${REPO_ROOT}" -p1 < "${PREFILL_METRICS_PATCH_FILE}"
+fi
+
+decode_sampling_marker_count="$(grep -Ec '^[[:space:]]*(params\["min_tokens"\] = gen_kwargs\["min_new_tokens"\]|params\["ignore_eos"\] = True)$' "${TARGET}" || true)"
+if [[ "${decode_sampling_marker_count}" == "2" ]]; then
+    :
+elif [[ "${decode_sampling_marker_count}" != "0" ]]; then
+    echo "error: lmms-eval vLLM decode sampling kwargs patch is only partially applied (${decode_sampling_marker_count}/2 markers)." >&2
+    exit 2
+else
+    if ! patch --dry-run --silent --forward -d "${REPO_ROOT}" -p1 < "${DECODE_SAMPLING_PATCH_FILE}"; then
+        echo "error: ${DECODE_SAMPLING_PATCH_FILE} does not apply to the current lmms-eval checkout." >&2
+        exit 2
+    fi
+    patch --silent --forward -d "${REPO_ROOT}" -p1 < "${DECODE_SAMPLING_PATCH_FILE}"
 fi

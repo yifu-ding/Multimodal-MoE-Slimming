@@ -1,0 +1,3 @@
+strategy	batch_size	status	exit_code
+default	512	complete	0
+default	512	capped	0

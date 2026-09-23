@@ -1,0 +1,21 @@
+diff --git a/lmms-eval/lmms_eval/models/simple/vllm.py b/lmms-eval/lmms_eval/models/simple/vllm.py
+--- a/lmms-eval/lmms_eval/models/simple/vllm.py
++++ b/lmms-eval/lmms_eval/models/simple/vllm.py
+@@ -360,11 +360,16 @@
+         return top_p
+
+     def _build_sampling_params_dict(self, gen_kwargs: dict[str, Any]) -> dict[str, Any]:
+-        return {
++        params = {
+             "max_tokens": gen_kwargs["max_new_tokens"],
+             "temperature": gen_kwargs["temperature"],
+             "top_p": self._normalize_top_p_for_vllm(gen_kwargs["top_p"]),
+         }
++        if "min_new_tokens" in gen_kwargs:
++            params["min_tokens"] = gen_kwargs["min_new_tokens"]
++        if gen_kwargs.get("ignore_eos"):
++            params["ignore_eos"] = True
++        return params
+
+     def _run_tp_synced(
+         self,

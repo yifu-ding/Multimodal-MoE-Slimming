@@ -1,0 +1,6 @@
+task=gqa_prefill
+signature=e80a2042419afaf637f3ffe8fddfb4d586c13f6a65ecd50f5055bfa907d449ab
+completed_at=2026-09-22T23:17:37+08:00
+batch_size=512
+wall_time_seconds=174
+output_dir=/home/dyf/code/distill/MAES/artifacts/efficiency_figure/kimi_vl_gqa_ep4/batch512_main/prune_0/default/bs_512/eval/tasks/gqa_prefill

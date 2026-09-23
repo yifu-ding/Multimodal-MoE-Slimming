@@ -15,7 +15,7 @@ _LAYER_PATTERN = re.compile(
     r"(?:^|\.)layers\.(\d+)\.mlp\.experts(?:\.groups\.\d+)?$"
 )
 _CONTEXT = threading.local()
-_VALID_STRATEGIES = {"cross_layer", "multi_kernel", "padded"}
+_VALID_STRATEGIES = {"cross_layer", "multi_kernel", "padded", "single_width"}
 
 
 @dataclass(frozen=True)
@@ -125,6 +125,52 @@ def _multi_kernel_layer_plan(plan, position: int, model_layer_id: int, ep_rank: 
         model_layer_id=model_layer_id,
         ep_rank=ep_rank,
         rank_width=width,
+        full_width=int(plan["intermediate_masks"].shape[2]),
+        num_experts=int(layer_widths.shape[0]),
+        expert_to_rank=expert_to_rank,
+        expert_to_local=expert_to_local,
+        channel_masks=plan["intermediate_masks"][position],
+        local_to_global=local_to_global,
+    )
+
+
+def _single_width_layer_plan(plan, position: int, model_layer_id: int, ep_rank: int):
+    """Pin one width tier to one EP rank forever, never rotating across layers.
+
+    Naive baseline: rank `r` always owns the `r`-th smallest active width, in
+    every layer, regardless of how unevenly that tier's expert count varies
+    layer to layer. Unlike cross_layer this ignores per-layer load balance.
+    """
+    import torch
+
+    layer_widths = plan["expert_widths"][position]
+    active_widths = sorted(int(value) for value in plan["active_widths"])
+    if len(active_widths) != 4:
+        raise ValueError(
+            f"single_width requires exactly four active widths, got {active_widths}"
+        )
+    width_to_rank = {width: rank for rank, width in enumerate(active_widths)}
+    expert_to_rank = torch.full_like(layer_widths, -1, dtype=torch.int64)
+    expert_to_local = torch.full_like(layer_widths, -1, dtype=torch.int64)
+    rank_local_counts = [0, 0, 0, 0]
+    for expert_id in range(int(layer_widths.shape[0])):
+        width = int(layer_widths[expert_id])
+        if width == 0:
+            continue
+        rank = width_to_rank[width]
+        expert_to_rank[expert_id] = rank
+        expert_to_local[expert_id] = rank_local_counts[rank]
+        rank_local_counts[rank] += 1
+    local_to_global = [
+        expert_id
+        for expert_id in range(int(layer_widths.shape[0]))
+        if int(expert_to_rank[expert_id]) == ep_rank
+    ]
+    return _LayerPlan(
+        plan_position=position,
+        model_layer_id=model_layer_id,
+        ep_rank=ep_rank,
+        rank_width=active_widths[ep_rank],
         full_width=int(plan["intermediate_masks"].shape[2]),
         num_experts=int(layer_widths.shape[0]),
         expert_to_rank=expert_to_rank,
@@ -252,6 +298,11 @@ def install_into(layer_module: ModuleType) -> None:
                 channel_masks=plan["intermediate_masks"][position],
                 local_to_global=local_ids,
             )
+        elif strategy == "single_width":
+            active = _single_width_layer_plan(plan, position, model_layer_id, ep_rank)
+            local_ids = active.local_to_global
+            bound.arguments["intermediate_size"] = active.rank_width
+            original_init(*bound.args, **bound.kwargs)
         else:
             active = getattr(_CONTEXT, "layer_plan", None)
             if active is None:
@@ -405,6 +456,46 @@ def install_qwen_moe_into(model_module: ModuleType) -> None:
                 finally:
                     _CONTEXT.layer_plan = None
 
+            # vLLM's stock per-expert-key loader (Qwen3MoeModel.load_weights,
+            # used by plain Qwen3Moe text backbones such as InternVL's) looks
+            # up a single fused `experts.w13_weight` / `experts.w2_weight`
+            # parameter by name and calls its weight_loader. That parameter
+            # no longer exists once experts is replaced by four groups, so
+            # expose harmless placeholders at the expected attribute names
+            # whose weight_loader fans each call out across the four groups;
+            # exactly one group's own (already-patched, slicing-aware)
+            # weight_loader claims each expert_id, via its normal expert_map
+            # ownership check.
+            for leaf in ("w13_weight", "w2_weight"):
+                redirect = nn.Parameter(torch.empty(0), requires_grad=False)
+
+                def _redirect_loader(
+                    param,
+                    loaded_weight,
+                    weight_name,
+                    shard_id,
+                    expert_id,
+                    return_success=False,
+                    _leaf=leaf,
+                ):
+                    loaded_any = False
+                    for group in self.groups.values():
+                        group_param = getattr(group, _leaf)
+                        success = group_param.weight_loader(
+                            group_param,
+                            loaded_weight,
+                            weight_name,
+                            shard_id,
+                            expert_id,
+                            return_success=True,
+                        )
+                        loaded_any = bool(success) or loaded_any
+                    if return_success:
+                        return loaded_any
+
+                redirect.weight_loader = _redirect_loader
+                setattr(self, leaf, redirect)
+
         def forward(self, hidden_states, router_logits):
             result = None
             for group in self.groups.values():
@@ -426,8 +517,235 @@ def install_qwen_moe_into(model_module: ModuleType) -> None:
         torch.cuda.empty_cache()
 
     model_module.Qwen3MoeSparseMoeBlock.__init__ = patched_init
+
+    # The redirect parameters above satisfy the stock loader's per-expert-key
+    # name lookup, but its returned loaded_params set still only names the
+    # redirect (`experts.w13_weight`/`experts.w2_weight`), not the four real
+    # group parameters that actually hold the weights. Expand it so vLLM's
+    # "were all parameters loaded" completeness check does not fail on plain
+    # (non fused-checkpoint) Qwen3Moe backbones such as InternVL's.
+    original_model_load_weights = model_module.Qwen3MoeModel.load_weights
+
+    def patched_model_load_weights(self, weights):
+        loaded_params = original_model_load_weights(self, weights)
+        params_dict = dict(self.named_parameters())
+        expanded = set(loaded_params)
+        for name in loaded_params:
+            if not name.endswith(("experts.w13_weight", "experts.w2_weight")):
+                continue
+            base, leaf = name.rsplit(".", 1)
+            group_prefix = f"{base}.groups."
+            expanded.update(
+                key
+                for key in params_dict
+                if key.startswith(group_prefix) and key.endswith(f".{leaf}")
+            )
+        return expanded
+
+    model_module.Qwen3MoeModel.load_weights = patched_model_load_weights
+
     model_module._maes_ep4_installed = True
     print("[MAES EP4] installed Qwen multi-kernel block", flush=True)
+
+
+def install_kimi_moe_into(model_module: ModuleType) -> None:
+    """Replace DeepSeek-v2-style Kimi-VL MoE blocks with width-specific kernels.
+
+    Unlike Qwen3Moe, DeepSeek-v2's MoE block (``DeepseekV2MoE``) bakes a
+    shared-expert MLP contribution into the same ``SharedFusedMoE`` module
+    that also runs the routed experts. Building four independent per-tier
+    ``SharedFusedMoE`` groups the way ``install_qwen_moe_into`` does for
+    plain ``FusedMoE`` would make every group recompute the shared-expert
+    output, silently summing it four times. Only the first group is given
+    the real ``shared_experts`` submodule (the other three get ``None``),
+    and ``use_overlapped=False`` is forced on every group so each one
+    computes its routed and shared contributions independently instead of
+    through the fused/overlapped kernel path, which assumes a single owner.
+    """
+    if getattr(model_module, "_maes_ep4_installed", False):
+        return
+    if not os.environ.get("MAES_EP4_PLAN") or _strategy() != "multi_kernel":
+        return
+
+    import torch
+    from torch import nn
+
+    from src.vllm_ep4_plan import load_ep4_plan
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.distributed import get_ep_group
+    from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
+
+    plan = load_ep4_plan(os.environ["MAES_EP4_PLAN"])
+    layer_id_to_position = {
+        int(layer_id): position
+        for position, layer_id in enumerate(plan["model_layer_ids"])
+    }
+    original_init = model_module.DeepseekV2MoE.__init__
+
+    class MultiKernelDeepseekExperts(nn.Module):
+        def __init__(
+            self,
+            block,
+            position: int,
+            model_layer_id: int,
+            prefix: str,
+            config,
+            quant_config,
+        ):
+            super().__init__()
+            ep_rank = int(get_ep_group().rank_in_group)
+            n_shared_experts = (
+                config.n_shared_experts
+                if rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+                else None
+            )
+            self.groups = nn.ModuleDict()
+            for index, width in enumerate(sorted(plan["active_widths"], reverse=True)):
+                active = _multi_kernel_layer_plan(
+                    plan, position, model_layer_id, ep_rank, int(width)
+                )
+                _CONTEXT.layer_plan = active
+                try:
+                    group = SharedFusedMoE(
+                        shared_experts=block.shared_experts if index == 0 else None,
+                        gate=None,
+                        use_overlapped=False,
+                        num_experts=block.n_routed_experts,
+                        top_k=config.num_experts_per_tok,
+                        hidden_size=config.hidden_size,
+                        intermediate_size=int(plan["intermediate_masks"].shape[2]),
+                        reduce_results=False,
+                        renormalize=config.norm_topk_prob,
+                        quant_config=quant_config,
+                        use_grouped_topk=True,
+                        num_expert_group=getattr(config, "n_group", 1),
+                        topk_group=getattr(config, "topk_group", 1),
+                        prefix=f"{prefix}.experts.groups.{width}",
+                        scoring_func=getattr(config, "scoring_func", "softmax"),
+                        routed_scaling_factor=(
+                            1.0
+                            if not block.is_rocm_aiter_moe_enabled
+                            else block.routed_scaling_factor
+                        ),
+                        e_score_correction_bias=block.gate.e_score_correction_bias,
+                        enable_eplb=block.enable_eplb,
+                        num_redundant_experts=block.n_redundant_experts,
+                        is_sequence_parallel=block.is_sequence_parallel,
+                        n_shared_experts=n_shared_experts,
+                    )
+                    if not active.local_to_global:
+                        with torch.no_grad():
+                            for param in group.parameters():
+                                param.zero_()
+                    self.groups[str(width)] = group
+                finally:
+                    _CONTEXT.layer_plan = None
+
+            # Mirrors install_qwen_moe_into's redirect trick: vLLM's stock
+            # per-expert-key loader (DeepseekV2Model.load_weights) looks up
+            # a single fused `experts.w13_weight` / `experts.w2_weight`
+            # parameter by name; expose harmless placeholders there whose
+            # weight_loader fans out across the four groups.
+            for leaf in ("w13_weight", "w2_weight"):
+                redirect = nn.Parameter(torch.empty(0), requires_grad=False)
+
+                def _redirect_loader(
+                    param,
+                    loaded_weight,
+                    weight_name,
+                    shard_id,
+                    expert_id,
+                    return_success=False,
+                    _leaf=leaf,
+                ):
+                    loaded_any = False
+                    for group in self.groups.values():
+                        group_param = getattr(group, _leaf)
+                        success = group_param.weight_loader(
+                            group_param,
+                            loaded_weight,
+                            weight_name,
+                            shard_id,
+                            expert_id,
+                            return_success=True,
+                        )
+                        loaded_any = bool(success) or loaded_any
+                    if return_success:
+                        return loaded_any
+
+                redirect.weight_loader = _redirect_loader
+                setattr(self, leaf, redirect)
+
+            # DeepseekV2MoE.forward() branches on this to decide whether to
+            # compute router_logits itself (self.gate(hidden_states)) before
+            # calling self.experts, or let an internal router do it. Every
+            # group is forced use_overlapped=False above, which always makes
+            # a real SharedFusedMoE's own is_internal_router False too, so
+            # this stays consistent with what the groups actually do.
+            self.is_internal_router = False
+
+        def forward(self, hidden_states, router_logits):
+            shared_output = None
+            routed_sum = None
+            for group in self.groups.values():
+                group_shared, group_routed = group(
+                    hidden_states=hidden_states, router_logits=router_logits
+                )
+                if group_shared is not None:
+                    shared_output = group_shared
+                routed_sum = (
+                    group_routed if routed_sum is None else routed_sum + group_routed
+                )
+            return shared_output, routed_sum
+
+        def maybe_all_reduce_tensor_model_parallel(self, final_hidden_states):
+            # A generic TP-group communication op that only depends on
+            # shared quant/TP config, not on which experts a group owns;
+            # any one real group answers it identically.
+            return next(
+                iter(self.groups.values())
+            ).maybe_all_reduce_tensor_model_parallel(final_hidden_states)
+
+    def patched_init(self, config, parallel_config, quant_config=None, prefix: str = ""):
+        original_init(self, config, parallel_config, quant_config, prefix)
+        match = re.search(r"(?:^|\.)layers\.(\d+)\.mlp$", prefix)
+        if match is None:
+            return
+        model_layer_id = int(match.group(1))
+        if model_layer_id not in layer_id_to_position:
+            return
+        position = layer_id_to_position[model_layer_id]
+        self.experts = MultiKernelDeepseekExperts(
+            self, position, model_layer_id, prefix, config, quant_config
+        )
+        torch.cuda.empty_cache()
+
+    model_module.DeepseekV2MoE.__init__ = patched_init
+
+    # Same loaded_params expansion as install_qwen_moe_into, applied to
+    # DeepSeek-v2's own plain per-expert-key model-level loader.
+    original_model_load_weights = model_module.DeepseekV2ForCausalLM.load_weights
+
+    def patched_model_load_weights(self, weights):
+        loaded_params = original_model_load_weights(self, weights)
+        params_dict = dict(self.named_parameters())
+        expanded = set(loaded_params)
+        for name in loaded_params:
+            if not name.endswith(("experts.w13_weight", "experts.w2_weight")):
+                continue
+            base, leaf = name.rsplit(".", 1)
+            group_prefix = f"{base}.groups."
+            expanded.update(
+                key
+                for key in params_dict
+                if key.startswith(group_prefix) and key.endswith(f".{leaf}")
+            )
+        return expanded
+
+    model_module.DeepseekV2ForCausalLM.load_weights = patched_model_load_weights
+
+    model_module._maes_ep4_installed = True
+    print("[MAES EP4] installed Kimi/DeepSeek-v2 multi-kernel block", flush=True)
 
 
 def install_qwen_vl_loader_into(model_module: ModuleType) -> None:

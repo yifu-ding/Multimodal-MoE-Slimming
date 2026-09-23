@@ -1,0 +1,2 @@
+task	status	exit_code	batch_size	wall_time_seconds	output_dir
+gqa_prefill	complete	0	512	174	/home/dyf/code/distill/MAES/artifacts/efficiency_figure/kimi_vl_gqa_ep4/batch512_main/prune_0/default/bs_512/eval/tasks/gqa_prefill

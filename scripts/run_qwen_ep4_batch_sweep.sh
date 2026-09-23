@@ -5,8 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
-EP4_PLAN="${EP4_PLAN:?Set EP4_PLAN to a validated Qwen EP4 plan.}"
+EP4_PLAN="${EP4_PLAN:-}"
 OUTPUT_ROOT="${OUTPUT_ROOT:?Set OUTPUT_ROOT for this pruning ratio.}"
+MODEL="${MODEL:-Qwen/Qwen3-VL-30B-A3B-Instruct}"
 START_BATCH_SIZE="${START_BATCH_SIZE:-8}"
 MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-512}"
 BATCH_GRANULARITY="${BATCH_GRANULARITY:-8}"
@@ -98,6 +99,8 @@ run_point() {
     local wrapper_log="${point_dir}/runner.log"
     local limit=$(( batch_size * (WARMUP_BATCHES + MEASURED_BATCHES) ))
     local token_budget=$(( batch_size * TOKENS_PER_REQUEST_BUDGET ))
+    local model_label_tag
+    model_label_tag="$(basename "${MODEL}" | tr '[:upper:]' '[:lower:]')"
     (( token_budget >= 16384 )) || token_budget=16384
     mkdir -p "${point_dir}"
     printf 'timestamp,gpu_index,memory_used_mib,memory_total_mib,gpu_utilization_percent,power_watts\n' > "${gpu_trace}"
@@ -114,26 +117,51 @@ run_point() {
 
     echo "[run] strategy=${strategy} batch_size=${batch_size} limit=${limit} max_num_batched_tokens=${token_budget}"
     set +e
-    EP4_PLAN="${EP4_PLAN}" \
-    MODEL=Qwen/Qwen3-VL-30B-A3B-Instruct \
-    MAES_EP4_STRATEGY="${strategy}" \
-    MAES_EFFICIENCY_TRACE="${batch_trace}" \
-    MAES_EFFICIENCY_WARMUP_BATCHES="${WARMUP_BATCHES}" \
-    TASKS="${PREFILL_TASK}" \
-    LIMIT="${limit}" \
-    LIGHT_IMAGE_BATCH_SIZE="${batch_size}" \
-    MAX_NUM_SEQS="${batch_size}" \
-    MAX_NUM_BATCHED_TOKENS="${token_budget}" \
-    MAX_NEW_TOKENS="${PREFILL_MAX_NEW_TOKENS}" \
-    GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION}" \
-    KV_CACHE_MEMORY_BYTES= \
-    MAX_MODEL_LEN=4096 \
-    ENABLE_RESPONSE_CACHE=0 \
-    FORCE=1 \
-    FAIL_FAST=1 \
-    RUN_DIR="${point_dir}/eval" \
-    BASELINE_LABEL="qwen3_gqa_${strategy}_bs${batch_size}" \
-        bash scripts/run_vllm_ep4_pruned.sh 2>&1 | tee "${wrapper_log}"
+    if [[ "${strategy}" == "default" ]]; then
+        MODEL="${MODEL}" \
+        MAES_EFFICIENCY_TRACE="${batch_trace}" \
+        MAES_EFFICIENCY_WARMUP_BATCHES="${WARMUP_BATCHES}" \
+        TASKS="${PREFILL_TASK}" \
+        LIMIT="${limit}" \
+        LIGHT_IMAGE_BATCH_SIZE="${batch_size}" \
+        MAX_NUM_SEQS="${batch_size}" \
+        MAX_NUM_BATCHED_TOKENS="${token_budget}" \
+        MAX_NEW_TOKENS="${PREFILL_MAX_NEW_TOKENS}" \
+        GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION}" \
+        KV_CACHE_MEMORY_BYTES= \
+        MAX_MODEL_LEN=4096 \
+        ENABLE_RESPONSE_CACHE=0 \
+        FORCE=1 \
+        FAIL_FAST=1 \
+        RUN_DIR="${point_dir}/eval" \
+        BASELINE_LABEL="${model_label_tag}_gqa_default_bs${batch_size}" \
+            bash scripts/run_vllm_ep4_default.sh 2>&1 | tee "${wrapper_log}"
+    else
+        if [[ -z "${EP4_PLAN}" ]]; then
+            echo "error: EP4_PLAN must be set for strategy=${strategy}" >&2
+            return 2
+        fi
+        EP4_PLAN="${EP4_PLAN}" \
+        MODEL="${MODEL}" \
+        MAES_EP4_STRATEGY="${strategy}" \
+        MAES_EFFICIENCY_TRACE="${batch_trace}" \
+        MAES_EFFICIENCY_WARMUP_BATCHES="${WARMUP_BATCHES}" \
+        TASKS="${PREFILL_TASK}" \
+        LIMIT="${limit}" \
+        LIGHT_IMAGE_BATCH_SIZE="${batch_size}" \
+        MAX_NUM_SEQS="${batch_size}" \
+        MAX_NUM_BATCHED_TOKENS="${token_budget}" \
+        MAX_NEW_TOKENS="${PREFILL_MAX_NEW_TOKENS}" \
+        GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION}" \
+        KV_CACHE_MEMORY_BYTES= \
+        MAX_MODEL_LEN=4096 \
+        ENABLE_RESPONSE_CACHE=0 \
+        FORCE=1 \
+        FAIL_FAST=1 \
+        RUN_DIR="${point_dir}/eval" \
+        BASELINE_LABEL="${model_label_tag}_gqa_${strategy}_bs${batch_size}" \
+            bash scripts/run_vllm_ep4_pruned.sh 2>&1 | tee "${wrapper_log}"
+    fi
     local run_status=${PIPESTATUS[0]}
     set -e
     cleanup_monitor
@@ -194,7 +222,7 @@ IFS=',' read -r -a strategy_list <<< "${STRATEGIES}"
 for strategy in "${strategy_list[@]}"; do
     strategy="${strategy// /}"
     case "${strategy}" in
-        padded|multi_kernel|cross_layer) ;;
+        padded|multi_kernel|single_width|cross_layer|default) ;;
         *) echo "error: unsupported strategy '${strategy}'" >&2; exit 2 ;;
     esac
     search_strategy "${strategy}"

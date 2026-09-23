@@ -467,7 +467,7 @@ build_command() {
 task_batch_size_for() {
     local task_name="$1"
     case "${task_name}" in
-        gqa|gqa_prefill|coco2017_cap_val_local|mme)
+        gqa|gqa_prefill|gqa_decode|coco2017_cap_val_local|mme)
             echo "${LIGHT_IMAGE_BATCH_SIZE}"
             ;;
         textvqa_val|chartqa|mmstar|mmbench_en_dev_static_local|mmbench_en_dev|mmvet|realworldqa)
