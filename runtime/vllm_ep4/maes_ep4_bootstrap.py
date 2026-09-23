@@ -7,12 +7,11 @@ import importlib.machinery
 import os
 import sys
 
-
 _INSTALLERS = {
     "vllm.model_executor.layers.fused_moe.layer": "install_into",
     "vllm.model_executor.models.qwen3_moe": "install_qwen_moe_into",
     "vllm.model_executor.models.qwen3_vl_moe": "install_qwen_vl_loader_into",
-    "vllm.model_executor.models.deepseek_v2": "install_kimi_moe_into",
+    "vllm.model_executor.models.deepseek_v2": "install_deepseek_loader_into",
 }
 
 
@@ -32,9 +31,16 @@ class _PatchLoader(importlib.abc.Loader):
 
                 install_into(module)
         else:
-            import src.vllm_ep4_runtime as runtime
+            if module.__name__ == "vllm.model_executor.models.deepseek_v2":
+                from src.mistral4_vllm_compat import install_deepseek_loader_into
+                from src.vllm_ep4_runtime import install_kimi_moe_into
 
-            getattr(runtime, _INSTALLERS[module.__name__])(module)
+                install_deepseek_loader_into(module)
+                install_kimi_moe_into(module)
+            else:
+                import src.vllm_ep4_runtime as runtime
+
+                getattr(runtime, _INSTALLERS[module.__name__])(module)
 
 
 class _PatchFinder(importlib.abc.MetaPathFinder):
@@ -79,6 +85,14 @@ if os.environ.get("MAES_EP4_PLAN") and os.environ.get("MAES_MASK_PLAN"):
 if (os.environ.get("MAES_EP4_PLAN") or os.environ.get("MAES_MASK_PLAN")) and not any(
     isinstance(finder, _PatchFinder) for finder in sys.meta_path
 ):
+    if os.environ.get("MAES_EP4_PLAN"):
+        try:
+            from src.mistral4_vllm_compat import register_transformers_config
+
+            register_transformers_config()
+        except ModuleNotFoundError as error:
+            if error.name != "transformers":
+                raise
     sys.meta_path.insert(0, _PatchFinder())
 if os.environ.get("FORCE_QWENVL_VIDEO_READER") == "opencv" and not any(
     isinstance(finder, _QwenVideoPatchFinder) for finder in sys.meta_path

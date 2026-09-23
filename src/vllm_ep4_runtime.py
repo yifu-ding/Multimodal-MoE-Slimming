@@ -68,6 +68,42 @@ def _slice_expert_weight(loaded_weight, shard_id: str, channel_indices, full_wid
     )
 
 
+def _slice_expert_parameter(
+    loaded_weight,
+    shard_id: str,
+    channel_indices,
+    full_width: int,
+    weight_name: str,
+):
+    """Slice an expert weight or its block-FP8 scale grid."""
+    import torch
+
+    if "scale" not in weight_name:
+        return _slice_expert_weight(
+            loaded_weight, shard_id, channel_indices, full_width
+        )
+    if loaded_weight.numel() == 1:
+        return loaded_weight
+    width = int(channel_indices.numel())
+    expected_prefix = torch.arange(
+        width, dtype=channel_indices.dtype, device=channel_indices.device
+    )
+    if not channel_indices.equal(expected_prefix):
+        raise ValueError("block-FP8 scale slicing requires contiguous prefix channels")
+    dim = 0 if shard_id in ("w1", "w3") else 1
+    if loaded_weight.ndim != 2 or full_width % loaded_weight.shape[dim] != 0:
+        raise ValueError(
+            f"unsupported {shard_id} scale shape {tuple(loaded_weight.shape)} "
+            f"for full width {full_width}"
+        )
+    block_size = full_width // loaded_weight.shape[dim]
+    if width % block_size:
+        raise ValueError(
+            f"planned width {width} is not aligned to FP8 block size {block_size}"
+        )
+    return loaded_weight.narrow(dim, 0, width // block_size)
+
+
 def _zero_pruned_channels(loaded_weight, shard_id: str, channel_mask, full_width: int):
     """Keep the full kernel shape while zero-padding pruned channels."""
     import torch
@@ -306,22 +342,30 @@ def install_into(layer_module: ModuleType) -> None:
         else:
             active = getattr(_CONTEXT, "layer_plan", None)
             if active is None:
-                rank_width = int(plan["rank_widths"][position, ep_rank])
-                local_ids = [
-                    int(value) for value in plan["local_to_global"][position][ep_rank]
-                ]
-                active = _LayerPlan(
-                    plan_position=position,
-                    model_layer_id=model_layer_id,
-                    ep_rank=ep_rank,
-                    rank_width=rank_width,
-                    full_width=full_width,
-                    num_experts=plan_num_experts,
-                    expert_to_rank=plan["expert_to_rank"][position],
-                    expert_to_local=plan["expert_to_local_id"][position],
-                    channel_masks=plan["intermediate_masks"][position],
-                    local_to_global=local_ids,
-                )
+                if strategy == "single_width":
+                    active = _single_width_layer_plan(
+                        plan, position, model_layer_id, ep_rank
+                    )
+                    local_ids = active.local_to_global
+                    rank_width = active.rank_width
+                else:
+                    rank_width = int(plan["rank_widths"][position, ep_rank])
+                    local_ids = [
+                        int(value)
+                        for value in plan["local_to_global"][position][ep_rank]
+                    ]
+                    active = _LayerPlan(
+                        plan_position=position,
+                        model_layer_id=model_layer_id,
+                        ep_rank=ep_rank,
+                        rank_width=rank_width,
+                        full_width=full_width,
+                        num_experts=plan_num_experts,
+                        expert_to_rank=plan["expert_to_rank"][position],
+                        expert_to_local=plan["expert_to_local_id"][position],
+                        channel_masks=plan["intermediate_masks"][position],
+                        local_to_global=local_ids,
+                    )
             else:
                 local_ids = active.local_to_global
             bound.arguments["intermediate_size"] = active.rank_width
@@ -360,12 +404,13 @@ def install_into(layer_module: ModuleType) -> None:
             if "weight" in weight_name:
                 channel_mask = active.channel_masks[expert_id]
                 if strategy == "padded":
-                    loaded_weight = _zero_pruned_channels(
-                        loaded_weight,
-                        shard_id=shard_id,
-                        channel_mask=channel_mask,
-                        full_width=active.full_width,
-                    )
+                    if "scale" not in weight_name:
+                        loaded_weight = _zero_pruned_channels(
+                            loaded_weight,
+                            shard_id=shard_id,
+                            channel_mask=channel_mask,
+                            full_width=active.full_width,
+                        )
                 else:
                     channel_indices = torch.where(channel_mask)[0]
                     if channel_indices.numel() != active.rank_width:
@@ -373,11 +418,12 @@ def install_into(layer_module: ModuleType) -> None:
                             f"layer {active.model_layer_id} expert {expert_id} has "
                             f"{channel_indices.numel()} channels, expected {active.rank_width}"
                         )
-                    loaded_weight = _slice_expert_weight(
+                    loaded_weight = _slice_expert_parameter(
                         loaded_weight,
                         shard_id=shard_id,
                         channel_indices=channel_indices,
                         full_width=active.full_width,
+                        weight_name=weight_name,
                     )
         return original_weight_loader(
             self,
@@ -576,6 +622,8 @@ def install_kimi_moe_into(model_module: ModuleType) -> None:
     from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
 
     plan = load_ep4_plan(os.environ["MAES_EP4_PLAN"])
+    if "mistral" in str(plan.get("model", "")).lower():
+        return
     layer_id_to_position = {
         int(layer_id): position
         for position, layer_id in enumerate(plan["model_layer_ids"])

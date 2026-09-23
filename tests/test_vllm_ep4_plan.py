@@ -2,9 +2,11 @@ import torch
 
 from src.generate_mask.ep4_intplan import plan_ep4_intplan
 from src.vllm_ep4_plan import SCHEMA_VERSION, validate_ep4_plan
+from scripts.build_random_ep4_plan import sample_nonuniform_tier_counts
 from src.vllm_ep4_runtime import (
     _rank_expert_map,
     _single_width_layer_plan,
+    _slice_expert_parameter,
     _slice_expert_weight,
 )
 
@@ -85,6 +87,24 @@ def test_single_width_pins_one_tier_per_rank_across_all_layers():
         assert seen_experts == expected
 
 
+def test_block_fp8_scale_slicing_tracks_prefix_width():
+    channels = torch.arange(1024)
+    gate_scale = torch.arange(12 * 32).reshape(12, 32)
+    down_scale = torch.arange(32 * 12).reshape(32, 12)
+    assert torch.equal(
+        _slice_expert_parameter(
+            gate_scale, "w1", channels, 1536, "w13_weight_scale_inv"
+        ),
+        gate_scale[:8],
+    )
+    assert torch.equal(
+        _slice_expert_parameter(
+            down_scale, "w2", channels, 1536, "w2_weight_scale_inv"
+        ),
+        down_scale[:, :8],
+    )
+
+
 def test_validator_rejects_removed_expert_with_live_mapping():
     plan = _valid_plan()
     removed = torch.nonzero(plan["expert_widths"] == 0, as_tuple=False)
@@ -102,3 +122,37 @@ def test_validator_rejects_removed_expert_with_live_mapping():
         assert "removed experts" in str(error)
     else:
         raise AssertionError("expected an invalid removed-expert mapping error")
+
+
+def test_random_tier_counts_are_deterministic_nonuniform_and_bounded():
+    kwargs = dict(
+        num_layers=5,
+        num_experts=64,
+        active_widths=(768, 1024, 1280, 1536),
+        target_keep_ratio=0.70,
+        min_tier_experts=6,
+        max_tier_fraction=0.50,
+    )
+    first = sample_nonuniform_tier_counts(
+        **kwargs, generator=torch.Generator().manual_seed(2603)
+    )
+    second = sample_nonuniform_tier_counts(
+        **kwargs, generator=torch.Generator().manual_seed(2603)
+    )
+    assert torch.equal(first, second)
+    assert (first.sum(dim=1) == 64).all()
+    assert (first >= 6).all()
+    assert (first <= 32).all()
+    assert ((first.max(dim=1).values - first.min(dim=1).values) >= 8).all()
+
+
+def test_single_width_mapping_is_fixed_across_layers():
+    plan = validate_ep4_plan(_valid_plan())
+    for layer in range(plan["expert_widths"].shape[0]):
+        for rank, width in enumerate(sorted(plan["active_widths"])):
+            active = _single_width_layer_plan(plan, layer, layer, rank)
+            assert active.rank_width == width
+            assert all(
+                int(plan["expert_widths"][layer, expert]) == width
+                for expert in active.local_to_global
+            )
