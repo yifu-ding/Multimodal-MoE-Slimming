@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Resumable dispatcher: runs each model's ACP p=0.3 padded-strategy eval
-# (7 benchmarks, 50% random subset each) in a fixed RUN_DIR so already
+# Resumable dispatcher: runs each model's ACP p=0.3/p=0.5 padded-strategy eval
+# (12 benchmarks, 50% random subset each) in a fixed RUN_DIR so already
 # completed tasks (status/<task>.complete) are skipped automatically by
 # run_qwen3_vl_vllm_baseline.sh. Safe to re-run; skips fully-done models.
 set -uo pipefail
