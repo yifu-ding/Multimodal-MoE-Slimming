@@ -15,7 +15,7 @@ for name in "${MODEL_NAMES[@]}"; do
         echo "invalid: missing EP4 plan for ${name}: ${plan}" >&2
         exit 2
     fi
-    total_done=$((total_done + $(count_complete "${run_dir}")))
+    total_done=$((total_done + $(count_complete "${name}" "${run_dir}")))
 done
 
 if (( total_done == total_expected )); then

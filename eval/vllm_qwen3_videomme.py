@@ -34,12 +34,21 @@ class Qwen3VideoMMEConfig:
 
     @classmethod
     def from_env(cls) -> "Qwen3VideoMMEConfig":
+        total_video_tokens = _env_int("QWEN3_VIDEOMME_TOTAL_VIDEO_TOKENS", 224000)
+        recovery_total_video_tokens = os.getenv(
+            "QWEN3_VIDEOMME_RECOVERY_TOTAL_VIDEO_TOKENS"
+        )
+        if recovery_total_video_tokens is not None:
+            total_video_tokens = _env_int(
+                "QWEN3_VIDEOMME_RECOVERY_TOTAL_VIDEO_TOKENS",
+                total_video_tokens,
+            )
         config = cls(
             fps=_env_float("QWEN3_VIDEOMME_FPS", 2.0),
             max_frames=_env_int("QWEN3_VIDEOMME_MAX_FRAMES", 2048),
             min_tokens_per_frame=_env_int("QWEN3_VIDEOMME_MIN_TOKENS_PER_FRAME", 128),
             max_tokens_per_frame=_env_int("QWEN3_VIDEOMME_MAX_TOKENS_PER_FRAME", 640),
-            total_video_tokens=_env_int("QWEN3_VIDEOMME_TOTAL_VIDEO_TOKENS", 224000),
+            total_video_tokens=total_video_tokens,
         )
         if config.min_tokens_per_frame > config.max_tokens_per_frame:
             raise ValueError(

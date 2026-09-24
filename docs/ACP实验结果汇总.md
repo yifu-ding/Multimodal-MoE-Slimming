@@ -1,7 +1,7 @@
 # ACP 剪枝方案 —— vLLM EP4 精度评测结果汇总
 
 - **状态**: 进行中（详见"数据完整性说明"）
-- **快照时间**: 2026-09-23 21:31
+- **快照时间**: 2026-09-24 13:28
 - **分支**: `ep4_intplan`
 - **实验目录**: `.automation/acp_eval/`（`pipeline.sh` / `common.sh` / `resource_check.sh` 等）
 - **结果原始文件**: `results/vllm_acp/<model>/ep4-p{30,50}-padded/{run,ep4-20260923-001917}/tasks/<task>/**/*_results.json`
@@ -30,8 +30,8 @@
 ## 2. 数据完整性说明（请先读这部分再看表格）
 
 1. **六个模型×剪枝率组合的非 VideoMME predict 任务均已完成**：每组已有 11/12 个完成标记。InternVL3.5 p=0.5 的 `longvideobench_val_v`、`egoschema_subset_local`、`mvbench_available_3800` 和 `mmvet` predict 已于 17:06 前完成。
-2. **`videomme` 已完成 2/6**：Kimi p=0.3 与 InternVL p=0.3 已产出真实结果；当前 Kimi p=0.5 正在运行，约 `488/1350`。已有任务均按完成签名跳过，没有重跑。
-3. **Qwen VideoMME 尚未开始推理**：旧 Qwen RUN_DIR 的实验身份是 `qwen3_native_video=1`，统一 dispatcher 曾强制传入 `0`，因此被身份校验正确拒绝。后续必须保持 Qwen 原生视频协议并识别 `videomme_qwen3_vllm.complete`，不能在原目录混用不同设置。
+2. **`videomme` 已完成 4/6**：Kimi 与 InternVL 的 p=0.3/p=0.5 均已产出真实结果。已有任务均按完成签名跳过，没有重跑。
+3. **Qwen VideoMME 尚未产出最终分数**：p=0.3 和 p=0.5 均已复用原缓存并增长至 `463/1350`，但两组都在同一个 160k-token 视频样本的 masked-scatter 阶段 OOM 后停止。这是显存预留配置问题，不是长时间无输出；vLLM 为单请求保留了约 8.6 倍最大上下文的 KV cache。已将 Qwen `GPU_MEMORY_UTILIZATION` 从 `0.85` 降至 `0.75`，p=0.3 的该失败样本已成功返回，cache 已增至 `818/1350`（60.6%）并正常运行。p=0.5 保留 `463/1350`，将在 p=0.3 完成后自动续跑。
 4. **`mmvet` 只完成了 `--predict_only` 预测阶段**（`status/mmvet.complete` 已生成），真实分数需要额外启动本地
    judge 模型对预测结果打分（`scripts/judge_vllm_predictions.py`），这一步还没有执行。
    下表中 mmvet 列显示占位值 `bypass,none=999`（lmms-eval 在缺少 judge 结果时的固定占位符），**不是真实分数**。
@@ -52,7 +52,7 @@
 | longvideobench_val_v | lvb_acc | 61.29% | 64.13% | 57.70% |
 | egoschema_subset | score | 69.60% | 64.80% | 80.80% |
 | mvbench_available_3800 | accuracy | 59.21% | 61.42% | 69.79% |
-| videomme | perception_score | 63.78% | *待修复 native-video 配置后跑* | 58.44% |
+| videomme | perception_score | 63.78% | *运行中（818/1350，60.6%）* | 58.44% |
 | mmvet | gpt_eval_score | *predict_only 完成，judge 待跑* | *同左* | *同左* |
 
 ## 4. 结果表（p = 0.5）
@@ -69,7 +69,7 @@
 | longvideobench_val_v | lvb_acc | 57.40% | 62.48% | 56.80% |
 | egoschema_subset | score | 65.20% | 68.00% | 72.00% |
 | mvbench_available_3800 | accuracy | 56.89% | 58.58% | 64.26% |
-| videomme | perception_score | *进行中（488/1350）* | *待修复 native-video 配置后跑* | *待跑* |
+| videomme | perception_score | 56.52% | *恢复中（463/1350，OOM 已调参）* | 54.22% |
 | mmvet | gpt_eval_score | *predict_only 完成，judge 待跑* | *同左* | *同左* |
 
 ## 5. 观察（初步，基于目前已完成的数据）
@@ -83,8 +83,8 @@
 
 ## 6. 待办（下一步）
 
-1. 等当前 Kimi p=0.5 VideoMME 完成，再运行 InternVL p=0.5；两者继续复用原 RUN_DIR 和 response cache。
-2. 修正 Qwen 的完成标记逻辑：保持 `qwen3_native_video=1`，使用 `videomme_qwen3_vllm` 任务和 marker，再补 Qwen p=0.3/p=0.5；不复用设置不同的实验产物。
+1. 等 Qwen p=0.3/p=0.5 的原生 VideoMME 完成；两组继续复用各自原 RUN_DIR 和 response cache。
+2. Qwen 修复已落地：保持 `qwen3_native_video=1`，使用 `videomme_qwen3_vllm` 任务和 marker，不复用设置不同的实验产物。
 3. 启动本地 judge 服务，跑 `scripts/judge_vllm_predictions.py` 为全部 6 个 模型×剪枝率 组合计算真实
    MMVet 分数。
 4. 全部跑完后，按用户指示补跑 `coco2017_cap_val_local` 与 `video_mmmu_local`。

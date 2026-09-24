@@ -18,7 +18,7 @@ wait_for_gpus() {
 
 for name in "${MODEL_NAMES[@]}"; do
     IFS='|' read -r model_id plan run_dir <<< "$(model_spec "${name}")"
-    done_count="$(count_complete "${run_dir}")"
+    done_count="$(count_complete "${name}" "${run_dir}")"
     if (( done_count == ${#TASK_LIST[@]} )); then
         echo "[pipeline] $(date -Is) skip ${name}: all ${#TASK_LIST[@]} tasks already complete"
         continue
@@ -34,12 +34,14 @@ for name in "${MODEL_NAMES[@]}"; do
     PRUNING_LABEL=acp \
     OUTPUT_ROOT="$(dirname "${run_dir}")" \
     RUN_DIR="${run_dir}" \
-    TASKS="${TASKS}" \
+    TASKS="$(tasks_for_model "${name}")" \
     RANDOM_SUBSET_FRACTION=0.5 \
     RANDOM_SUBSET_MIN_SAMPLES=1 \
     RANDOM_SUBSET_SEED=42 \
-    GPU_MEMORY_UTILIZATION=0.90 \
-    ENABLE_QWEN3_NATIVE_VIDEO=0 \
+    GPU_MEMORY_UTILIZATION="$(gpu_memory_utilization_for_model "${name}")" \
+    QWEN3_VIDEOMME_RECOVERY_TOTAL_VIDEO_TOKENS=160000 \
+    PYTORCH_ALLOC_CONF=expandable_segments:True \
+    ENABLE_QWEN3_NATIVE_VIDEO="$(native_video_for_model "${name}")" \
         bash scripts/run_vllm_ep4_pruned.sh
     status=$?
     echo "[pipeline] $(date -Is) ${name} run exited with status=${status}"
