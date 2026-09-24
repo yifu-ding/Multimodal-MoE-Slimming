@@ -1280,6 +1280,491 @@ def _permutation_id(permutation: Sequence[int]) -> int:
     return result
 
 
+def _lpt_sort_initialize(
+    group_loads: np.ndarray,
+    ep_size: int,
+    num_layers: int,
+    *,
+    fix_first_layer: bool,
+) -> tuple[np.ndarray, np.ndarray, int, np.ndarray, float]:
+    """Algorithm 2's sort initialization, shared by every Refine operator.
+
+    Heaviest-extreme layers are placed first; within a layer the heaviest
+    group goes to the currently lightest rank (LPT).
+    """
+    rank_group_indices = np.full((num_layers, ep_size), -1, dtype=np.int64)
+    rank_loads = np.zeros(ep_size, dtype=np.int64)
+    first_unfixed_layer = 0
+
+    started = time.perf_counter()
+    if fix_first_layer and num_layers > 0:
+        rank_group_indices[0] = np.arange(ep_size, dtype=np.int64)
+        rank_loads += group_loads[0]
+        first_unfixed_layer = 1
+    layer_order = sorted(
+        range(first_unfixed_layer, num_layers),
+        key=lambda layer: (-int(np.ptp(group_loads[layer])), layer),
+    )
+    for layer in layer_order:
+        rank_order = sorted(range(ep_size), key=lambda rank: (rank_loads[rank], rank))
+        group_order = sorted(
+            range(ep_size), key=lambda group: (-group_loads[layer, group], group)
+        )
+        for rank, group in zip(rank_order, group_order):
+            rank_group_indices[layer, rank] = group
+            rank_loads[rank] += group_loads[layer, group]
+    elapsed = time.perf_counter() - started
+    return (
+        rank_group_indices,
+        rank_loads,
+        first_unfixed_layer,
+        rank_loads.copy(),
+        elapsed,
+    )
+
+
+def _width_quantum(widths: torch.Tensor) -> int:
+    quantum = 0
+    for width in widths.flatten().tolist():
+        quantum = math.gcd(quantum, int(width))
+    if quantum <= 0:
+        raise ValueError("placement width quantum must be positive")
+    return quantum
+
+
+def _finalize_refine_result(
+    rank_group_indices: np.ndarray,
+    rank_loads: np.ndarray,
+    initial_rank_loads: np.ndarray,
+    counts: torch.Tensor,
+    widths: torch.Tensor,
+    tolerance: float,
+    *,
+    placement_method: str,
+    refinement_neighborhood: str,
+    initialization_seconds: float,
+    refinement_seconds: float,
+    extra: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Shared wrap-up for the SA/Tabu/Beam Refine operators."""
+    num_layers, ep_size = counts.shape
+    rank_group_indices_tensor = torch.from_numpy(rank_group_indices.copy())
+    group_to_rank = torch.empty_like(counts)
+    rank_widths = torch.empty_like(widths)
+    for layer in range(num_layers):
+        for rank, group in enumerate(rank_group_indices[layer].tolist()):
+            group_to_rank[layer, group] = rank
+            rank_widths[layer, rank] = widths[layer, group]
+    rank_loads_tensor = torch.from_numpy(rank_loads.copy())
+    initial_rank_loads_tensor = torch.from_numpy(initial_rank_loads.copy())
+    placement: Dict[str, Any] = {
+        "rank_widths": rank_widths,
+        "group_to_rank": group_to_rank,
+        "rank_group_indices": rank_group_indices_tensor,
+        "rank_weight_loads": rank_loads_tensor,
+        "initial_rank_weight_loads": initial_rank_loads_tensor,
+        "solver_status": 0,
+        "solver_objective": _placement_objective(rank_loads)[0],
+        "placement_method": placement_method,
+        "refinement_neighborhood": refinement_neighborhood,
+        "initialization_time_seconds": initialization_seconds,
+        "refinement_time_seconds": refinement_seconds,
+    }
+    placement.update(extra)
+    placement.update(_placement_metrics(rank_loads_tensor, tolerance))
+    initial_metrics = _placement_metrics(initial_rank_loads_tensor, tolerance)
+    placement["initial_rank_weight_spread"] = initial_metrics["rank_weight_spread"]
+    placement["initial_relative_rank_weight_spread"] = initial_metrics[
+        "relative_rank_weight_spread"
+    ]
+    return placement
+
+
+def _solve_placement_groups_simulated_annealing(
+    group_counts: torch.Tensor,
+    group_widths: torch.Tensor,
+    *,
+    tolerance: float = 0.01,
+    fix_first_layer: bool = True,
+    seed: int = 0,
+    cooling_rate: float = 0.99,
+    max_iterations: int | None = None,
+    max_seconds: float | None = 30.0,
+) -> Dict[str, Any]:
+    """Pairwise-swap neighbourhood with simulated-annealing acceptance.
+
+    Anneals on the primary objective ΔΦ (scaled by the width quantum); when a
+    candidate ties on ΔΦ, the same schedule anneals the tie-break S so the
+    algorithm can still escape the ΔΦ-plateaus that trap greedy local search.
+    """
+    counts, widths = _validate_placement_groups(group_counts, group_widths, tolerance)
+    if cooling_rate <= 0.0 or cooling_rate >= 1.0:
+        raise ValueError(f"cooling_rate must be in (0, 1), got {cooling_rate}")
+    num_layers, ep_size = counts.shape
+    quantum = _width_quantum(widths)
+    group_loads = (counts * widths).numpy()
+
+    (
+        rank_group_indices,
+        rank_loads,
+        first_unfixed_layer,
+        initial_rank_loads,
+        initialization_seconds,
+    ) = _lpt_sort_initialize(
+        group_loads, ep_size, num_layers, fix_first_layer=fix_first_layer
+    )
+
+    if max_iterations is None:
+        max_iterations = max(1, 100 * num_layers * ep_size)
+    initial_temperature = 1.44 * quantum
+    min_temperature = max(quantum / 100.0, 1e-9)
+
+    rng = np.random.default_rng(seed)
+    current_indices = rank_group_indices.copy()
+    current_loads = rank_loads.copy()
+    current_objective = _placement_objective(current_loads)
+    best_indices = current_indices.copy()
+    best_loads = current_loads.copy()
+    best_objective = current_objective
+    accepted_worse = 0
+    temperature = initial_temperature
+    iterations_run = 0
+    hit_time_cap = False
+
+    refinement_started = time.perf_counter()
+    if num_layers > first_unfixed_layer and ep_size > 1:
+        for iterations_run in range(1, max_iterations + 1):
+            if temperature < min_temperature:
+                break
+            if (
+                max_seconds is not None
+                and iterations_run % 2000 == 0
+                and time.perf_counter() - refinement_started > max_seconds
+            ):
+                hit_time_cap = True
+                break
+            layer = int(rng.integers(first_unfixed_layer, num_layers))
+            left, right = (int(value) for value in rng.choice(ep_size, size=2, replace=False))
+            candidate = current_indices[layer].copy()
+            candidate[left], candidate[right] = candidate[right], candidate[left]
+            candidate_loads = (
+                current_loads
+                - group_loads[layer, current_indices[layer]]
+                + group_loads[layer, candidate]
+            )
+            candidate_objective = _placement_objective(candidate_loads)
+            delta_spread = candidate_objective[0] - current_objective[0]
+            if delta_spread != 0.0:
+                loss = delta_spread / quantum
+            else:
+                loss = (candidate_objective[1] - current_objective[1]) / (quantum * quantum)
+            if loss <= 0.0:
+                accept = True
+                is_worse = False
+            else:
+                probability = math.exp(-loss / max(temperature, 1e-9))
+                accept = bool(rng.random() < probability)
+                is_worse = True
+            if accept:
+                if is_worse:
+                    accepted_worse += 1
+                current_indices[layer] = candidate
+                current_loads = candidate_loads
+                current_objective = candidate_objective
+                if current_objective < best_objective:
+                    best_objective = current_objective
+                    best_indices = current_indices.copy()
+                    best_loads = current_loads.copy()
+            temperature *= cooling_rate
+    refinement_seconds = time.perf_counter() - refinement_started
+
+    return _finalize_refine_result(
+        best_indices,
+        best_loads,
+        initial_rank_loads,
+        counts,
+        widths,
+        tolerance,
+        placement_method="simulated_annealing",
+        refinement_neighborhood="pairwise_swap",
+        initialization_seconds=initialization_seconds,
+        refinement_seconds=refinement_seconds,
+        extra={
+            "solver_message": "sort initialization with simulated-annealing refinement",
+            "random_seed": seed,
+            "iterations": iterations_run,
+            "max_iterations": max_iterations,
+            "accepted_worse_count": accepted_worse,
+            "initial_temperature": initial_temperature,
+            "min_temperature": min_temperature,
+            "cooling_rate": cooling_rate,
+            "hit_time_cap": hit_time_cap,
+        },
+    )
+
+
+def _solve_placement_groups_tabu(
+    group_counts: torch.Tensor,
+    group_widths: torch.Tensor,
+    *,
+    tolerance: float = 0.01,
+    fix_first_layer: bool = True,
+    tabu_tenure: int | None = None,
+    max_rounds: int | None = None,
+    stall_rounds: int | None = None,
+    seed: int = 0,
+    max_seconds: float | None = 30.0,
+) -> Dict[str, Any]:
+    """Pairwise-swap neighbourhood, best non-tabu candidate per round.
+
+    Each round scans every (layer, rank-pair) swap, takes the best one that
+    is either not tabu or improves the best-so-far (aspiration), and always
+    executes it -- even when it worsens the current solution -- which is how
+    tabu search escapes the ΔΦ-plateaus untouched by greedy local search.
+    Only one layer's assignment changes per round, so the round budget scales
+    with the number of layers: a single sweep is not enough to touch every
+    layer once. The tabu tenure is jittered (Glover's standard fix) because a
+    fixed tenure otherwise lets the search settle into a period-``tenure``
+    cycle of moves and their exact reverses.
+    """
+    counts, widths = _validate_placement_groups(group_counts, group_widths, tolerance)
+    if max_rounds is not None and max_rounds < 0:
+        raise ValueError(f"max_rounds must be non-negative, got {max_rounds}")
+    num_layers, ep_size = counts.shape
+    tenure = tabu_tenure if tabu_tenure is not None else max(1, ep_size)
+    if max_rounds is None:
+        max_rounds = max(100, 20 * num_layers)
+    if stall_rounds is None:
+        stall_rounds = max_rounds
+    rng = np.random.default_rng(seed)
+    group_loads = (counts * widths).numpy()
+
+    (
+        rank_group_indices,
+        rank_loads,
+        first_unfixed_layer,
+        initial_rank_loads,
+        initialization_seconds,
+    ) = _lpt_sort_initialize(
+        group_loads, ep_size, num_layers, fix_first_layer=fix_first_layer
+    )
+
+    current_indices = rank_group_indices.copy()
+    current_loads = rank_loads.copy()
+    best_indices = current_indices.copy()
+    best_loads = current_loads.copy()
+    best_objective = _placement_objective(best_loads)
+    accepted_worse = 0
+    tabu_until: dict[tuple[int, int, int], int] = {}
+    rounds_without_improvement = 0
+    rounds_run = 0
+    hit_time_cap = False
+
+    refinement_started = time.perf_counter()
+    if ep_size > 1 and num_layers > first_unfixed_layer:
+        for round_index in range(1, max_rounds + 1):
+            if (
+                max_seconds is not None
+                and time.perf_counter() - refinement_started > max_seconds
+            ):
+                hit_time_cap = True
+                break
+            rounds_run = round_index
+            current_objective = _placement_objective(current_loads)
+            best_candidate = None
+            best_candidate_objective = None
+            best_candidate_key = None
+            for layer in range(first_unfixed_layer, num_layers):
+                base_loads = current_loads - group_loads[layer, current_indices[layer]]
+                for left in range(ep_size):
+                    for right in range(left + 1, ep_size):
+                        candidate = current_indices[layer].copy()
+                        candidate[left], candidate[right] = (
+                            candidate[right],
+                            candidate[left],
+                        )
+                        candidate_loads = base_loads + group_loads[layer, candidate]
+                        candidate_objective = _placement_objective(candidate_loads)
+                        key = (layer, left, right)
+                        aspires = candidate_objective < best_objective
+                        if tabu_until.get(key, 0) > round_index and not aspires:
+                            continue
+                        if (
+                            best_candidate_objective is None
+                            or candidate_objective < best_candidate_objective
+                        ):
+                            best_candidate_objective = candidate_objective
+                            best_candidate = (layer, candidate, candidate_loads)
+                            best_candidate_key = key
+            if best_candidate is None:
+                break
+            layer, candidate, candidate_loads = best_candidate
+            if best_candidate_objective > current_objective:
+                accepted_worse += 1
+            current_indices[layer] = candidate
+            current_loads = candidate_loads
+            jittered_tenure = int(rng.integers(tenure, 2 * tenure + 1))
+            tabu_until[best_candidate_key] = round_index + jittered_tenure
+            if best_candidate_objective < best_objective:
+                best_objective = best_candidate_objective
+                best_indices = current_indices.copy()
+                best_loads = current_loads.copy()
+                rounds_without_improvement = 0
+            else:
+                rounds_without_improvement += 1
+            if rounds_without_improvement >= stall_rounds:
+                break
+    refinement_seconds = time.perf_counter() - refinement_started
+
+    return _finalize_refine_result(
+        best_indices,
+        best_loads,
+        initial_rank_loads,
+        counts,
+        widths,
+        tolerance,
+        placement_method="tabu_search",
+        refinement_neighborhood="pairwise_swap",
+        initialization_seconds=initialization_seconds,
+        refinement_seconds=refinement_seconds,
+        extra={
+            "solver_message": "sort initialization with tabu-search refinement",
+            "iterations": rounds_run,
+            "max_rounds": max_rounds,
+            "tabu_tenure": tenure,
+            "accepted_worse_count": accepted_worse,
+            "random_seed": seed,
+            "hit_time_cap": hit_time_cap,
+        },
+    )
+
+
+def _solve_placement_groups_beam(
+    group_counts: torch.Tensor,
+    group_widths: torch.Tensor,
+    *,
+    tolerance: float = 0.01,
+    fix_first_layer: bool = True,
+    beam_width: int = 8,
+    max_rounds: int | None = None,
+    stall_rounds: int | None = None,
+    max_seconds: float | None = 30.0,
+) -> Dict[str, Any]:
+    """Pairwise-swap neighbourhood, keeping the ``beam_width`` best states.
+
+    Every round expands every beam member by every pairwise swap in every
+    layer, then keeps the top ``beam_width`` distinct states by (ΔΦ, S).
+    Parallel paths let it cross plateaus that trap a single-point search.
+    """
+    counts, widths = _validate_placement_groups(group_counts, group_widths, tolerance)
+    if beam_width <= 0:
+        raise ValueError(f"beam_width must be positive, got {beam_width}")
+    if max_rounds is not None and max_rounds < 0:
+        raise ValueError(f"max_rounds must be non-negative, got {max_rounds}")
+    num_layers, ep_size = counts.shape
+    if max_rounds is None:
+        max_rounds = max(100, 20 * num_layers)
+    if stall_rounds is None:
+        stall_rounds = max_rounds
+    group_loads = (counts * widths).numpy()
+
+    (
+        rank_group_indices,
+        rank_loads,
+        first_unfixed_layer,
+        initial_rank_loads,
+        initialization_seconds,
+    ) = _lpt_sort_initialize(
+        group_loads, ep_size, num_layers, fix_first_layer=fix_first_layer
+    )
+
+    beam: list[tuple[np.ndarray, np.ndarray]] = [
+        (rank_group_indices.copy(), rank_loads.copy())
+    ]
+    best_indices = rank_group_indices.copy()
+    best_loads = rank_loads.copy()
+    best_objective = _placement_objective(best_loads)
+    rounds_without_improvement = 0
+    rounds_run = 0
+    hit_time_cap = False
+
+    refinement_started = time.perf_counter()
+    if ep_size > 1 and num_layers > first_unfixed_layer:
+        for round_index in range(1, max_rounds + 1):
+            if (
+                max_seconds is not None
+                and time.perf_counter() - refinement_started > max_seconds
+            ):
+                hit_time_cap = True
+                break
+            rounds_run = round_index
+            seen_this_round: set[bytes] = set()
+            candidates: list[tuple[tuple[float, float], np.ndarray, np.ndarray]] = []
+            for indices, loads in beam:
+                for layer in range(first_unfixed_layer, num_layers):
+                    base_loads = loads - group_loads[layer, indices[layer]]
+                    for left in range(ep_size):
+                        for right in range(left + 1, ep_size):
+                            candidate_layer = indices[layer].copy()
+                            candidate_layer[left], candidate_layer[right] = (
+                                candidate_layer[right],
+                                candidate_layer[left],
+                            )
+                            candidate_loads = (
+                                base_loads + group_loads[layer, candidate_layer]
+                            )
+                            new_indices = indices.copy()
+                            new_indices[layer] = candidate_layer
+                            key = new_indices.tobytes()
+                            if key in seen_this_round:
+                                continue
+                            seen_this_round.add(key)
+                            candidates.append(
+                                (
+                                    _placement_objective(candidate_loads),
+                                    new_indices,
+                                    candidate_loads,
+                                )
+                            )
+            if not candidates:
+                break
+            candidates.sort(key=lambda item: item[0])
+            beam = [
+                (indices, loads) for _, indices, loads in candidates[:beam_width]
+            ]
+            round_best_objective, round_best_indices, round_best_loads = candidates[0]
+            if round_best_objective < best_objective:
+                best_objective = round_best_objective
+                best_indices = round_best_indices.copy()
+                best_loads = round_best_loads.copy()
+                rounds_without_improvement = 0
+            else:
+                rounds_without_improvement += 1
+            if rounds_without_improvement >= stall_rounds:
+                break
+    refinement_seconds = time.perf_counter() - refinement_started
+
+    return _finalize_refine_result(
+        best_indices,
+        best_loads,
+        initial_rank_loads,
+        counts,
+        widths,
+        tolerance,
+        placement_method="beam_search",
+        refinement_neighborhood="pairwise_swap",
+        initialization_seconds=initialization_seconds,
+        refinement_seconds=refinement_seconds,
+        extra={
+            "solver_message": "sort initialization with beam-search refinement",
+            "iterations": rounds_run,
+            "max_rounds": max_rounds,
+            "beam_width": beam_width,
+            "hit_time_cap": hit_time_cap,
+        },
+    )
+
+
 def _solve_placement_groups_greedy(
     group_counts: torch.Tensor,
     group_widths: torch.Tensor,
@@ -1309,29 +1794,15 @@ def _solve_placement_groups_greedy(
     if refinement_neighborhood == "full_bijection" and ep_size > 8:
         raise ValueError("full-bijection refinement is restricted to EP size <= 8")
     group_loads = (counts * widths).numpy()
-    rank_group_indices = np.full((num_layers, ep_size), -1, dtype=np.int64)
-    rank_loads = np.zeros(ep_size, dtype=np.int64)
-    first_unfixed_layer = 0
-
-    initialization_started = time.perf_counter()
-    if fix_first_layer and num_layers > 0:
-        rank_group_indices[0] = np.arange(ep_size, dtype=np.int64)
-        rank_loads += group_loads[0]
-        first_unfixed_layer = 1
-    layer_order = sorted(
-        range(first_unfixed_layer, num_layers),
-        key=lambda layer: (-int(np.ptp(group_loads[layer])), layer),
+    (
+        rank_group_indices,
+        rank_loads,
+        first_unfixed_layer,
+        initial_rank_loads,
+        initialization_seconds,
+    ) = _lpt_sort_initialize(
+        group_loads, ep_size, num_layers, fix_first_layer=fix_first_layer
     )
-    for layer in layer_order:
-        rank_order = sorted(range(ep_size), key=lambda rank: (rank_loads[rank], rank))
-        group_order = sorted(
-            range(ep_size), key=lambda group: (-group_loads[layer, group], group)
-        )
-        for rank, group in zip(rank_order, group_order):
-            rank_group_indices[layer, rank] = group
-            rank_loads[rank] += group_loads[layer, group]
-    initialization_seconds = time.perf_counter() - initialization_started
-    initial_rank_loads = rank_loads.copy()
 
     refinement_started = time.perf_counter()
     local_search_passes = 0
