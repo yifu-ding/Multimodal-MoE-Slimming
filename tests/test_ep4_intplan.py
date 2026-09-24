@@ -7,10 +7,13 @@ from src.generate_mask.ep4_intplan import (
     _build_layer_placement_groups,
     _merge_sparse_width_tiers,
     _quantize_balanced_widths_to_budget,
+    _solve_placement_groups_beam,
     _solve_placement_groups_greedy,
     _solve_placement_groups_greedy_permutation_reference,
     _solve_placement_groups_milp,
     _solve_placement_groups_milp_permutation_reference,
+    _solve_placement_groups_simulated_annealing,
+    _solve_placement_groups_tabu,
     _placement_spread_arithmetic_lower_bound,
     plan_ep4_from_masks,
     plan_ep4_intplan,
@@ -438,3 +441,125 @@ def test_sort_greedy_supports_large_rank_count_without_permutation_id_overflow()
     assert result["rank_weight_loads"].shape == (24,)
     for layer in result["rank_group_indices"]:
         assert sorted(layer.tolist()) == list(range(24))
+
+
+def test_sort_only_is_greedy_with_no_refinement_passes():
+    generator = torch.Generator().manual_seed(41)
+    counts = torch.randint(1, 20, (12, 4), generator=generator)
+    widths = torch.tensor([768, 640, 512, 384]).expand_as(counts)
+
+    sort_only = _solve_placement_groups_greedy(
+        counts, widths, max_local_search_passes=0
+    )
+
+    assert sort_only["local_search_passes"] == 0
+    assert sort_only["rank_weight_spread"] == sort_only["initial_rank_weight_spread"]
+
+
+def _small_placement_case(seed: int):
+    generator = torch.Generator().manual_seed(seed)
+    counts = torch.randint(1, 20, (12, 4), generator=generator)
+    widths = torch.tensor([768, 640, 512, 384]).expand_as(counts)
+    return counts, widths
+
+
+def test_new_refine_operators_preserve_load_and_mapping_invariants():
+    counts, widths = _small_placement_case(41)
+    total_load = int((counts * widths).sum().item())
+
+    for solver in (
+        _solve_placement_groups_simulated_annealing,
+        _solve_placement_groups_tabu,
+        _solve_placement_groups_beam,
+    ):
+        result = solver(counts, widths)
+        assert int(result["rank_weight_loads"].sum().item()) == total_load
+        assert result["rank_weight_loads"].shape == (4,)
+        for layer in range(counts.shape[0]):
+            assert sorted(result["rank_group_indices"][layer].tolist()) == [
+                0,
+                1,
+                2,
+                3,
+            ]
+            for group in range(4):
+                rank = int(result["group_to_rank"][layer, group].item())
+                assert result["rank_widths"][layer, rank] == widths[layer, group]
+
+
+def test_new_refine_operators_never_regress_below_sort_initialization():
+    counts, widths = _small_placement_case(41)
+    initial_spread = _solve_placement_groups_greedy(
+        counts, widths, max_local_search_passes=0
+    )["rank_weight_spread"]
+
+    for solver in (
+        _solve_placement_groups_simulated_annealing,
+        _solve_placement_groups_tabu,
+        _solve_placement_groups_beam,
+    ):
+        result = solver(counts, widths)
+        assert result["rank_weight_spread"] <= initial_spread
+
+
+def test_simulated_annealing_is_reproducible_with_a_fixed_seed():
+    counts, widths = _small_placement_case(5)
+
+    first = _solve_placement_groups_simulated_annealing(counts, widths, seed=0)
+    second = _solve_placement_groups_simulated_annealing(counts, widths, seed=0)
+
+    assert first["rank_weight_spread"] == second["rank_weight_spread"]
+    assert first["rank_group_indices"].equal(second["rank_group_indices"])
+    assert first["accepted_worse_count"] == second["accepted_worse_count"]
+
+
+def test_tabu_search_tenure_jitter_avoids_cycling():
+    # Regression test: with a fixed (non-jittered) tabu tenure this instance
+    # settles into a period-``tenure`` cycle of a move and its exact reverse,
+    # stalling at spread=768 forever. Jittering the tenure (Glover's standard
+    # fix) breaks the cycle; it does not guarantee reaching the MILP optimum
+    # with the doc-default tenure=m, so this only checks it comfortably beats
+    # both the cycle-trapped value and plain pairwise-swap local search.
+    counts, widths = _small_placement_case(0)
+
+    swap = _solve_placement_groups_greedy(
+        counts, widths, refinement_neighborhood="pairwise_swap"
+    )
+    tabu = _solve_placement_groups_tabu(counts, widths, seed=0)
+
+    assert tabu["rank_weight_spread"] < swap["rank_weight_spread"]
+    assert tabu["rank_weight_spread"] < 768.0
+
+
+def test_simulated_annealing_and_tabu_report_accepted_worse_moves():
+    counts, widths = _small_placement_case(0)
+
+    sa = _solve_placement_groups_simulated_annealing(counts, widths, seed=0)
+    tabu = _solve_placement_groups_tabu(counts, widths, seed=0)
+
+    # A guard against parameters so conservative that SA/tabu silently
+    # degenerate into plain greedy hill-climbing (accepted_worse == 0 always).
+    assert sa["accepted_worse_count"] > 0
+    assert tabu["accepted_worse_count"] > 0
+
+
+def test_beam_search_matches_or_beats_pairwise_local_search():
+    counts, widths = _small_placement_case(41)
+
+    pairwise = _solve_placement_groups_greedy(
+        counts, widths, refinement_neighborhood="pairwise_swap"
+    )
+    beam = _solve_placement_groups_beam(counts, widths, beam_width=8)
+
+    assert beam["rank_weight_spread"] <= pairwise["rank_weight_spread"]
+    assert beam["refinement_neighborhood"] == "pairwise_swap"
+
+
+def test_new_refine_operators_honor_a_short_time_cap():
+    generator = torch.Generator().manual_seed(43)
+    counts = torch.randint(1, 9, (24, 16), generator=generator)
+    widths = torch.arange(16, 0, -1, dtype=torch.int64).mul(64).expand_as(counts)
+
+    for solver in (_solve_placement_groups_tabu, _solve_placement_groups_beam):
+        result = solver(counts, widths, max_seconds=0.05)
+        assert result["hit_time_cap"] is True

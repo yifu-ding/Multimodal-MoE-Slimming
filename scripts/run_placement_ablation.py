@@ -27,9 +27,88 @@ if str(REPO_ROOT) not in sys.path:
 from src.generate_mask.ep4_intplan import (
     PlacementMilpNoIncumbentError,
     _build_layer_placement_groups,
+    _placement_spread_arithmetic_lower_bound,
+    _solve_placement_groups_beam,
     _solve_placement_groups_greedy,
     _solve_placement_groups_milp,
+    _solve_placement_groups_simulated_annealing,
+    _solve_placement_groups_tabu,
 )
+
+# Fixed so SA/tabu/beam are reproducible; recorded on every record via
+# placement_summary()'s "random_seed" field.
+REFINE_OPERATOR_SEED = 0
+
+
+def refine_operator_methods(
+    layer_counts: torch.Tensor, layer_widths: torch.Tensor
+) -> tuple[tuple[str, Callable[[], dict[str, Any]]], ...]:
+    """The Refine operators compared in Table 6, sharing one (counts, widths) pair.
+
+    ``greedy_full_bijection`` is only defined for EP size <= 8 (see
+    ``_solve_placement_groups_greedy``) and is omitted otherwise -- the m>4
+    grid legitimately has empty cells here, which is itself part of the
+    story (full-bijection enumeration is infeasible past single digits).
+    """
+    ep_size = int(layer_widths.shape[-1])
+    methods: list[tuple[str, Callable[[], dict[str, Any]]]] = [
+        (
+            "sort_only",
+            lambda: _solve_placement_groups_greedy(
+                layer_counts,
+                layer_widths,
+                max_local_search_passes=0,
+                refinement_neighborhood="pairwise_swap",
+            ),
+        ),
+        (
+            "greedy_pairwise_swap",
+            lambda: _solve_placement_groups_greedy(
+                layer_counts,
+                layer_widths,
+                refinement_neighborhood="pairwise_swap",
+            ),
+        ),
+    ]
+    if ep_size <= 8:
+        methods.append(
+            (
+                "greedy_full_bijection",
+                lambda: _solve_placement_groups_greedy(
+                    layer_counts,
+                    layer_widths,
+                    refinement_neighborhood="full_bijection",
+                ),
+            )
+        )
+    methods.extend(
+        [
+            (
+                "simulated_annealing",
+                lambda: _solve_placement_groups_simulated_annealing(
+                    layer_counts,
+                    layer_widths,
+                    seed=REFINE_OPERATOR_SEED,
+                ),
+            ),
+            (
+                "tabu_search",
+                lambda: _solve_placement_groups_tabu(
+                    layer_counts,
+                    layer_widths,
+                    seed=REFINE_OPERATOR_SEED,
+                ),
+            ),
+            (
+                "beam_search",
+                lambda: _solve_placement_groups_beam(
+                    layer_counts,
+                    layer_widths,
+                ),
+            ),
+        ]
+    )
+    return tuple(methods)
 
 DEFAULT_PLANS = (
     Path("/home/dyf/data/MARS-results/storage/ep4_plans/qwen3-vl-30b-a3b-p30.pt"),
@@ -202,6 +281,21 @@ def placement_summary(result: dict[str, Any]) -> dict[str, Any]:
             "arithmetic_spread_lower_bound"
         ),
         "spread_upper_bound": result.get("spread_upper_bound"),
+        "placement_method": result.get("placement_method"),
+        "refinement_neighborhood": result.get("refinement_neighborhood"),
+        "iterations": result.get("iterations"),
+        "max_rounds": result.get("max_rounds"),
+        "max_iterations": result.get("max_iterations"),
+        "tabu_tenure": result.get("tabu_tenure"),
+        "beam_width": result.get("beam_width"),
+        "random_seed": result.get("random_seed"),
+        "accepted_worse_count": result.get("accepted_worse_count"),
+        "hit_time_cap": result.get("hit_time_cap"),
+        "initial_temperature": result.get("initial_temperature"),
+        "min_temperature": result.get("min_temperature"),
+        "cooling_rate": result.get("cooling_rate"),
+        "initialization_time_seconds": result.get("initialization_time_seconds"),
+        "refinement_time_seconds": result.get("refinement_time_seconds"),
     }
 
 
@@ -345,23 +439,10 @@ def run_table6(args: argparse.Namespace) -> None:
                 raise ValueError(f"invalid layer count {num_layers} for {plan_path}")
             layer_counts = counts[:num_layers]
             layer_widths = widths[:num_layers]
-            methods = (
-                (
-                    "greedy_pairwise_swap",
-                    lambda: _solve_placement_groups_greedy(
-                        layer_counts,
-                        layer_widths,
-                        refinement_neighborhood="pairwise_swap",
-                    ),
-                ),
-                (
-                    "greedy_full_bijection",
-                    lambda: _solve_placement_groups_greedy(
-                        layer_counts,
-                        layer_widths,
-                        refinement_neighborhood="full_bijection",
-                    ),
-                ),
+            tau0 = _placement_spread_arithmetic_lower_bound(
+                layer_counts, layer_widths
+            )["arithmetic_spread_lower_bound"]
+            methods = refine_operator_methods(layer_counts, layer_widths) + (
                 (
                     "milp_assignment",
                     lambda: _solve_placement_groups_milp(
@@ -395,6 +476,7 @@ def run_table6(args: argparse.Namespace) -> None:
                     "layers": num_layers,
                     "m": int(layer_counts.shape[1]),
                     "method": method,
+                    "tau0": tau0,
                     "warmup_runs": 1,
                     "timing_repeats": args.repeats,
                     "times_seconds": durations,
@@ -441,23 +523,10 @@ def run_depth_sweep(args: argparse.Namespace) -> None:
             ):
                 layer_counts = counts[layer_start:layer_end]
                 layer_widths = widths[layer_start:layer_end]
-                methods = (
-                    (
-                        "greedy_pairwise_swap",
-                        lambda: _solve_placement_groups_greedy(
-                            layer_counts,
-                            layer_widths,
-                            refinement_neighborhood="pairwise_swap",
-                        ),
-                    ),
-                    (
-                        "greedy_full_bijection",
-                        lambda: _solve_placement_groups_greedy(
-                            layer_counts,
-                            layer_widths,
-                            refinement_neighborhood="full_bijection",
-                        ),
-                    ),
+                tau0 = _placement_spread_arithmetic_lower_bound(
+                    layer_counts, layer_widths
+                )["arithmetic_spread_lower_bound"]
+                methods = refine_operator_methods(layer_counts, layer_widths) + (
                     (
                         "milp_assignment",
                         lambda: _solve_placement_groups_milp(
@@ -495,6 +564,7 @@ def run_depth_sweep(args: argparse.Namespace) -> None:
                         "layers": num_layers,
                         "m": int(layer_counts.shape[1]),
                         "method": method,
+                        "tau0": tau0,
                         "warmup_runs": 0 if method == "milp_assignment" else 1,
                         "timing_repeats": len(durations),
                         "times_seconds": durations,
@@ -550,30 +620,26 @@ def run_m_sweep(args: argparse.Namespace) -> None:
         )
         counts = groups["placement_group_counts"]
         widths = groups["placement_group_widths"]
-        greedy_results: dict[str, dict[str, Any]] = {}
-        neighborhoods = ["pairwise_swap"]
-        if ep_size == 4:
-            neighborhoods.append("full_bijection")
-        for neighborhood in neighborhoods:
-            method = f"greedy_{neighborhood}"
+        tau0 = _placement_spread_arithmetic_lower_bound(counts, widths)[
+            "arithmetic_spread_lower_bound"
+        ]
+        refine_results: dict[str, dict[str, Any]] = {}
+        for method, function in refine_operator_methods(counts, widths):
             key = (ep_size, method, None)
             if key in completed:
                 continue
             durations, results = timed_repeats(
-                lambda neighborhood=neighborhood: _solve_placement_groups_greedy(
-                    counts,
-                    widths,
-                    refinement_neighborhood=neighborhood,
-                ),
+                function,
                 args.greedy_repeats,
                 warmup=True,
             )
             result = results[-1]
-            greedy_results[neighborhood] = result
+            refine_results[method] = result
             record = {
                 "plan_sha256": metadata["sha256"],
                 "m": ep_size,
                 "method": method,
+                "tau0": tau0,
                 "time_limit": None,
                 "timing_repeats": args.greedy_repeats,
                 "times_seconds": durations,
@@ -591,18 +657,17 @@ def run_m_sweep(args: argparse.Namespace) -> None:
             checkpoint(output, payload)
             print(json.dumps(record, sort_keys=True), flush=True)
 
-        selected_neighborhood = "full_bijection" if ep_size == 4 else "pairwise_swap"
-        if selected_neighborhood not in greedy_results:
+        selected_method = "greedy_full_bijection" if ep_size <= 8 else "greedy_pairwise_swap"
+        if selected_method not in refine_results:
             selected_record = next(
                 record
                 for record in payload["records"]
-                if record["m"] == ep_size
-                and record["method"] == f"greedy_{selected_neighborhood}"
+                if record["m"] == ep_size and record["method"] == selected_method
             )
             greedy_spread = float(selected_record["spread"])
         else:
             greedy_spread = float(
-                greedy_results[selected_neighborhood]["rank_weight_spread"]
+                refine_results[selected_method]["rank_weight_spread"]
             )
 
         for time_limit in args.time_limits:
@@ -625,6 +690,7 @@ def run_m_sweep(args: argparse.Namespace) -> None:
                 "plan_sha256": metadata["sha256"],
                 "m": ep_size,
                 "method": method,
+                "tau0": tau0,
                 "time_limit": float(time_limit),
                 "time_seconds": duration,
                 **summary,
