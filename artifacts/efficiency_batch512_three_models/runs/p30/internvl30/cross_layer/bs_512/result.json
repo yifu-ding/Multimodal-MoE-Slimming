@@ -1,0 +1,73 @@
+{
+  "model_path": "/home/data/dyf/hf_cache/hub/models--OpenGVLab--InternVL3_5-30B-A3B-HF/snapshots/647fbc96f5fc9798f9f5811ddf622f07a09ccb9f",
+  "seed": 2603,
+  "tensor_parallel_size": 4,
+  "expert_parallel": true,
+  "kv_cache_memory_bytes_per_gpu": 2147483648,
+  "prefill": {
+    "workload": "prefill",
+    "batch_size": 512,
+    "prompt_tokens_per_request": 512,
+    "requested_output_tokens_per_request": 1,
+    "warmup_runs": 1,
+    "measured_runs": [
+      {
+        "repeat": 0,
+        "elapsed_seconds": 5.358364872983657,
+        "requests_per_second": 95.55153710816766,
+        "input_tokens_per_second": 48922.386999381844,
+        "output_tokens_per_second": 95.55153710816766,
+        "generated_tokens": 512
+      },
+      {
+        "repeat": 1,
+        "elapsed_seconds": 5.356424317986239,
+        "requests_per_second": 95.58615404697582,
+        "input_tokens_per_second": 48940.11087205162,
+        "output_tokens_per_second": 95.58615404697582,
+        "generated_tokens": 512
+      },
+      {
+        "repeat": 2,
+        "elapsed_seconds": 5.357974496961106,
+        "requests_per_second": 95.55849888617279,
+        "input_tokens_per_second": 48925.951429720466,
+        "output_tokens_per_second": 95.55849888617279,
+        "generated_tokens": 512
+      }
+    ]
+  },
+  "decode": {
+    "workload": "decode",
+    "batch_size": 512,
+    "prompt_tokens_per_request": 32,
+    "requested_output_tokens_per_request": 128,
+    "warmup_runs": 1,
+    "measured_runs": [
+      {
+        "repeat": 0,
+        "elapsed_seconds": 6.563937887956854,
+        "requests_per_second": 78.00195686485532,
+        "input_tokens_per_second": 2496.06261967537,
+        "output_tokens_per_second": 9984.25047870148,
+        "generated_tokens": 65536
+      },
+      {
+        "repeat": 1,
+        "elapsed_seconds": 6.525006800016854,
+        "requests_per_second": 78.4673511755846,
+        "input_tokens_per_second": 2510.955237618707,
+        "output_tokens_per_second": 10043.820950474828,
+        "generated_tokens": 65536
+      },
+      {
+        "repeat": 2,
+        "elapsed_seconds": 6.619040395016782,
+        "requests_per_second": 77.35260240826825,
+        "input_tokens_per_second": 2475.283277064584,
+        "output_tokens_per_second": 9901.133108258337,
+        "generated_tokens": 65536
+      }
+    ]
+  }
+}
