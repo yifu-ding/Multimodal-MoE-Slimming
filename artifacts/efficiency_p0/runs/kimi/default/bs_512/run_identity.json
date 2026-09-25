@@ -1,0 +1,14 @@
+{
+  "model_key": "kimi",
+  "model_path": "/home/data/dyf/hf_cache/hub/models--moonshotai--Kimi-VL-A3B-Instruct/snapshots/398eede0903cd983a2bfa0cc634e9ac1d843f375",
+  "prune_ratio": 0.0,
+  "implementation": "default",
+  "batch_size": 512,
+  "prefill_tokens": 512,
+  "decode_prompt_tokens": 32,
+  "decode_tokens": 128,
+  "warmup_runs": 1,
+  "measured_runs": 3,
+  "prefix_cache": false,
+  "kv_cache_memory_bytes_per_gpu": 2147483648
+}

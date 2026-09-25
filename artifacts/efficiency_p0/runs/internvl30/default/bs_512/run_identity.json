@@ -1,0 +1,14 @@
+{
+  "model_key": "internvl30",
+  "model_path": "/home/data/dyf/hf_cache/hub/models--OpenGVLab--InternVL3_5-30B-A3B-HF/snapshots/647fbc96f5fc9798f9f5811ddf622f07a09ccb9f",
+  "prune_ratio": 0.0,
+  "implementation": "default",
+  "batch_size": 512,
+  "prefill_tokens": 512,
+  "decode_prompt_tokens": 32,
+  "decode_tokens": 128,
+  "warmup_runs": 1,
+  "measured_runs": 3,
+  "prefix_cache": false,
+  "kv_cache_memory_bytes_per_gpu": 2147483648
+}

@@ -1,0 +1,14 @@
+{
+  "model_key": "qwen30",
+  "model_path": "/home/data/dyf/hf_cache/hub/models--Qwen--Qwen3-VL-30B-A3B-Instruct/snapshots/9c4b90e1e4ba969fd3b5378b57d966d725f1b86c",
+  "prune_ratio": 0.0,
+  "implementation": "default",
+  "batch_size": 512,
+  "prefill_tokens": 512,
+  "decode_prompt_tokens": 32,
+  "decode_tokens": 128,
+  "warmup_runs": 1,
+  "measured_runs": 3,
+  "prefix_cache": false,
+  "kv_cache_memory_bytes_per_gpu": 2147483648
+}
