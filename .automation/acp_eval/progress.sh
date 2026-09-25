@@ -9,7 +9,7 @@ total=0
 line=""
 for name in "${MODEL_NAMES[@]}"; do
     IFS='|' read -r model_id plan run_dir <<< "$(model_spec "${name}")"
-    done_count="$(count_complete "${run_dir}")"
+    done_count="$(count_complete "${name}" "${run_dir}")"
     total=$((total + done_count))
     line+="${name}=${done_count}/${#TASK_LIST[@]} "
 done

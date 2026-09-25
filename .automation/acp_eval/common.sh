@@ -24,12 +24,10 @@ REPO_ROOT="/home/dyf/code/distill/MAES"
 # <RUN_DIR>` pass afterwards (not tracked under status/ at all). Treat mmvet
 # like any other TASK_LIST entry for "is this model's predict pass done";
 # track the judge step separately once every model/ratio here is done.
-# videomme now runs too (user: run it before coco/video_mmmu, which stay
-# deferred). Qwen3-VL-30B's own baseline script defaults
-# ENABLE_QWEN3_NATIVE_VIDEO=1 (Kimi/InternVL's wrappers force it to 0), which
-# would remap videomme to "videomme_qwen3_vllm" only for that one model and
-# break a shared TASK_LIST. pipeline.sh forces ENABLE_QWEN3_NATIVE_VIDEO=0 for
-# every model so the completion marker is "videomme" everywhere.
+# VideoMME uses Qwen3's native-video adapter for Qwen and the generic video
+# path for Kimi/InternVL. The Qwen adapter writes videomme_qwen3_vllm.complete,
+# so completion checks must resolve that model-specific marker without changing
+# the experiment protocol.
 TASKS="gqa,textvqa_val,chartqa,mmstar,mmbench_en_dev_static_local,mmvet,mme,realworldqa,videomme,longvideobench_val_v,egoschema_subset,mvbench_available_3800"
 TASK_LIST=(gqa textvqa_val chartqa mmstar mmbench_en_dev_static_local mmvet mme realworldqa videomme longvideobench_val_v egoschema_subset_local mvbench_available_3800)
 
@@ -64,11 +62,42 @@ model_spec() {
 # (matches "these 3 models' p0.3 first, then p0.5" from the user).
 MODEL_NAMES=(kimi_p30 qwen3_p30 internvl_p30 kimi_p50 qwen3_p50 internvl_p50)
 
-# Number of TASK_LIST entries with a status/<task>.complete marker under $1 (a RUN_DIR).
+native_video_for_model() {
+    case "$1" in
+        qwen3_*) echo 1 ;;
+        *) echo 0 ;;
+    esac
+}
+
+gpu_memory_utilization_for_model() {
+    case "$1" in
+        qwen3_*) echo 0.75 ;;
+        *) echo 0.90 ;;
+    esac
+}
+
+tasks_for_model() {
+    case "$1" in
+        qwen3_*) echo videomme ;;
+        *) echo "${TASKS}" ;;
+    esac
+}
+
+task_marker_for_model() {
+    local name="$1" task="$2"
+    if [[ "${name}" == qwen3_* && "${task}" == videomme ]]; then
+        echo videomme_qwen3_vllm
+    else
+        echo "${task}"
+    fi
+}
+
+# Number of TASK_LIST entries with a matching model-specific completion marker.
 count_complete() {
-    local run_dir="$1" count=0 task
+    local name="$1" run_dir="$2" count=0 task marker
     for task in "${TASK_LIST[@]}"; do
-        [[ -f "${run_dir}/status/${task}.complete" ]] && count=$((count + 1))
+        marker="$(task_marker_for_model "${name}" "${task}")"
+        [[ -f "${run_dir}/status/${marker}.complete" ]] && count=$((count + 1))
     done
     echo "${count}"
 }
