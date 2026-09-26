@@ -1,0 +1,17 @@
+accelerate>=1.1
+datasets>=3.0
+decord>=0.6.0
+einops>=0.8
+imageio>=2.34
+loguru>=0.7
+numpy>=1.26
+pillow>=10.0
+pyarrow>=15.0
+PyYAML>=6.0
+qwen-vl-utils>=0.0.14
+safetensors>=0.4
+scipy>=1.11
+torch>=2.5
+torchvision>=0.20
+tqdm>=4.66
+transformers>=4.51

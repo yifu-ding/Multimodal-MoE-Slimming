@@ -1,0 +1,7 @@
+
+[pip]
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple/"
+
+
+[extra-build-dependencies]
+flash-attn = ["torch"]
